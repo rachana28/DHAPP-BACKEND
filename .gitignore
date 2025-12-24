@@ -1,0 +1,20 @@
+# Ignore virtual environment
+
+venv/
+
+env/
+
+__pycache__/
+
+*.pyc
+ 
+# Ignore local database (optional but recommended)
+
+*.db
+
+drivers.db
+ 
+# Ignore OS generated files
+
+.DS_Store
+ 
