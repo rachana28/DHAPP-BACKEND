@@ -1,3 +1,10 @@
 fastapi
 uvicorn[standard]
 sqlmodel
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+google-auth
+requests
+email-validator
+argon2-cffi
