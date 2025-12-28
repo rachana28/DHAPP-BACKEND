@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select, func
+from sqlmodel import Session, select, func, desc
 from typing import List
 from app.database import get_session
 from app.models import Driver, DriverBase, DriverUpdate, DriverReview, DriverReviewBase
@@ -25,25 +25,6 @@ def read_driver(driver_id: int, session: Session = Depends(get_session)):
        raise HTTPException(status_code=404, detail="Driver not found")
    return driver
 
-@router.get("/{driver_id}/reviews/total")
-def get_driver_reviews_total(driver_id: int, session: Session = Depends(get_session)):
-   # Check if driver exists
-   driver = session.get(Driver, driver_id)
-   if not driver:
-       raise HTTPException(status_code=404, detail="Driver not found")
-
-   # Get total reviews and average rating
-   result = session.exec(
-       select(func.count(DriverReview.id), func.avg(DriverReview.rating))
-       .where(DriverReview.driver_id == driver_id)
-   ).first()
-
-   total_reviews, avg_rating = result
-   return {
-       "driver_id": driver_id,
-       "total_reviews": total_reviews or 0,
-       "average_rating": round(avg_rating, 2) if avg_rating else 0.0
-   }
 
 @router.get("/{driver_id}/reviews", response_model=List[DriverReview])
 def get_driver_reviews(driver_id: int, session: Session = Depends(get_session)):
@@ -52,7 +33,7 @@ def get_driver_reviews(driver_id: int, session: Session = Depends(get_session)):
    if not driver:
        raise HTTPException(status_code=404, detail="Driver not found")
 
-   reviews = session.exec(select(DriverReview).where(DriverReview.driver_id == driver_id)).all()
+   reviews = session.exec(select(DriverReview).where(DriverReview.driver_id == driver_id).order_by(desc(DriverReview.created_at))).all()
    return reviews
 
 @router.post("/{driver_id}/reviews", response_model=DriverReview)
@@ -66,4 +47,10 @@ def add_driver_review(driver_id: int, review: DriverReviewBase, session: Session
    session.add(db_review)
    session.commit()
    session.refresh(db_review)
+
+   # Update driver's average rating
+   avg_rating = session.exec(select(func.avg(DriverReview.rating)).where(DriverReview.driver_id == driver_id)).first()
+   driver.rating = round(avg_rating, 2) if avg_rating is not None else 0.0
+   session.commit()
+
    return db_review

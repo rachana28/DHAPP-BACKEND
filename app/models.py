@@ -21,9 +21,11 @@ class OrganisationBase(SQLModel):
 # --- Table Models (The actual database tables) ---
 class Driver(DriverBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    rating: float = Field(default=0.0)
 
 class Organisation(OrganisationBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    rating: float = Field(default=0.0)
 
 # --- Update Models (For when we want to update only specific fields) ---
 class DriverUpdate(SQLModel):
