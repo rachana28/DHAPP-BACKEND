@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select, func
+from sqlmodel import Session, select, func, desc
 from typing import List
 
 # Import our setup
@@ -58,28 +58,8 @@ def delete_organisation(org_id: int, session: Session = Depends(get_session)):
    session.commit()
    return {"ok": True}
 
-# 6. Get total reviews for an organisation
-@router.get("/{org_id}/reviews/total")
-def get_organisation_reviews_total(org_id: int, session: Session = Depends(get_session)):
-   # Check if organisation exists
-   org = session.get(Organisation, org_id)
-   if not org:
-       raise HTTPException(status_code=404, detail="Organisation not found")
 
-   # Get total reviews and average rating
-   result = session.exec(
-       select(func.count(OrganisationReview.id), func.avg(OrganisationReview.rating))
-       .where(OrganisationReview.organisation_id == org_id)
-   ).first()
-
-   total_reviews, avg_rating = result
-   return {
-       "organisation_id": org_id,
-       "total_reviews": total_reviews or 0,
-       "average_rating": round(avg_rating, 2) if avg_rating else 0.0
-   }
-
-# 7. Get all reviews for an organisation
+# 6. Get all reviews for an organisation
 @router.get("/{org_id}/reviews", response_model=List[OrganisationReview])
 def get_organisation_reviews(org_id: int, session: Session = Depends(get_session)):
    # Check if organisation exists
@@ -87,10 +67,10 @@ def get_organisation_reviews(org_id: int, session: Session = Depends(get_session
    if not org:
        raise HTTPException(status_code=404, detail="Organisation not found")
 
-   reviews = session.exec(select(OrganisationReview).where(OrganisationReview.organisation_id == org_id)).all()
+   reviews = session.exec(select(OrganisationReview).where(OrganisationReview.organisation_id == org_id).order_by(desc(OrganisationReview.created_at))).all()
    return reviews
 
-# 8. Add a review for an organisation
+# 7. Add a review for an organisation
 @router.post("/{org_id}/reviews", response_model=OrganisationReview)
 def add_organisation_review(org_id: int, review: OrganisationReviewBase, session: Session = Depends(get_session)):
    # Check if organisation exists
@@ -102,4 +82,10 @@ def add_organisation_review(org_id: int, review: OrganisationReviewBase, session
    session.add(db_review)
    session.commit()
    session.refresh(db_review)
+
+   # Update organisation's average rating
+   avg_rating = session.exec(select(func.avg(OrganisationReview.rating)).where(OrganisationReview.organisation_id == org_id)).first()
+   org.rating = round(avg_rating, 2) if avg_rating is not None else 0.0
+   session.commit()
+
    return db_review

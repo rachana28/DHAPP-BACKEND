@@ -1,4 +1,5 @@
 from sqlmodel import SQLModel, create_engine, Session
+from app import models  # Import models to ensure tables are created
 
 # This connects to the SQLite file in the parent directory
 sqlite_file_name = "drivers.db"
