@@ -31,7 +31,11 @@ def signup(user: UserCreate, session: Session = Depends(get_session)):
     session.commit()
 
     access_token = create_access_token(data={"sub": db_user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {"name": db_user.full_name, "picture": db_user.avatar_url},
+    }
 
 
 @router.post("/login", response_model=Token)
@@ -45,12 +49,15 @@ def login(user_data: UserLogin, session: Session = Depends(get_session)):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
     access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {"name": user.full_name, "picture": user.avatar_url},
+    }
 
 
 @router.post("/google", response_model=Token)
 def google_login(token: str, session: Session = Depends(get_session)):
-
     google_response = requests.get(
         f"https://oauth2.googleapis.com/tokeninfo?id_token={token}"
     )
@@ -77,4 +84,8 @@ def google_login(token: str, session: Session = Depends(get_session)):
         session.commit()
 
     access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {"name": user.full_name, "picture": user.avatar_url},
+    }
