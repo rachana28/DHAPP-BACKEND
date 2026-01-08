@@ -74,7 +74,7 @@ class OrganisationReview(OrganisationReviewBase, table=True):
 
 # --- Base Models ---
 class UserBase(SQLModel):
-    email: EmailStr = Field(unique=True, index=True)
+    email: EmailStr = Field(index=True)
     full_name: Optional[str] = None
     provider: str = "local"
     avatar_url: Optional[str] = None
@@ -106,6 +106,7 @@ class UserCreate(SQLModel):
 class UserLogin(SQLModel):
     email: EmailStr
     password: str
+    role: str
 
 
 class Token(SQLModel):

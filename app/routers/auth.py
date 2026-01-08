@@ -24,10 +24,10 @@ def signup(user: UserCreate, session: Session = Depends(get_session)):
         raise HTTPException(status_code=400, detail="Invalid role")
 
     # Check for duplicates
-    statement = select(User).where(User.email == user.email)
+    statement = select(User).where(User.email == user.email, User.role == user.role)
     existing_user = session.exec(statement).first()
     if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail="Email already registered for this role")
 
     # Hash the password
     hashed_pwd = get_password_hash(user.password)
@@ -74,13 +74,13 @@ def signup(user: UserCreate, session: Session = Depends(get_session)):
 
 @router.post("/login", response_model=Token)
 def login(user_data: UserLogin, session: Session = Depends(get_session)):
-    statement = select(User).where(User.email == user_data.email)
+    statement = select(User).where(User.email == user_data.email, User.role == user_data.role)
     user = session.exec(statement).first()
 
     if not user or not verify_password(user_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
-    access_token = create_access_token(data={"sub": user.email})
+    access_token = create_access_token(data={"sub": user.email, "role": user.role})
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -101,7 +101,7 @@ def google_login(token: str, session: Session = Depends(get_session)):
     name = data.get("name", "")
     picture = data.get("picture", "")
 
-    statement = select(User).where(User.email == email)
+    statement = select(User).where(User.email == email, User.role == "user")
     user = session.exec(statement).first()
 
     if not user:
@@ -116,7 +116,7 @@ def google_login(token: str, session: Session = Depends(get_session)):
         session.add(user)
         session.commit()
 
-    access_token = create_access_token(data={"sub": user.email})
+    access_token = create_access_token(data={"sub": user.email, "role": user.role})
     return {
         "access_token": access_token,
         "token_type": "bearer",
