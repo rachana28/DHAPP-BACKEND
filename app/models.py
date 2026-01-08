@@ -15,7 +15,7 @@ class DriverBase(SQLModel):
 
 class OrganisationBase(SQLModel):
     org_name: str = Field(index=True)  # Indexed for faster search
-    contact_person: str
+    contact_number: str
     contact_email: Optional[str] = None
     address: str
     is_active: bool = True
@@ -24,11 +24,13 @@ class OrganisationBase(SQLModel):
 # --- Table Models (The actual database tables) ---
 class Driver(DriverBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
     rating: float = Field(default=0.0)
 
 
 class Organisation(OrganisationBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
     rating: float = Field(default=0.0)
 
 
@@ -41,7 +43,7 @@ class DriverUpdate(SQLModel):
 
 class OrganisationUpdate(SQLModel):
     org_name: Optional[str] = None
-    contact_person: Optional[str] = None
+    contact_number: Optional[str] = None
     address: Optional[str] = None
 
 
@@ -72,10 +74,11 @@ class OrganisationReview(OrganisationReviewBase, table=True):
 
 # --- Base Models ---
 class UserBase(SQLModel):
-    email: EmailStr = Field(unique=True, index=True)
+    email: EmailStr = Field(index=True)
     full_name: Optional[str] = None
     provider: str = "local"
     avatar_url: Optional[str] = None
+    role: str = "user"
 
 
 # --- Table Model (Database) ---
@@ -88,12 +91,22 @@ class User(UserBase, table=True):
 class UserCreate(SQLModel):
     email: EmailStr
     password: str
-    full_name: str
+    full_name: Optional[str] = None
+    role: str = "user"
+    # Driver fields
+    license_number: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    phone_number: Optional[str] = None
+    # Organisation fields
+    org_name: Optional[str] = None
+    contact_number: Optional[str] = None
+    address: Optional[str] = None
 
 
 class UserLogin(SQLModel):
     email: EmailStr
     password: str
+    role: str
 
 
 class Token(SQLModel):
