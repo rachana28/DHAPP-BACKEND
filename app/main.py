@@ -18,6 +18,7 @@ origins = [
     "http://localhost:5173",  # Vite (Your React App)
     "http://localhost:3000",  # Create React App (Backup)
     "http://127.0.0.1:5173",  # Alternative localhost URL
+    "https://dhapp-frontend.onrender.com" #Render production url
 ]
 
 app.add_middleware(
