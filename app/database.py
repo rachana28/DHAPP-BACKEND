@@ -2,6 +2,7 @@ import os
 import ssl
 from dotenv import load_dotenv
 from sqlmodel import SQLModel, create_engine, Session
+from app import models  # Import models to ensure tables are created
 
 # Load environment variables from .env file
 load_dotenv()
