@@ -1,0 +1,87 @@
+name: Universal Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  # -----------------------------------------------------------------
+  # JOB 1: QUALITY ASSURANCE (Universal - Runs for everyone)
+  # -----------------------------------------------------------------
+  quality-check:
+    name: 🛡️ Test Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      
+      # Fails deployment if your code has syntax errors
+      - name: Run Syntax Check
+        run: python -m compileall .
+
+  # -----------------------------------------------------------------
+  # JOB 2: RENDER DEPLOY (Runs ONLY if you have a Render Hook)
+  # -----------------------------------------------------------------
+  deploy-render:
+    name: 🚀 Render Deploy
+    needs: quality-check  # Wait for tests to pass
+    runs-on: ubuntu-latest
+    # This magic line checks if you added the secret. If not, it skips this job.
+    if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
+    steps:
+      - name: Trigger Render Deploy
+        run: curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+
+  # -----------------------------------------------------------------
+  # JOB 3: AWS DEPLOY (Runs ONLY if you have AWS Keys)
+  # -----------------------------------------------------------------
+  deploy-aws:
+    name: 🔶 AWS Deploy
+    needs: quality-check
+    runs-on: ubuntu-latest
+    if: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # NOTE: AWS requires much more setup (Docker, ECR, ECS).
+      # This is just the login step. A full AWS deploy often needs 20+ lines here.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+  # -----------------------------------------------------------------
+  # JOB 4: AZURE DEPLOY (Runs ONLY if you have Azure Keys)
+  # -----------------------------------------------------------------
+  deploy-azure:
+    name: 🔷 Azure Deploy
+    needs: quality-check
+    runs-on: ubuntu-latest
+    if: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE != '' }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: 'your-app-name'
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: .
