@@ -37,10 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Render Deploy
-        # FIX: Check for the secret HERE, inside the step.
-        # If the secret is missing, this step simply skips (turns gray).
-        if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
-        run: curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        if: env.DEPLOY_HOOK != ''
+        run: curl "$DEPLOY_HOOK"
 
   # -----------------------------------------------------------------
   # JOB 3: AWS DEPLOY
@@ -85,8 +85,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to Azure Web App
-        # FIX: Check for the secret HERE, inside the step.
-        if: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE != '' }}
+        env:
+          AZURE_PROFILE: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        if: env.AZURE_PROFILE != ''
         uses: azure/webapps-deploy@v2
         with:
           app-name: 'your-app-name'
