@@ -11,3 +11,4 @@ argon2-cffi
 python-dotenv
 pg8000
 wheel
+dnspython
