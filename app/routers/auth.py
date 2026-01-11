@@ -109,7 +109,7 @@ def signup(user: UserCreate, session: Session = Depends(get_session)):
         session.add(db_org)
         session.commit()
 
-    access_token = create_access_token(data={"sub": db_user.email})
+    access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role})
     return {
         "access_token": access_token,
         "token_type": "bearer",
