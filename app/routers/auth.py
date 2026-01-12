@@ -1,6 +1,7 @@
+import redis
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
-from app.database import get_session
+from app.database import get_session, get_redis
 from app.models import User, UserCreate, UserLogin, Token, Driver, Organisation
 from app.security import get_password_hash, verify_password, create_access_token
 import requests
@@ -44,7 +45,11 @@ def verify_email(request: EmailVerificationRequest):
 
 
 @router.post("/signup", response_model=Token)
-def signup(user: UserCreate, session: Session = Depends(get_session)):
+def signup(
+    user: UserCreate,
+    session: Session = Depends(get_session),
+    redis_client: redis.Redis = Depends(get_redis),
+):
     # Validate based on role
     if user.role == "user":
         if not user.full_name:
@@ -99,6 +104,8 @@ def signup(user: UserCreate, session: Session = Depends(get_session)):
         )
         session.add(db_driver)
         session.commit()
+        if redis_client:
+            redis_client.delete("drivers")
     elif user.role == "organisation":
         db_org = Organisation(
             org_name=user.org_name,
@@ -108,6 +115,8 @@ def signup(user: UserCreate, session: Session = Depends(get_session)):
         )
         session.add(db_org)
         session.commit()
+        if redis_client:
+            redis_client.delete("organisations")
 
     access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role})
     return {

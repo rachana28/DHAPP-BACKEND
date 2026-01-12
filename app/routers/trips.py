@@ -1,8 +1,9 @@
+import redis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 from typing import List
 
-from app.database import get_session
+from app.database import get_session, get_redis
 from app.models import Trip, TripCreate, TripUpdate, User, Driver
 from app.security import get_current_user
 
@@ -15,6 +16,7 @@ def create_trip(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     trip_in: TripCreate,
+    redis_client: redis.Redis = Depends(get_redis),
 ):
     """
     Create a new trip (booking request).
@@ -37,6 +39,12 @@ def create_trip(
     session.add(db_trip)
     session.commit()
     session.refresh(db_trip)
+
+    # Invalidate cache
+    if redis_client:
+        redis_client.delete("drivers")
+        redis_client.delete(f"driver_{trip_in.driver_id}")
+
     return db_trip
 
 
@@ -70,6 +78,7 @@ def update_trip_status(
     current_user: User = Depends(get_current_user),
     trip_id: int,
     trip_update: TripUpdate,
+    redis_client: redis.Redis = Depends(get_redis),
 ):
     """
     Update trip status (e.g., accept, cancel).
@@ -99,4 +108,10 @@ def update_trip_status(
     session.add(trip)
     session.commit()
     session.refresh(trip)
+
+    # Invalidate cache
+    if redis_client:
+        redis_client.delete("drivers")
+        redis_client.delete(f"driver_{trip.driver_id}")
+
     return trip
