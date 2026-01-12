@@ -3,9 +3,40 @@ import ssl
 from dotenv import load_dotenv
 from sqlmodel import SQLModel, create_engine, Session
 from app import models  # Import models to ensure tables are created
+import redis
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Redis connection details from environment variables
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = os.getenv("REDIS_PORT")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+
+redis_client = None
+if REDIS_HOST and REDIS_PORT:
+    try:
+        redis_client = redis.Redis(
+            host=REDIS_HOST,
+            port=int(REDIS_PORT),
+            username="default",
+            password=REDIS_PASSWORD,
+            db=0,
+            decode_responses=True,
+            socket_connect_timeout=5
+        )
+        # Test the connection
+        redis_client.ping()
+        print("Successfully connected to Redis.")
+    except redis.exceptions.ConnectionError as e:
+        print(f"Could not connect to Redis: {e}")
+        redis_client = None
+
+
+def get_redis():
+    """Dependency to provide a Redis client for each request."""
+    return redis_client
+
 
 # PostgreSQL connection details
 DB_HOST = os.getenv("DB_HOST")
