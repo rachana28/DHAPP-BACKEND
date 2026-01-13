@@ -144,6 +144,21 @@ class User(UserBase, table=True):
     trips: List[Trip] = Relationship(back_populates="user")
 
 
+class UserPublic(SQLModel):
+    id: int
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class UserPrivate(UserBase):
+    id: int
+
+
+class UserUpdate(SQLModel):
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
 class UserCreate(SQLModel):
     email: EmailStr
     password: str
