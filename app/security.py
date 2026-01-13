@@ -73,3 +73,12 @@ def get_current_active_driver(
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
     return driver_profile
+
+
+def get_current_active_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if current_user.role != "user":
+        raise HTTPException(status_code=403, detail="Not a user")
+    return current_user
+
