@@ -1,5 +1,8 @@
 import json
-from fastapi import APIRouter, Depends, HTTPException, Query
+import os
+import shutil
+import time
+from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from fastapi.encoders import jsonable_encoder
 from sqlmodel import Session, select, func, desc
 from typing import List, Optional
@@ -17,6 +20,8 @@ from app.models import (
 from app.security import get_current_active_driver
 
 router = APIRouter(prefix="/drivers", tags=["Drivers"])
+
+os.makedirs("media/profile_pictures", exist_ok=True)
 
 
 @router.get("/me", response_model=DriverPrivate)
@@ -45,6 +50,37 @@ def update_current_driver_profile(
     for key, value in update_data.items():
         setattr(current_driver, key, value)
 
+    session.add(current_driver)
+    session.commit()
+    session.refresh(current_driver)
+
+    # Invalidate cache
+    if redis_client:
+        redis_client.delete("drivers")
+        redis_client.delete(f"driver_{current_driver.id}")
+
+    return current_driver
+
+
+@router.put("/me/profile-picture", response_model=DriverPrivate)
+def update_driver_profile_picture(
+    *,
+    session: Session = Depends(get_session),
+    current_driver: Driver = Depends(get_current_active_driver),
+    file: UploadFile = File(...),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Update the profile picture for the currently authenticated driver.
+    """
+    timestamp = int(time.time())
+    file_extension = os.path.splitext(file.filename)[1]
+    file_path = f"media/profile_pictures/driver_{current_driver.id}_{timestamp}{file_extension}"
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    current_driver.profile_picture_url = f"/{file_path}"
     session.add(current_driver)
     session.commit()
     session.refresh(current_driver)

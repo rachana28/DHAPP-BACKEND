@@ -30,6 +30,7 @@ class DriverBase(SQLModel):
     license_number: str  # Sensitive
     address: Optional[str] = None  # Sensitive
     emergency_phone: Optional[str] = None  # Sensitive
+    profile_picture_url: Optional[str] = None
 
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
@@ -69,6 +70,7 @@ class DriverPublic(SQLModel):
     id: int
     name: str
     rating: float
+    profile_picture_url: Optional[str] = None
     years_of_experience: Optional[int]
     vehicle_type: Optional[str]
     spoken_languages: Optional[str]
@@ -88,6 +90,7 @@ class DriverUpdate(SQLModel):
     address: Optional[str] = None
     phone_number: Optional[str] = None
     emergency_phone: Optional[str] = None
+    profile_picture_url: Optional[str] = None
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
     fare_per_km: Optional[float] = None
