@@ -2,7 +2,7 @@ import redis
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 from app.database import get_session, get_redis
-from app.models import User, UserCreate, UserLogin, Token, Driver, Organisation
+from app.models import User, UserCreate, UserLogin, Token, Driver
 from app.security import get_password_hash, verify_password, create_access_token
 import requests
 import re
@@ -62,12 +62,6 @@ def signup(
                 status_code=400,
                 detail="Full name, license number, and phone number are required for driver",
             )
-    elif user.role == "organisation":
-        if not user.org_name or not user.contact_number or not user.address:
-            raise HTTPException(
-                status_code=400,
-                detail="Organisation name, contact number, and address are required for organisation",
-            )
     else:
         raise HTTPException(status_code=400, detail="Invalid role")
 
@@ -106,17 +100,6 @@ def signup(
         session.commit()
         if redis_client:
             redis_client.delete("drivers")
-    elif user.role == "organisation":
-        db_org = Organisation(
-            org_name=user.org_name,
-            contact_number=user.contact_number,
-            address=user.address,
-            user_id=db_user.id,
-        )
-        session.add(db_org)
-        session.commit()
-        if redis_client:
-            redis_client.delete("organisations")
 
     access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role})
     return {
