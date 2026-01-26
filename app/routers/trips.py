@@ -1,7 +1,7 @@
 import redis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select, desc, func
-from typing import List
+from typing import List, Union
 from datetime import datetime, timedelta
 from sqlalchemy.orm import selectinload
 
@@ -11,6 +11,7 @@ from app.models import (
     TripCreate,
     TripOffer,
     TripOfferPublic,
+    TripReadUser,
     TripSafe,
     Driver,
     User,
@@ -67,26 +68,79 @@ def create_booking_request(
     return db_trip
 
 
-@router.get("/my-bookings", response_model=List[TripSafe])
-def get_my_bookings_as_driver(
+@router.get("/my-bookings", response_model=List[Union[TripReadUser, TripSafe]])
+def get_my_bookings(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Get trips where the current user is the assigned driver.
+    Get bookings for the current user.
+    - If User: Returns their trip history (Active & Past) with Driver details.
+    - If Driver: Returns trips they are assigned to.
     """
-    if current_user.role != "driver":
-        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.role == "driver":
+        # Existing Driver Logic
+        driver = session.exec(
+            select(Driver).where(Driver.user_id == current_user.id)
+        ).first()
+        if not driver:
+            return []
+        return session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
 
-    driver = session.exec(
-        select(Driver).where(Driver.user_id == current_user.id)
-    ).first()
-    if not driver:
-        raise HTTPException(status_code=404, detail="Driver profile not found")
+    else:
+        # New User Logic
+        # Fetch all trips for this user, joining the Driver table to populate details
+        statement = (
+            select(Trip)
+            .where(Trip.user_id == current_user.id)
+            .order_by(desc(Trip.booking_time))
+            .options(selectinload(Trip.driver))  # Load driver info for TripReadUser
+        )
+        return session.exec(statement).all()
 
-    trips = session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
-    return trips
+
+@router.post("/{trip_id}/cancel")
+def cancel_trip(
+    trip_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    User cancels a trip.
+    Logic:
+    1. Mark Trip as 'cancelled'.
+    2. DELETE all active TripOffers so drivers no longer see the request.
+    """
+    trip = session.get(Trip, trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    # Security: Ensure user owns this trip
+    if trip.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to cancel this trip"
+        )
+
+    if trip.status in ["completed", "cancelled"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel a completed or already cancelled trip",
+        )
+
+    # 1. Update Status
+    trip.status = "cancelled"
+    session.add(trip)
+
+    # 2. Delete Requests (Offers)
+    # This removes the "Ring" from all drivers' phones/dashboards
+    offers = session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all()
+    for offer in offers:
+        session.delete(offer)
+
+    session.commit()
+
+    return {"message": "Trip cancelled successfully"}
 
 
 @router.get("/driver/offers", response_model=List[TripOfferPublic])

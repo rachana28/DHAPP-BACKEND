@@ -109,6 +109,9 @@ class DriverPublic(SQLModel):
     total_trips: int = 0
 
 
+class TripReadUser(TripSafe):
+    driver: Optional[DriverPublic] = None
+
 class DriverPrivate(DriverBase):
     id: int
     rating: float
