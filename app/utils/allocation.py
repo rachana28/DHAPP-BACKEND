@@ -1,6 +1,6 @@
 from sqlmodel import Session, select, func, desc
-from datetime import datetime
-from typing import List, Tuple
+from datetime import datetime, timedelta
+from typing import List
 from app.models import Driver, Trip, TripOffer
 
 
@@ -94,81 +94,103 @@ def create_offers_for_tier(
     session.commit()
 
 
-def process_tier_escalation(session: Session):
+def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
     """
-    Core logic to check for trips pending > 10 mins and escalate them.
-    Returns the number of escalated trips.
+    Single Trip Escalation Logic.
+    Checks if a trip should move to the next tier or be cancelled.
+    Returns True if an action was taken (escalated or cancelled).
     """
-    from app.models import (
-        Trip,
-        TripOffer,
-    )  # Import inside to avoid circular deps if any
-    from datetime import datetime, timedelta
+    TIER_SIZE = 3
 
-    TIER_SIZE = 3  # Ensure this matches your config
+    # 1. Determine Current Tier
+    latest_offer = session.exec(
+        select(TripOffer)
+        .where(TripOffer.trip_id == trip.id)
+        .order_by(desc(TripOffer.tier))
+        .limit(1)
+    ).first()
 
-    # Find trips currently searching
-    active_trips = session.exec(select(Trip).where(Trip.status == "searching")).all()
-    escalated_count = 0
+    if not latest_offer:
+        return False
 
-    for trip in active_trips:
-        # Get latest offers to determine current tier
-        latest_offer = session.exec(
-            select(TripOffer)
-            .where(TripOffer.trip_id == trip.id)
-            .order_by(desc(TripOffer.tier))
-            .limit(1)
-        ).first()
+    current_tier = latest_offer.tier
+    should_escalate = False
 
-        if not latest_offer:
-            continue
+    # 2. Check Conditions
+    # Condition A: Time Threshold (10 mins)
+    if (datetime.utcnow() - latest_offer.created_at) > timedelta(minutes=10):
+        should_escalate = True
 
-        current_tier = latest_offer.tier
-        should_escalate = False
+    # Condition B: All rejected/processed in current tier
+    pending_in_tier = session.exec(
+        select(func.count(TripOffer.id)).where(
+            TripOffer.trip_id == trip.id,
+            TripOffer.tier == current_tier,
+            TripOffer.status == "pending",
+        )
+    ).one()
 
-        # Condition A: Time Threshold (10 mins)
-        time_diff = datetime.utcnow() - latest_offer.created_at
-        if time_diff > timedelta(minutes=10):
-            should_escalate = True
+    if pending_in_tier == 0:
+        should_escalate = True
 
-        # Condition B: All rejected in current tier
-        pending_in_tier = session.exec(
+    # 3. Execute Escalation
+    if should_escalate:
+        # Double Check: Did anyone accept?
+        accepted_count = session.exec(
             select(func.count(TripOffer.id)).where(
                 TripOffer.trip_id == trip.id,
                 TripOffer.tier == current_tier,
-                TripOffer.status == "pending",
+                TripOffer.status == "accepted",
             )
         ).one()
+        if accepted_count > 0:
+            return False  # Trip is taken, don't escalate
 
-        if pending_in_tier == 0:
-            should_escalate = True
+        next_tier = current_tier + 1
+        all_ranked_drivers = rank_drivers(session, trip.vehicle_type)
 
-        if should_escalate:
-            # Prepare Next Tier
-            next_tier = current_tier + 1
-            all_ranked_drivers = rank_drivers(session, trip.vehicle_type)
+        # Calculate Next Batch
+        start = current_tier * TIER_SIZE
+        end = start + TIER_SIZE
+        next_batch = all_ranked_drivers[start:end]
 
-            start_index = current_tier * TIER_SIZE
-            end_index = start_index + TIER_SIZE
-            next_batch = all_ranked_drivers[start_index:end_index]
+        if next_batch:
+            # Clean up old pending offers (if any remain)
+            old_offers = session.exec(
+                select(TripOffer).where(
+                    TripOffer.trip_id == trip.id, TripOffer.status == "pending"
+                )
+            ).all()
+            for o in old_offers:
+                session.delete(o)
 
-            if next_batch:
-                # Expire old pending offers
-                old_pending = session.exec(
-                    select(TripOffer).where(
-                        TripOffer.trip_id == trip.id, TripOffer.status == "pending"
-                    )
-                ).all()
-                for op in old_pending:
-                    session.delete(op)
+            create_offers_for_tier(session, trip.id, next_batch, next_tier)
+            return True
+        else:
+            # --- MISSING LOGIC FIXED HERE ---
+            # No drivers left? Auto-Cancel the trip.
+            trip.status = "cancelled"
+            session.add(trip)
+            # Optionally: Clean up offers so it doesn't clutter DB
+            all_offers = session.exec(
+                select(TripOffer).where(TripOffer.trip_id == trip.id)
+            ).all()
+            for o in all_offers:
+                session.delete(o)
 
-                # Create offers for next tier
-                create_offers_for_tier(session, trip.id, next_batch, next_tier)
-                escalated_count += 1
-            else:
-                # No more drivers!
-                trip.status = "no_drivers_available"
-                session.add(trip)
+            return True
 
+    return False
+
+
+def process_tier_escalation(session: Session) -> int:
+    """
+    Background Task: Scans all searching trips.
+    """
+    active_trips = session.exec(select(Trip).where(Trip.status == "searching")).all()
+    count = 0
+    for trip in active_trips:
+        if attempt_trip_escalation(session, trip):
+            count += 1
     session.commit()
-    return escalated_count
+    return count

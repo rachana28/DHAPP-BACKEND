@@ -1,8 +1,7 @@
 import redis
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select, desc, func
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select, desc
 from typing import List, Union
-from datetime import datetime, timedelta
 from sqlalchemy.orm import selectinload
 
 from app.database import get_session, get_redis
@@ -21,6 +20,7 @@ from app.utils.allocation import (
     rank_drivers,
     create_offers_for_tier,
     process_tier_escalation,
+    attempt_trip_escalation,
 )
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
@@ -246,9 +246,18 @@ def reject_trip_offer(
     if not offer or offer.driver_id != driver.id:
         raise HTTPException(404, "Offer not found")
 
+    # 1. Mark as Rejected
     offer.status = "rejected"
     session.add(offer)
-    session.commit()
+    session.commit()  # Commit the rejection first
+
+    # 2. Update: Instant Check
+    # Check if this rejection triggers next tier or cancellation
+    trip = session.get(Trip, offer.trip_id)
+    if trip and trip.status == "searching":
+        escalated = attempt_trip_escalation(session, trip)
+        if escalated:
+            session.commit()  # Commit the escalation/cancellation change
 
     return {"message": "Offer rejected"}
 
