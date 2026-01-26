@@ -2,15 +2,50 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from apscheduler.schedulers.asyncio import (
+    AsyncIOScheduler,
+)  # You need to install: pip install apscheduler
+from sqlmodel import Session
 
-from app.database import create_db_and_tables
-from app.routers import auth, drivers, organisations, trips, users
+from app.database import (
+    create_db_and_tables,
+    engine,
+)  # Import engine to create new sessions
+from app.routers import auth, drivers, trips, users
+from app.utils.allocation import process_tier_escalation  # Import the logic
+
+
+def run_scheduled_escalation_check():
+    """
+    This function runs every minute.
+    It creates a NEW database session specifically for this task.
+    """
+    print("⏳ Running scheduled escalation check...")
+    with Session(engine) as session:
+        try:
+            count = process_tier_escalation(session)
+            if count > 0:
+                print(f"✅ Escalated {count} trips to next tier.")
+        except Exception as e:
+            print(f"❌ Error in scheduled task: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Startup: Create DB Tables
     create_db_and_tables()
+
+    # 2. Startup: Initialize Scheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(run_scheduled_escalation_check, "interval", minutes=1)
+    scheduler.start()
+    print("🚀 Scheduler started: Checking for trip escalations every 1 minute.")
+
     yield
+
+    # 3. Shutdown
+    scheduler.shutdown()
+    print("🛑 Scheduler shut down.")
 
 
 app = FastAPI(lifespan=lifespan, title="Driver Hiring Backend")
@@ -37,7 +72,6 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(drivers.router)
-app.include_router(organisations.router)
 app.include_router(trips.router)
 app.include_router(users.router)
 

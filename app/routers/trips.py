@@ -1,117 +1,271 @@
 import redis
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
-from typing import List
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select, desc
+from typing import List, Union
+from sqlalchemy.orm import selectinload
 
 from app.database import get_session, get_redis
-from app.models import Trip, TripCreate, TripUpdate, User, Driver
+from app.models import (
+    Trip,
+    TripCreate,
+    TripOffer,
+    TripOfferPublic,
+    TripReadUser,
+    TripSafe,
+    Driver,
+    User,
+)
 from app.security import get_current_user
+from app.utils.allocation import (
+    rank_drivers,
+    create_offers_for_tier,
+    process_tier_escalation,
+    attempt_trip_escalation,
+)
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
 
+TIER_SIZE = 3  # Configurable: How many drivers per batch
 
-@router.post("/", response_model=Trip)
-def create_trip(
+
+@router.post("/book-request", response_model=TripSafe)
+def create_booking_request(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     trip_in: TripCreate,
-    redis_client: redis.Redis = Depends(get_redis),
 ):
     """
-    Create a new trip (booking request).
+    Step 1: User creates booking. System Segregates & Offers to Tier 1.
     """
-    if current_user.id != trip_in.user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only create trips for yourself.",
-        )
+    if not trip_in.vehicle_type:
+        raise HTTPException(400, "Vehicle type is required.")
 
-    # Verify driver exists
-    driver = session.get(Driver, trip_in.driver_id)
-    if not driver:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Driver with id {trip_in.driver_id} not found.",
-        )
+    # 1. Save Trip
+    trip_data = trip_in.model_dump()
+    trip_data["user_id"] = current_user.id
+    trip_data["status"] = "searching"
 
-    db_trip = Trip.model_validate(trip_in)
+    db_trip = Trip.model_validate(trip_data)
+
     session.add(db_trip)
     session.commit()
     session.refresh(db_trip)
 
-    # Invalidate cache
-    if redis_client:
-        redis_client.delete("drivers")
-        redis_client.delete(f"driver_{trip_in.driver_id}")
+    # 2. Rank Drivers (Intelligent Algorithm)
+    ranked_drivers = rank_drivers(session, trip_in.vehicle_type)
+
+    if not ranked_drivers:
+        db_trip.status = "no_drivers_found"
+        session.add(db_trip)
+        session.commit()
+        return db_trip
+
+    # 3. Offer to Tier 1
+    tier_1_drivers = ranked_drivers[:TIER_SIZE]
+    create_offers_for_tier(session, db_trip.id, tier_1_drivers, tier=1)
 
     return db_trip
 
 
-@router.get("/my-bookings", response_model=List[Trip])
-def get_my_bookings_as_driver(
+@router.get("/my-bookings", response_model=List[Union[TripReadUser, TripSafe]])
+def get_my_bookings(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Get all trip requests for the currently logged-in driver.
+    Get bookings for the current user.
+    - If User: Returns their trip history (Active & Past) with Driver details.
+    - If Driver: Returns trips they are assigned to.
     """
-    if current_user.role != "driver":
-        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.role == "driver":
+        # Existing Driver Logic
+        driver = session.exec(
+            select(Driver).where(Driver.user_id == current_user.id)
+        ).first()
+        if not driver:
+            return []
+        return session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
 
-    driver = session.exec(
-        select(Driver).where(Driver.user_id == current_user.id)
-    ).first()
+    else:
+        # New User Logic
+        # Fetch all trips for this user, joining the Driver table to populate details
+        statement = (
+            select(Trip)
+            .where(Trip.user_id == current_user.id)
+            .order_by(desc(Trip.booking_time))
+            .options(selectinload(Trip.driver))  # Load driver info for TripReadUser
+        )
+        return session.exec(statement).all()
 
-    if not driver:
-        raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    trips = session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
-    return trips
-
-
-@router.patch("/{trip_id}", response_model=Trip)
-def update_trip_status(
-    *,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+@router.post("/{trip_id}/cancel")
+def cancel_trip(
     trip_id: int,
-    trip_update: TripUpdate,
-    redis_client: redis.Redis = Depends(get_redis),
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Update trip status (e.g., accept, cancel).
-    Accessible by either the user who booked or the driver.
+    User cancels a trip.
+    Logic:
+    1. Mark Trip as 'cancelled'.
+    2. DELETE all active TripOffers so drivers no longer see the request.
     """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    # Check if the current user is the driver for the trip
+    # Security: Ensure user owns this trip
+    if trip.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to cancel this trip"
+        )
+
+    if trip.status in ["completed", "cancelled"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel a completed or already cancelled trip",
+        )
+
+    # 1. Update Status
+    trip.status = "cancelled"
+    session.add(trip)
+
+    # 2. Delete Requests (Offers)
+    # This removes the "Ring" from all drivers' phones/dashboards
+    offers = session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all()
+    for offer in offers:
+        session.delete(offer)
+
+    session.commit()
+
+    return {"message": "Trip cancelled successfully"}
+
+
+@router.get("/driver/offers", response_model=List[TripOfferPublic])
+def get_driver_offers(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get all pending offers for the logged-in driver.
+    Uses 'TripOfferPublic' to ensure NO sensitive credentials (user_id/driver_id) are exposed.
+    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    is_driver_of_trip = driver and driver.id == trip.driver_id
-    is_user_of_trip = current_user.id == trip.user_id
+    # Eager load the trip details
+    statement = (
+        select(TripOffer)
+        .where(TripOffer.driver_id == driver.id)
+        .where(TripOffer.status == "pending")
+        .options(selectinload(TripOffer.trip))
+    )
 
-    if not is_driver_of_trip and not is_user_of_trip:
-        raise HTTPException(
-            status_code=403, detail="Not authorized to update this trip"
-        )
+    offers = session.exec(statement).all()
+    return offers
 
-    update_data = trip_update.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(trip, key, value)
 
+@router.post("/driver/accept-offer/{offer_id}")
+def accept_trip_offer(
+    offer_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Driver accepts a trip.
+    CRITICAL: Deletes all other active offers for this trip immediately.
+    """
+    driver = session.exec(
+        select(Driver).where(Driver.user_id == current_user.id)
+    ).first()
+    if not driver:
+        raise HTTPException(403, "Only drivers can accept trips")
+
+    offer = session.get(TripOffer, offer_id)
+    if not offer or offer.driver_id != driver.id:
+        raise HTTPException(404, "Offer not found or not authorized")
+
+    if offer.status != "pending":
+        raise HTTPException(400, "Offer is no longer valid")
+
+    trip = session.get(Trip, offer.trip_id)
+    if trip.status != "searching":
+        raise HTTPException(400, "Trip has already been taken by another driver")
+
+    # 1. Assign Trip
+    trip.driver_id = driver.id
+    trip.status = "accepted"
+
+    # 2. Update Accepted Offer
+    offer.status = "accepted"
     session.add(trip)
+    session.add(offer)
+
+    # 3. DELETE all other offers for this trip (Requirement: automatically deleted)
+    other_offers = session.exec(
+        select(TripOffer).where(TripOffer.trip_id == trip.id)
+    ).all()
+    for o in other_offers:
+        if o.id != offer.id:
+            session.delete(o)
+
     session.commit()
-    session.refresh(trip)
 
-    # Invalidate cache
+    # Invalidate cache if needed
     if redis_client:
-        redis_client.delete("drivers")
-        redis_client.delete(f"driver_{trip.driver_id}")
+        redis_client.delete(f"driver_{driver.id}")
 
-    return trip
+    return {
+        "message": "Trip accepted. Other offers have been removed.",
+        "trip_id": trip.id,
+    }
+
+
+@router.post("/driver/reject-offer/{offer_id}")
+def reject_trip_offer(
+    offer_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Driver rejects an offer.
+    """
+    driver = session.exec(
+        select(Driver).where(Driver.user_id == current_user.id)
+    ).first()
+    if not driver:
+        raise HTTPException(403, "Not authorized")
+
+    offer = session.get(TripOffer, offer_id)
+    if not offer or offer.driver_id != driver.id:
+        raise HTTPException(404, "Offer not found")
+
+    # 1. Mark as Rejected
+    offer.status = "rejected"
+    session.add(offer)
+    session.commit()  # Commit the rejection first
+
+    # 2. Update: Instant Check
+    # Check if this rejection triggers next tier or cancellation
+    trip = session.get(Trip, offer.trip_id)
+    if trip and trip.status == "searching":
+        escalated = attempt_trip_escalation(session, trip)
+        if escalated:
+            session.commit()  # Commit the escalation/cancellation change
+
+    return {"message": "Offer rejected"}
+
+
+@router.post("/check-escalation")
+def check_and_escalate_tiers(session: Session = Depends(get_session)):
+    """
+    Manual trigger endpoint (useful for testing/debugging).
+    """
+    count = process_tier_escalation(session)
+    return {"message": f"Escalated {count} trips."}
