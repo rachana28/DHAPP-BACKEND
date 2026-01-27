@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
@@ -7,7 +6,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session, select
 
 from app.database import get_session
-from app.models import User, Driver
+from app.models import User, Driver, TowTruckDriver
 
 SECRET_KEY = "supersecretkey_change_this_in_production"
 ALGORITHM = "HS256"
@@ -75,10 +74,31 @@ def get_current_active_driver(
     return driver_profile
 
 
+def get_current_active_tow_truck_driver(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> TowTruckDriver:
+    if current_user.role != "tow_truck_driver":
+        raise HTTPException(status_code=403, detail="Not a tow truck driver")
+
+    driver_profile = session.exec(
+        select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
+    ).first()
+    if not driver_profile:
+        raise HTTPException(
+            status_code=404, detail="Tow truck driver profile not found"
+        )
+
+    return driver_profile
+
+
 def get_current_active_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
-    if current_user.role != "user":
-        raise HTTPException(status_code=403, detail="Not a user")
-    return current_user
-
+    if (
+        current_user.role == "user"
+        or current_user.role == "driver"
+        or current_user.role == "tow_truck_driver"
+    ):
+        return current_user
+    raise HTTPException(status_code=403, detail="Not a valid user")

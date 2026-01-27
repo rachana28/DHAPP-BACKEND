@@ -11,8 +11,17 @@ from app.database import (
     create_db_and_tables,
     engine,
 )  # Import engine to create new sessions
-from app.routers import auth, drivers, trips, users
-from app.utils.allocation import process_tier_escalation  # Import the logic
+from app.routers import (
+    auth,
+    drivers,
+    trips,
+    users,
+    tow_truck_drivers,
+    tow_trips,
+    tracking,
+)
+from app.utils.allocation import process_tier_escalation
+from app.utils.tow_allocation import process_tow_tier_escalation
 
 
 def run_scheduled_escalation_check():
@@ -30,20 +39,32 @@ def run_scheduled_escalation_check():
             print(f"❌ Error in scheduled task: {e}")
 
 
+def run_scheduled_tow_escalation_check():
+    """Runs every minute for tow trips."""
+    print("⏳ Running scheduled TOW escalation check...")
+    with Session(engine) as session:
+        try:
+            count = process_tow_tier_escalation(session)
+            if count > 0:
+                print(f"✅ Escalated {count} tow trips.")
+        except Exception as e:
+            print(f"❌ Error in tow scheduled task: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Create DB Tables
     create_db_and_tables()
 
-    # 2. Startup: Initialize Scheduler
     scheduler = AsyncIOScheduler()
     scheduler.add_job(run_scheduled_escalation_check, "interval", minutes=1)
+    scheduler.add_job(
+        run_scheduled_tow_escalation_check, "interval", minutes=1
+    )
     scheduler.start()
-    print("🚀 Scheduler started: Checking for trip escalations every 1 minute.")
+    print("🚀 Scheduler started.")
 
     yield
 
-    # 3. Shutdown
     scheduler.shutdown()
     print("🛑 Scheduler shut down.")
 
@@ -74,6 +95,9 @@ app.include_router(auth.router)
 app.include_router(drivers.router)
 app.include_router(trips.router)
 app.include_router(users.router)
+app.include_router(tow_truck_drivers.router)
+app.include_router(tow_trips.router)
+app.include_router(tracking.router)
 
 
 @app.get("/")

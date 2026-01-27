@@ -88,7 +88,7 @@ def get_my_bookings(
             return []
         return session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
 
-    else:
+    elif current_user.role == "user":
         # New User Logic
         # Fetch all trips for this user, joining the Driver table to populate details
         statement = (
@@ -98,6 +98,8 @@ def get_my_bookings(
             .options(selectinload(Trip.driver))  # Load driver info for TripReadUser
         )
         return session.exec(statement).all()
+    else:
+        return []
 
 
 @router.post("/{trip_id}/cancel")
