@@ -15,17 +15,30 @@ class DriverBase(SQLModel):
 
     # Professional Details
     years_of_experience: Optional[int] = None
-    vehicle_type: Optional[str] = None  # SEDAN, SUV, etc.
+    vehicle_type: Optional[str] = None
     fare_per_km: Optional[float] = None
     driver_allowance: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: str = "available"  # available, on_trip, busy
 
 
+class TowTruckDriverBase(SQLModel):
+    name: str
+    phone_number: str
+    vehicle_number: str  # Specific to Tow Truck
+    address: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    status: str = "available"
+    rating: float = Field(default=0.0)
+
+
 # --- Trip Models ---
 class TripBase(SQLModel):
     user_id: int = Field(foreign_key="user.id")
     driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+    tow_truck_driver_id: Optional[int] = Field(
+        default=None, foreign_key="towtruckdriver.id"
+    )  # Added
 
     # Booking Details
     hiring_type: str
@@ -44,8 +57,12 @@ class TripBase(SQLModel):
 class Trip(TripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     driver: Optional["Driver"] = Relationship(back_populates="trips")
+    tow_truck_driver: Optional["TowTruckDriver"] = Relationship(
+        back_populates="trips"
+    )  # Added
     user: "User" = Relationship(back_populates="trips")
     offers: List["TripOffer"] = Relationship(back_populates="trip")
+    tow_offers: List["TowTripOffer"] = Relationship(back_populates="trip")  # Added
 
 
 class TripOffer(SQLModel, table=True):
@@ -58,6 +75,18 @@ class TripOffer(SQLModel, table=True):
 
     trip: Trip = Relationship(back_populates="offers")
     driver: "Driver" = Relationship(back_populates="offers")
+
+
+class TowTripOffer(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    tow_truck_driver_id: int = Field(foreign_key="towtruckdriver.id")
+    status: str = "pending"
+    tier: int = 1
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    trip: Trip = Relationship(back_populates="tow_offers")
+    driver: "TowTruckDriver" = Relationship(back_populates="offers")
 
 
 # --- SAFETY LAYER: RESPONSE MODELS ---
@@ -77,7 +106,7 @@ class TripSafe(SQLModel):
 
 
 class TripOfferPublic(SQLModel):
-    id: int  # Offer ID
+    id: int
     status: str
     tier: int
     created_at: datetime
@@ -96,6 +125,16 @@ class Driver(DriverBase, table=True):
     offers: List[TripOffer] = Relationship(back_populates="driver")
 
 
+class TowTruckDriver(TowTruckDriverBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+
+    user: "User" = Relationship(back_populates="tow_truck_driver_profile")
+    trips: List[Trip] = Relationship(back_populates="tow_truck_driver")
+    reviews: List["TowTruckDriverReview"] = Relationship(back_populates="driver")
+    offers: List[TowTripOffer] = Relationship(back_populates="driver")
+
+
 # --- API Response Models ---
 class DriverPublic(SQLModel):
     id: int
@@ -109,12 +148,30 @@ class DriverPublic(SQLModel):
     total_trips: int = 0
 
 
+class TowTruckDriverPublic(SQLModel):
+    id: int
+    name: str
+    rating: float
+    profile_picture_url: Optional[str] = None
+    vehicle_number: str
+    status: str
+    total_trips: int = 0
+
+
 class TripReadUser(TripSafe):
     driver: Optional[DriverPublic] = None
+    tow_truck_driver: Optional[TowTruckDriverPublic] = (
+        None  # Added support for tow driver details
+    )
+
 
 class DriverPrivate(DriverBase):
     id: int
     rating: float
+
+
+class TowTruckDriverPrivate(TowTruckDriverBase):
+    id: int
 
 
 # --- Update Models ---
@@ -132,6 +189,15 @@ class DriverUpdate(SQLModel):
     status: Optional[str] = None
 
 
+class TowTruckDriverUpdate(SQLModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    phone_number: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    status: Optional[str] = None
+
+
 # --- Review Models ---
 class DriverReviewBase(SQLModel):
     user_id: int
@@ -144,6 +210,13 @@ class DriverReview(DriverReviewBase, table=True):
     driver_id: int = Field(foreign_key="driver.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     driver: "Driver" = Relationship(back_populates="reviews")
+
+
+class TowTruckDriverReview(DriverReviewBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver_id: int = Field(foreign_key="towtruckdriver.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    driver: "TowTruckDriver" = Relationship(back_populates="reviews")
 
 
 # --- User Models ---
@@ -159,6 +232,9 @@ class User(UserBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     hashed_password: str
     driver_profile: Optional[Driver] = Relationship(back_populates="user")
+    tow_truck_driver_profile: Optional[TowTruckDriver] = Relationship(
+        back_populates="user"
+    )  # Added
     trips: List[Trip] = Relationship(back_populates="user")
 
 
@@ -182,10 +258,11 @@ class UserCreate(SQLModel):
     password: str
     full_name: Optional[str] = None
     role: str = "user"
-    # Optional fields for Driver/Org creation
+    # Optional fields for Driver/Tow creation
     license_number: Optional[str] = None
     vehicle_type: Optional[str] = None
     phone_number: Optional[str] = None
+    vehicle_number: Optional[str] = None  # Added for TowTruckDriver
     org_name: Optional[str] = None
     contact_number: Optional[str] = None
     address: Optional[str] = None
@@ -209,6 +286,14 @@ class TripUpdate(SQLModel):
 
 
 class TripCreate(TripBase):
-    # Overriding these as they are set by the system, not the user
     user_id: Optional[int] = None
     driver_id: Optional[int] = None
+    tow_truck_driver_id: Optional[int] = None
+
+
+class LocationUpdate(SQLModel):
+    latitude: float
+    longitude: float
+    heading: Optional[float] = 0.0
+    speed: Optional[float] = 0.0
+    trip_id: Optional[int] = None

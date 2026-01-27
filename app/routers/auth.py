@@ -2,7 +2,7 @@ import redis
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 from app.database import get_session, get_redis
-from app.models import User, UserCreate, UserLogin, Token, Driver
+from app.models import User, UserCreate, UserLogin, Token, Driver, TowTruckDriver
 from app.security import get_password_hash, verify_password, create_access_token
 import requests
 import re
@@ -10,6 +10,7 @@ from dns import resolver
 from pydantic import BaseModel, EmailStr
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
 
 class EmailVerificationRequest(BaseModel):
     email: EmailStr
@@ -53,29 +54,29 @@ def signup(
     # Validate based on role
     if user.role == "user":
         if not user.full_name:
-            raise HTTPException(
-                status_code=400, detail="Full name is required for user"
-            )
+            raise HTTPException(status_code=400, detail="Full name is required")
     elif user.role == "driver":
         if not user.full_name or not user.license_number or not user.phone_number:
+            raise HTTPException(status_code=400, detail="Missing driver fields")
+    elif user.role == "tow_truck_driver":
+        # Check required fields for Tow Truck Driver
+        if not user.full_name or not user.vehicle_number or not user.phone_number:
             raise HTTPException(
                 status_code=400,
-                detail="Full name, license number, and phone number are required for driver",
+                detail="Full name, vehicle number, and phone number are required for tow truck driver",
             )
     else:
         raise HTTPException(status_code=400, detail="Invalid role")
 
-    # Check for duplicates
+    # Check duplicates
     statement = select(User).where(User.email == user.email, User.role == user.role)
-    existing_user = session.exec(statement).first()
-    if existing_user:
+    if session.exec(statement).first():
         raise HTTPException(
             status_code=400, detail="Email already registered for this role"
         )
 
-    # Hash the password
+    # Create User
     hashed_pwd = get_password_hash(user.password)
-
     db_user = User(
         email=user.email,
         hashed_password=hashed_pwd,
@@ -87,7 +88,7 @@ def signup(
     session.commit()
     session.refresh(db_user)
 
-    # Create role-specific entity
+    # Create Role Profile
     if user.role == "driver":
         db_driver = Driver(
             name=user.full_name,
@@ -98,10 +99,20 @@ def signup(
         )
         session.add(db_driver)
         session.commit()
-        if redis_client:
-            redis_client.delete("drivers")
 
-    access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role})
+    elif user.role == "tow_truck_driver":
+        db_tow_driver = TowTruckDriver(
+            name=user.full_name,
+            phone_number=user.phone_number,
+            vehicle_number=user.vehicle_number,
+            user_id=db_user.id,
+        )
+        session.add(db_tow_driver)
+        session.commit()
+
+    access_token = create_access_token(
+        data={"sub": db_user.email, "role": db_user.role}
+    )
     return {
         "access_token": access_token,
         "token_type": "bearer",
