@@ -19,6 +19,7 @@ from app.routers import (
     tow_truck_drivers,
     tow_trips,
     tracking,
+    price_calculator,
 )
 from app.utils.allocation import process_tier_escalation
 from app.utils.tow_allocation import process_tow_tier_escalation
@@ -57,9 +58,7 @@ async def lifespan(app: FastAPI):
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(run_scheduled_escalation_check, "interval", minutes=1)
-    scheduler.add_job(
-        run_scheduled_tow_escalation_check, "interval", minutes=1
-    )
+    scheduler.add_job(run_scheduled_tow_escalation_check, "interval", minutes=1)
     scheduler.start()
     print("🚀 Scheduler started.")
 
@@ -98,6 +97,7 @@ app.include_router(users.router)
 app.include_router(tow_truck_drivers.router)
 app.include_router(tow_trips.router)
 app.include_router(tracking.router)
+app.include_router(price_calculator.router)
 
 
 @app.get("/")
