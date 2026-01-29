@@ -4,9 +4,9 @@ from fastapi import APIRouter, Depends, File, UploadFile
 from sqlmodel import Session
 import time
 
-from app.database import get_session
-from app.models import User, UserUpdate, UserPrivate
-from app.security import get_current_active_user
+from app.core.database import get_session
+from app.core.models import User, UserUpdate, UserPrivate
+from app.core.security import get_current_active_user
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -59,7 +59,9 @@ def update_profile_picture(
     timestamp = int(time.time())
     file_extension = os.path.splitext(file.filename)[1]
     # Sanitize filename if needed, but here we generate a new one
-    file_path = f"media/profile_pictures/user_{current_user.id}_{timestamp}{file_extension}"
+    file_path = (
+        f"media/profile_pictures/user_{current_user.id}_{timestamp}{file_extension}"
+    )
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)

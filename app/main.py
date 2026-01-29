@@ -7,22 +7,25 @@ from apscheduler.schedulers.asyncio import (
 )  # You need to install: pip install apscheduler
 from sqlmodel import Session
 
-from app.database import (
+from app.core.database import (
     create_db_and_tables,
     engine,
-)  # Import engine to create new sessions
-from app.routers import (
-    auth,
-    drivers,
-    trips,
-    users,
-    tow_truck_drivers,
-    tow_trips,
-    tracking,
-    price_calculator,
 )
-from app.utils.allocation import process_tier_escalation
-from app.utils.tow_allocation import process_tow_tier_escalation
+
+# Import Routers from Modules
+from app.modules.auth import router as auth_router, users as users_router
+from app.modules.drivers import router as drivers_router
+from app.modules.trips import router as trips_router
+from app.modules.towing import (
+    driver_router as tow_drivers_router,
+    trip_router as tow_trips_router,
+)
+from app.modules.pricing import router as pricing_router
+from app.modules.tracking import router as tracking_router
+
+# Import Services for Scheduled Tasks
+from app.modules.trips.allocation import process_tier_escalation
+from app.modules.towing.tow_allocation import process_tow_tier_escalation
 
 
 def run_scheduled_escalation_check():
@@ -90,14 +93,14 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-app.include_router(auth.router)
-app.include_router(drivers.router)
-app.include_router(trips.router)
-app.include_router(users.router)
-app.include_router(tow_truck_drivers.router)
-app.include_router(tow_trips.router)
-app.include_router(tracking.router)
-app.include_router(price_calculator.router)
+app.include_router(auth_router.router)
+app.include_router(drivers_router.router)
+app.include_router(trips_router.router)
+app.include_router(users_router.router)
+app.include_router(tow_drivers_router.router)
+app.include_router(tow_trips_router.router)
+app.include_router(tracking_router.router)
+app.include_router(pricing_router.router)
 
 
 @app.get("/")

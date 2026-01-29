@@ -5,11 +5,11 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from fastapi.encoders import jsonable_encoder
 from sqlmodel import Session, select, func, desc
-from typing import List, Optional
+from typing import List
 import redis
 
-from app.database import get_session, get_redis
-from app.models import (
+from app.core.database import get_session, get_redis
+from app.core.models import (
     Driver,
     DriverUpdate,
     DriverPublic,
@@ -17,7 +17,7 @@ from app.models import (
     DriverReview,
     Trip,
 )
-from app.security import get_current_active_driver
+from app.core.security import get_current_active_driver
 
 router = APIRouter(prefix="/drivers", tags=["Drivers"])
 
@@ -75,7 +75,9 @@ def update_driver_profile_picture(
     """
     timestamp = int(time.time())
     file_extension = os.path.splitext(file.filename)[1]
-    file_path = f"media/profile_pictures/driver_{current_driver.id}_{timestamp}{file_extension}"
+    file_path = (
+        f"media/profile_pictures/driver_{current_driver.id}_{timestamp}{file_extension}"
+    )
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)

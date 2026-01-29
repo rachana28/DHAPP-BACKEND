@@ -6,8 +6,8 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session, select
 import uuid
 
-from app.database import get_session
-from app.models import User, Driver, TowTruckDriver
+from app.core.database import get_session
+from app.core.models import User, Driver, TowTruckDriver
 
 SECRET_KEY = "supersecretkey_change_this_in_production"
 REFRESH_SECRET_KEY = "refresh_supersecretkey_change_this_too"

@@ -1,15 +1,13 @@
-import json
 import os
 import shutil
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
-from fastapi.encoders import jsonable_encoder
 from sqlmodel import Session, select, func, desc
 from typing import List
 import redis
 
-from app.database import get_session, get_redis
-from app.models import (
+from app.core.database import get_session, get_redis
+from app.core.models import (
     TowTruckDriver,
     TowTruckDriverUpdate,
     TowTruckDriverPublic,
@@ -17,7 +15,7 @@ from app.models import (
     TowTruckDriverReview,
     Trip,
 )
-from app.security import get_current_active_tow_truck_driver
+from app.core.security import get_current_active_tow_truck_driver
 
 router = APIRouter(prefix="/tow-truck-drivers", tags=["Tow Truck Drivers"])
 

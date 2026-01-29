@@ -1,7 +1,7 @@
 from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
-from app.models import Driver, Trip, TripOffer
+from app.core.models import Driver, Trip, TripOffer
 
 
 def get_driver_score(

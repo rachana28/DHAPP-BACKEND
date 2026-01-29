@@ -1,9 +1,9 @@
 import redis
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
-from app.database import get_session, get_redis
-from app.models import User, UserCreate, UserLogin, Token, Driver, TowTruckDriver
-from app.security import (
+from app.core.database import get_session, get_redis
+from app.core.models import User, UserCreate, UserLogin, Token, Driver, TowTruckDriver
+from app.core.security import (
     get_password_hash,
     verify_password,
     create_access_token,
