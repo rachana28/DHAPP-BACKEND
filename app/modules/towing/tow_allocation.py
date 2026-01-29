@@ -1,7 +1,7 @@
 from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
-from app.models import TowTruckDriver, Trip, TowTripOffer
+from app.core.models import TowTruckDriver, Trip, TowTripOffer
 
 
 def get_tow_driver_score(

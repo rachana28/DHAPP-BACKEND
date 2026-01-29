@@ -4,8 +4,8 @@ from sqlmodel import Session, select, desc
 from typing import List, Union
 from sqlalchemy.orm import selectinload
 
-from app.database import get_session, get_redis
-from app.models import (
+from app.core.database import get_session, get_redis
+from app.core.models import (
     Trip,
     TripCreate,
     TripOffer,
@@ -15,8 +15,8 @@ from app.models import (
     Driver,
     User,
 )
-from app.security import get_current_user
-from app.utils.allocation import (
+from app.core.security import get_current_user
+from app.modules.trips.allocation import (
     rank_drivers,
     create_offers_for_tier,
     process_tier_escalation,

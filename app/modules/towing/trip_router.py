@@ -1,11 +1,10 @@
-import redis
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select, desc
 from typing import List
 from sqlalchemy.orm import selectinload
 
-from app.database import get_session, get_redis
-from app.models import (
+from app.core.database import get_session
+from app.core.models import (
     Trip,
     TripCreate,
     TripSafe,
@@ -15,8 +14,8 @@ from app.models import (
     TripOfferPublic,
     User,
 )
-from app.security import get_current_user, get_current_active_tow_truck_driver
-from app.utils.tow_allocation import (
+from app.core.security import get_current_user, get_current_active_tow_truck_driver
+from app.modules.towing.tow_allocation import (
     rank_tow_drivers,
     create_tow_offers_for_tier,
     attempt_tow_trip_escalation,

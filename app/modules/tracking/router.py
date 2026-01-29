@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
-from app.database import get_redis, get_session
-from app.models import LocationUpdate, User, Trip, TowTruckDriver
-from app.security import get_current_user
+from app.core.database import get_redis, get_session
+from app.core.models import LocationUpdate, User, Trip, TowTruckDriver
+from app.core.security import get_current_user
 from sqlalchemy.orm import selectinload
 import redis
 import json
