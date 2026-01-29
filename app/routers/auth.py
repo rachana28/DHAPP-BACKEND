@@ -3,7 +3,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 from app.database import get_session, get_redis
 from app.models import User, UserCreate, UserLogin, Token, Driver, TowTruckDriver
-from app.security import get_password_hash, verify_password, create_access_token
+from app.security import (
+    get_password_hash,
+    verify_password,
+    create_access_token,
+    create_refresh_token,
+    verify_refresh_token,
+)
 import requests
 import re
 from dns import resolver
@@ -14,6 +20,10 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 class EmailVerificationRequest(BaseModel):
     email: EmailStr
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
 
 
 @router.post("/verify-email")
@@ -113,8 +123,12 @@ def signup(
     access_token = create_access_token(
         data={"sub": db_user.email, "role": db_user.role}
     )
+    refresh_token = create_refresh_token(
+        data={"sub": db_user.email, "role": db_user.role}
+    )
     return {
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": {
             "name": db_user.full_name,
@@ -135,8 +149,30 @@ def login(user_data: UserLogin, session: Session = Depends(get_session)):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
     access_token = create_access_token(data={"sub": user.email, "role": user.role})
+    refresh_token = create_refresh_token(data={"sub": user.email, "role": user.role})
     return {
         "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {"name": user.full_name, "picture": user.avatar_url, "role": user.role},
+    }
+
+
+@router.post("/refresh", response_model=Token)
+def refresh_token(
+    request: RefreshTokenRequest, session: Session = Depends(get_session)
+):
+    user = verify_refresh_token(request.refresh_token, session)
+
+    # Token Rotation: Issue new Access AND new Refresh token (safer)
+    new_access_token = create_access_token(data={"sub": user.email, "role": user.role})
+    new_refresh_token = create_refresh_token(
+        data={"sub": user.email, "role": user.role}
+    )
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
         "token_type": "bearer",
         "user": {"name": user.full_name, "picture": user.avatar_url, "role": user.role},
     }
@@ -171,8 +207,10 @@ def google_login(token: str, session: Session = Depends(get_session)):
         session.commit()
 
     access_token = create_access_token(data={"sub": user.email, "role": user.role})
+    refresh_token = create_refresh_token(data={"sub": user.email, "role": user.role})
     return {
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": {"name": user.full_name, "picture": user.avatar_url, "role": user.role},
     }
