@@ -77,39 +77,24 @@ app = FastAPI(lifespan=lifespan, title="Driver Hiring Backend")
 # This will serve files from the 'media' directory at the '/media' URL path
 app.mount("/media", StaticFiles(directory="media"), name="media")
 
+# commented to integrate with mobile apps also
+# origins = [
+#     # 1. Production Web Frontend (User & Driver)
+#     "https://dhapp-frontend.onrender.com",
+#     "https://dhire-driverspace.onrender.com",
 
-origins = [
-    # 1. Production Web Frontend (User & Driver)
-    "https://dhapp-frontend.onrender.com",
-    "https://dhire-driverspace.onrender.com",
+#     # 2. Local Web Development
+#     "http://localhost:5173",
+#     "http://localhost:3000",
 
-    # 2. Local Web Development
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
-
-# DYNAMIC ORIGIN REGEX
-# This Logic:
-# 1. ^http://localhost...        -> Trusts the machine itself (Simulators)
-# 2. ^http://127\.0\.0\.1...     -> Trusts the loopback IP (Android Emulators)
-# 3. ^http://192\.168\....       -> Trusts YOUR WIFI NETWORK (iPhone + Laptop)
-# 4. ^http://10\....             -> Trusts Enterprise/School Networks
-# 5. ^http://172\....            -> Trusts Docker/WSL Networks
-# 6. ^https://.*\.onrender\.com$ -> Trusts your cloud deployments
-
-allow_origin_regex = (
-    r"^(http://localhost(:\d+)?)|"
-    r"(http://127\.0\.0\.1(:\d+)?)|"
-    r"(http://192\.168\.\d{1,3}\.\d{1,3}(:\d+)?)|" 
-    r"(http://10\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?)|"
-    r"(http://172\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?)|"
-    r"(https://.*\.onrender\.com)$"
-)
+#     # ... web urls ...
+#     "capacitor://localhost", # If using Capacitor
+#     "http://localhost",      # Sometimes iOS simulators send this
+# ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,             # Explicit allow list (Web)
-    allow_origin_regex=allow_origin_regex, # Smart Regex (Mobile/Dev)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
