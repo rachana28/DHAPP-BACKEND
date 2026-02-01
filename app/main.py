@@ -77,24 +77,24 @@ app = FastAPI(lifespan=lifespan, title="Driver Hiring Backend")
 # This will serve files from the 'media' directory at the '/media' URL path
 app.mount("/media", StaticFiles(directory="media"), name="media")
 
+# commented to integrate with mobile apps also
+# origins = [
+#     # 1. Production Web Frontend (User & Driver)
+#     "https://dhapp-frontend.onrender.com",
+#     "https://dhire-driverspace.onrender.com",
 
-origins = [
-    # 1. Production Web Frontend (User & Driver)
-    "https://dhapp-frontend.onrender.com",
-    "https://dhire-driverspace.onrender.com",
+#     # 2. Local Web Development
+#     "http://localhost:5173",
+#     "http://localhost:3000",
 
-    # 2. Local Web Development
-    "http://localhost:5173",
-    "http://localhost:3000",
-
-    # ... web urls ...
-    "capacitor://localhost", # If using Capacitor
-    "http://localhost",      # Sometimes iOS simulators send this
-]
+#     # ... web urls ...
+#     "capacitor://localhost", # If using Capacitor
+#     "http://localhost",      # Sometimes iOS simulators send this
+# ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
