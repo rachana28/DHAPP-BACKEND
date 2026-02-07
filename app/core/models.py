@@ -228,13 +228,25 @@ class UserBase(SQLModel):
     role: str = "user"
 
 
+class UserDevice(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    token: str = Field(index=True)  # The Expo Push Token
+    platform: Optional[str] = None  # 'ios' or 'android'
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
+
+    user: "User" = Relationship(back_populates="devices")
+
+
 class User(UserBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     hashed_password: str
+    devices: List["UserDevice"] = Relationship(back_populates="user")
     driver_profile: Optional[Driver] = Relationship(back_populates="user")
     tow_truck_driver_profile: Optional[TowTruckDriver] = Relationship(
         back_populates="user"
-    )  # Added
+    )
     trips: List[Trip] = Relationship(back_populates="user")
 
 
