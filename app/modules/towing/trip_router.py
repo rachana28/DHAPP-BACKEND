@@ -20,6 +20,8 @@ from app.modules.towing.tow_allocation import (
     create_tow_offers_for_tier,
     attempt_tow_trip_escalation,
 )
+from app.utils.notifications import send_push_notification
+from fastapi import BackgroundTasks
 
 router = APIRouter(prefix="/tow-trips", tags=["Tow Trips"])
 
@@ -95,6 +97,7 @@ def get_my_tow_bookings(
 @router.post("/{trip_id}/cancel")
 def cancel_tow_trip(
     trip_id: int,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
@@ -116,6 +119,13 @@ def cancel_tow_trip(
             detail="Cannot cancel a completed or already cancelled trip",
         )
 
+    driver_user_id_to_notify = None
+    if trip.tow_truck_driver_id:
+        # If a driver was already assigned, we must tell them it's cancelled
+        driver = session.get(TowTruckDriver, trip.tow_truck_driver_id)
+        if driver:
+            driver_user_id_to_notify = driver.user_id
+
     # Update Status
     trip.status = "cancelled"
     session.add(trip)
@@ -128,6 +138,16 @@ def cancel_tow_trip(
         session.delete(offer)
 
     session.commit()
+
+    if driver_user_id_to_notify:
+        background_tasks.add_task(
+            send_push_notification,
+            session=session,
+            user_ids=[driver_user_id_to_notify],
+            title="Trip Cancelled ❌",
+            body="The customer has cancelled this request.",
+            data={"trip_id": trip.id, "type": "cancellation"},
+        )
 
     return {"message": "Tow trip cancelled successfully"}
 
@@ -150,6 +170,7 @@ def get_tow_driver_offers(
 @router.post("/driver/accept-offer/{offer_id}")
 def accept_tow_offer(
     offer_id: int,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
 ):
@@ -179,6 +200,20 @@ def accept_tow_offer(
             session.delete(o)
 
     session.commit()
+
+    try:
+        # EXECUTE IN BACKGROUND (Non-blocking)
+        background_tasks.add_task(
+            send_push_notification,
+            session=session,
+            user_ids=[trip.user_id],  # Pass as list
+            title="Tow Truck Confirmed! 🚛",
+            body=f"{current_driver.name} is on the way.",
+            data={"trip_id": trip.id, "screen": "tracking"},
+        )
+    except Exception as e:
+        print(f"Notification error: {e}")
+
     return {"message": "Trip accepted", "trip_id": trip.id}
 
 

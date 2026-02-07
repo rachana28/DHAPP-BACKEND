@@ -2,6 +2,7 @@ from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
 from app.core.models import TowTruckDriver, Trip, TowTripOffer
+from app.utils.notifications import send_push_notification
 
 
 def get_tow_driver_score(
@@ -59,8 +60,20 @@ def create_tow_offers_for_tier(
         session.add(offer)
     session.commit()
 
+    # 2. Notify Drivers (Bulk Send)
+    # Collect all user_ids for these drivers
+    driver_user_ids = [d.user_id for d in drivers]
 
-# --- MISSING ESCALATION LOGIC ---
+    if driver_user_ids:
+        # Note: We cannot use BackgroundTasks easily here since this is a helper function.
+        # But `send_push_notification` is optimized to batch requests.
+        send_push_notification(
+            session=session,
+            user_ids=driver_user_ids,
+            title="New Tow Request! 🚨",
+            body="A new customer nearby needs a tow.",
+            data={"trip_id": trip_id, "type": "new_request"},
+        )
 
 
 def attempt_tow_trip_escalation(session: Session, trip: Trip) -> bool:

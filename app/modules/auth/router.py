@@ -1,14 +1,24 @@
 import redis
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select
+from sqlmodel import Session, select, delete
+from datetime import datetime
 from app.core.database import get_session, get_redis
-from app.core.models import User, UserCreate, UserLogin, Token, Driver, TowTruckDriver
+from app.core.models import (
+    User,
+    UserCreate,
+    UserLogin,
+    Token,
+    Driver,
+    TowTruckDriver,
+    UserDevice,
+)
 from app.core.security import (
     get_password_hash,
     verify_password,
     create_access_token,
     create_refresh_token,
     verify_refresh_token,
+    get_current_user,
 )
 import requests
 import re
@@ -24,6 +34,11 @@ class EmailVerificationRequest(BaseModel):
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
+
+
+class DeviceTokenRequest(BaseModel):
+    token: str
+    platform: str = "unknown"
 
 
 @router.post("/verify-email")
@@ -214,3 +229,50 @@ def google_login(token: str, session: Session = Depends(get_session)):
         "token_type": "bearer",
         "user": {"name": user.full_name, "picture": user.avatar_url, "role": user.role},
     }
+
+
+@router.post("/logout")
+def logout(
+    data: DeviceTokenRequest,  # Mobile app must send the token it wants to remove
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Removes the specific device token on logout so notifications stop.
+    """
+    statement = delete(UserDevice).where(
+        UserDevice.user_id == current_user.id, UserDevice.token == data.token
+    )
+    session.exec(statement)
+    session.commit()
+
+    return {"message": "Logged out and device token removed"}
+
+
+@router.post("/device/register")
+def register_device(
+    data: DeviceTokenRequest,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Registers or updates a device push token for the current user.
+    """
+    # Check if token already exists for this user
+    statement = select(UserDevice).where(
+        UserDevice.user_id == current_user.id, UserDevice.token == data.token
+    )
+    existing_device = session.exec(statement).first()
+
+    if existing_device:
+        existing_device.last_updated = datetime.utcnow()
+        existing_device.platform = data.platform
+        session.add(existing_device)
+    else:
+        new_device = UserDevice(
+            user_id=current_user.id, token=data.token, platform=data.platform
+        )
+        session.add(new_device)
+
+    session.commit()
+    return {"message": "Device registered successfully"}
