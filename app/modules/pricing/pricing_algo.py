@@ -3,6 +3,7 @@ import requests
 from datetime import datetime
 import json
 import base64
+from typing import Optional
 
 # --- CONFIGURATION ---
 OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving"
@@ -12,8 +13,7 @@ def get_road_distance_duration(
     start_lat: float, start_lng: float, dest_lat: float, dest_lng: float
 ):
     """
-    Fetches accurate road distance and duration using OSRM (Open Source Routing Machine).
-    Fallback to Haversine if OSRM fails.
+    Fetches accurate road distance and duration using OSRM.
     """
     try:
         url = f"{OSRM_BASE_URL}/{start_lng},{start_lat};{dest_lng},{dest_lat}?overview=false"
@@ -27,12 +27,12 @@ def get_road_distance_duration(
                 return (
                     distance_meters / 1000.0,
                     duration_seconds / 60.0,
-                )  # Returns km, min
+                )
     except Exception as e:
         print(f"Routing Error: {e}")
 
-    # Fallback: Haversine Formula * 1.4 (Tortuosity factor for road approx)
-    R = 6371  # Earth radius in km
+    # Fallback: Haversine
+    R = 6371
     dLat = math.radians(dest_lat - start_lat)
     dLon = math.radians(dest_lng - start_lng)
     a = math.sin(dLat / 2) * math.sin(dLat / 2) + math.cos(
@@ -40,41 +40,65 @@ def get_road_distance_duration(
     ) * math.cos(math.radians(dest_lat)) * math.sin(dLon / 2) * math.sin(dLon / 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     dist_km = R * c * 1.4
-    return dist_km, dist_km * 3  # Approx 3 mins per km
+    return dist_km, dist_km * 3
 
 
-def calculate_tow_cost(distance_km: float, vehicle_type: str) -> dict:
+def calculate_tow_cost(
+    distance_km: float, vehicle_type: str, redis_client: Optional[object] = None
+) -> dict:
     """
-    Intelligent Pricing Algorithm simulating a trained model logic.
-    Factors: Base Fare, Distance Tiers, Time of Day, Vehicle Type.
+    Intelligent Pricing Algorithm.
+    Fetches dynamic base fare from Redis if available.
     """
     current_hour = datetime.now().hour
 
-    # 1. Base Parameters
+    # 1. Base Parameters (Defaults)
     if vehicle_type.upper() == "BIKE":
-        base_fare = 255
-        rate_per_km = 12
+        base_fare = 255.0
+        rate_per_km = 12.0
         min_charge = 380.0
     else:  # CAR / SUV
-        base_fare = 450
-        rate_per_km = 15
+        base_fare = 450.0
+        rate_per_km = 15.0
         min_charge = 580.0
 
-    # 2. Time Multiplier (AI Heuristic)
-    # Night (10 PM - 5 AM): High Risk/Traffic Free but scarce drivers
-    # Evening (6 PM - 10 PM): High Traffic
-    # Day (5 AM - 6 PM): Standard
+    # 2. Dynamic Override (Check Admin Config)
+    if redis_client:
+        try:
+            # Keys must match what Admin sets in System Config
+            # Example Key: config:bike_base_fare
+            v_key = vehicle_type.lower()
+
+            # Fetch Base Fare
+            dyn_base = redis_client.get(f"config:{v_key}_base_fare")
+            if dyn_base:
+                base_fare = float(dyn_base)
+
+            # Fetch Rate Per KM
+            dyn_rate = redis_client.get(f"config:{v_key}_rate_per_km")
+            if dyn_rate:
+                rate_per_km = float(dyn_rate)
+
+            # Fetch Min Charge
+            dyn_min = redis_client.get(f"config:{v_key}_min_charge")
+            if dyn_min:
+                min_charge = float(dyn_min)
+
+        except Exception as e:
+            print(f"Pricing Config Fetch Error: {e}")
+
+    # 3. Time Multiplier (AI Heuristic)
     if 22 <= current_hour or current_hour < 5:
-        time_multiplier = 1.5  # Night Surge
+        time_multiplier = 1.5  # Night
         time_label = "Night"
     elif 18 <= current_hour < 22:
-        time_multiplier = 1.25  # Peak Traffic
+        time_multiplier = 1.25  # Evening
         time_label = "Evening"
     else:
-        time_multiplier = 1.0  # Standard
+        time_multiplier = 1.0  # Day
         time_label = "Day"
 
-    # 3. Distance Tiering (Longer distance = slightly lower marginal cost)
+    # 4. Distance Calculation
     distance_cost = 0.0
     if distance_km <= 10:
         distance_cost = distance_km * rate_per_km
@@ -87,7 +111,7 @@ def calculate_tow_cost(distance_km: float, vehicle_type: str) -> dict:
             + ((distance_km - 50) * (rate_per_km * 0.85))
         )
 
-    # 4. Final Calculation
+    # 5. Final Calculation
     sub_total = base_fare + distance_cost
     total_price = max(sub_total * time_multiplier, min_charge)
 
@@ -102,14 +126,12 @@ def calculate_tow_cost(distance_km: float, vehicle_type: str) -> dict:
             "time_multiplier": time_multiplier,
             "time_slot": time_label,
             "vehicle_type": vehicle_type,
+            "rate_used": rate_per_km,
         },
     }
 
 
 def encode_response_data(data: dict) -> str:
-    """
-    Base64 encodes the JSON response to obfuscate pricing logic from casual UI inspection.
-    """
     json_str = json.dumps(data)
     encoded_bytes = base64.b64encode(json_str.encode("utf-8"))
     return encoded_bytes.decode("utf-8")

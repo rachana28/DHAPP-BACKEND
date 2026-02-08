@@ -7,6 +7,7 @@ from app.core.models import (
     User,
     UserCreate,
     UserLogin,
+    UserUpdate,
     Token,
     Driver,
     TowTruckDriver,
@@ -39,6 +40,10 @@ class RefreshTokenRequest(BaseModel):
 class DeviceTokenRequest(BaseModel):
     token: str
     platform: str = "unknown"
+
+
+class PasswordChangeRequest(BaseModel):
+    new_password: str
 
 
 @router.post("/verify-email")
@@ -163,14 +168,44 @@ def login(user_data: UserLogin, session: Session = Depends(get_session)):
     if not user or not verify_password(user_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
+    # Generate Tokens
     access_token = create_access_token(data={"sub": user.email, "role": user.role})
     refresh_token = create_refresh_token(data={"sub": user.email, "role": user.role})
+
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": {"name": user.full_name, "picture": user.avatar_url, "role": user.role},
+        "user": {
+            "name": user.full_name,
+            "picture": user.avatar_url,
+            "role": user.role,
+            "force_password_change": user.force_password_change,
+        },
     }
+
+
+@router.post("/change-password")
+def change_password(
+    data: PasswordChangeRequest,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(
+        get_current_user
+    ),  # Use get_current_user (NOT Admin) so they aren't blocked
+):
+    """
+    Endpoint to set a new password.
+    Can be used by any authenticated user, but specifically clears the force_password_change flag.
+    """
+    hashed_pwd = get_password_hash(data.new_password)
+
+    current_user.hashed_password = hashed_pwd
+    current_user.force_password_change = False  # Clear the flag
+
+    session.add(current_user)
+    session.commit()
+
+    return {"message": "Password updated successfully. You may proceed to dashboard."}
 
 
 @router.post("/refresh", response_model=Token)

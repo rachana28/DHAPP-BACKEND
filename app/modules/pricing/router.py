@@ -1,5 +1,9 @@
-from fastapi import APIRouter, Form
+from fastapi import APIRouter, Form, Depends
 from typing import Optional
+import redis
+
+from app.core.database import get_redis
+
 from app.modules.pricing.pricing_algo import (
     get_road_distance_duration,
     calculate_tow_cost,
@@ -15,29 +19,29 @@ def calculate_towing_price(
     start_lng: float = Form(...),
     dest_lat: float = Form(...),
     dest_lng: float = Form(...),
-    vehicle_type: str = Form(..., regex="^(CAR|BIKE)$"),  # Strict Regex Validation
-    user_id: Optional[str] = Form(None),  # Optional for tracking/logging later
+    vehicle_type: str = Form(..., regex="^(CAR|BIKE)$"),
+    user_id: Optional[str] = Form(None),
+    # Inject Redis Client
+    redis_client: redis.Redis = Depends(get_redis),
 ):
     """
     Calculates towing price based on road distance and time.
-    Payload: Form Data (Harder to automate/inject json)
-    Response: Base64 Encoded JSON (Obfuscated)
+    Uses Dynamic Pricing from Redis Config if available.
     """
 
-    # 1. Calculate Distance (Road Routing)
+    # 1. Calculate Distance
     distance_km, duration_min = get_road_distance_duration(
         start_lat, start_lng, dest_lat, dest_lng
     )
 
     if distance_km is None or distance_km == 0:
-        # Fallback logic handled in utils, but if 0
-        distance_km = 1.0  # Minimum distance
+        distance_km = 1.0
         duration_min = 10.0
 
-    # 2. Run Intelligent Pricing Algorithm
-    pricing_result = calculate_tow_cost(distance_km, vehicle_type)
+    # 2. Run Intelligent Pricing Algorithm (Pass Redis Client)
+    pricing_result = calculate_tow_cost(distance_km, vehicle_type, redis_client)
 
-    # 3. Construct Final Data Payload
+    # 3. Construct Payload
     response_data = {
         "status": "success",
         "distance_km": round(distance_km, 2),

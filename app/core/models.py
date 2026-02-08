@@ -19,7 +19,7 @@ class DriverBase(SQLModel):
     fare_per_km: Optional[float] = None
     driver_allowance: Optional[float] = None
     spoken_languages: Optional[str] = None
-    status: str = "available"  # available, on_trip, busy
+    status: str = "pending_approval"
 
 
 class TowTruckDriverBase(SQLModel):
@@ -28,7 +28,7 @@ class TowTruckDriverBase(SQLModel):
     vehicle_number: str  # Specific to Tow Truck
     address: Optional[str] = None
     profile_picture_url: Optional[str] = None
-    status: str = "available"
+    status: str = "pending_approval"
     rating: float = Field(default=0.0)
 
 
@@ -239,21 +239,63 @@ class UserDevice(SQLModel, table=True):
     user: "User" = Relationship(back_populates="devices")
 
 
+# --- NEW: SYSTEM CONFIGURATION ---
+class SystemConfig(SQLModel, table=True):
+    key: str = Field(primary_key=True)  # e.g., "bike_base_fare", "car_per_km"
+    value: str  # We store as string and cast later (e.g., "450.0")
+    description: Optional[str] = None
+
+
+# --- NEW: SUPPORT TICKET SYSTEM ---
+class SupportTicketBase(SQLModel):
+    subject: str
+    description: str
+    category: str = "general"  # payment, safety, technical, other
+    priority: str = "medium"  # low, medium, high
+
+
+class SupportTicket(SupportTicketBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    ticket_id: str = Field(index=True)  # Unique ID like "TKT-1001" for display
+    status: str = "open"  # open, in_progress, resolved, closed
+    admin_response: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    user: "User" = Relationship(back_populates="tickets")
+
+
+class SupportTicketCreate(SupportTicketBase):
+    pass
+
+
+class SupportTicketResponse(SupportTicketBase):
+    id: int
+    ticket_id: str
+    status: str
+    admin_response: Optional[str]
+    created_at: datetime
+
+
 class User(UserBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     hashed_password: str
+    force_password_change: bool = Field(default=False)
     devices: List["UserDevice"] = Relationship(back_populates="user")
     driver_profile: Optional[Driver] = Relationship(back_populates="user")
     tow_truck_driver_profile: Optional[TowTruckDriver] = Relationship(
         back_populates="user"
     )
     trips: List[Trip] = Relationship(back_populates="user")
+    tickets: List["SupportTicket"] = Relationship(back_populates="user")
 
 
 class UserPublic(SQLModel):
     id: int
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    force_password_change: bool = False
 
 
 class UserPrivate(UserBase):
