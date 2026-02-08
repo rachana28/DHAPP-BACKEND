@@ -175,6 +175,55 @@ def get_all_trips_admin(
     ).all()
 
 
+@router.get("/users/{user_id}/trips")
+def get_user_trip_history(
+    user_id: int,
+    session: Session = Depends(get_session),
+    current_admin: User = Depends(get_current_admin),
+):
+    """
+    Fetches ALL trips for a specific user from the single 'Trip' table.
+    Differentiates between 'Ride' and 'Tow' using 'hiring_type'.
+    """
+    # 1. Fetch ALL trips for the user in one query, sorted by time
+    trips = session.exec(
+        select(Trip).where(Trip.user_id == user_id).order_by(desc(Trip.booking_time))
+    ).all()
+
+    # 2. Normalize Data for Frontend Table
+    history = []
+
+    for t in trips:
+        # Determine Service Type
+        # If hiring_type is "Tow Service", categorize as Tow
+        service_type = "Tow" if t.hiring_type == "Tow Service" else "Ride"
+
+        # Determine specific Driver ID (Tow Driver or Regular Driver)
+        assigned_driver_id = (
+            t.tow_truck_driver_id if service_type == "Tow" else t.driver_id
+        )
+
+        # Generate a unique display ID (e.g., TOW-101 or RIDE-101)
+        display_id = f"{service_type.upper()}-{t.id}"
+
+        history.append(
+            {
+                "id": display_id,  # Composite ID for Frontend keys
+                "original_id": t.id,  # Real DB ID
+                "service_type": service_type,
+                "booking_time": t.booking_time,
+                "status": t.status,
+                "price": t.fare if t.fare else 0.0,
+                "source": t.start_location or "N/A",
+                "destination": t.end_location or "N/A",
+                "driver_id": assigned_driver_id,
+                "vehicle_type": t.vehicle_type,  # Useful extra info
+            }
+        )
+
+    return history
+
+
 # --- SUPPORT TICKET MANAGEMENT ---
 @router.get("/tickets", response_model=List[SupportTicketResponse])
 def get_all_tickets(
