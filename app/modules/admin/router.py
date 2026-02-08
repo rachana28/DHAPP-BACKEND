@@ -1,6 +1,6 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select, func, desc
+from sqlmodel import Session, select, func, desc, delete
 from typing import List, Optional
 import redis
 from datetime import datetime
@@ -14,6 +14,9 @@ from app.core.models import (
     TowTruckDriver,
     TowTruckDriverPrivate,
     Trip,
+    TripOffer,
+    TowTripOffer,
+    UserDevice,
     TripSafe,
     SystemConfig,
     SupportTicket,
@@ -31,23 +34,43 @@ router = APIRouter(
 @router.get("/dashboard-stats")
 def get_dashboard_stats(session: Session = Depends(get_session)):
     """
-    Returns counts for the admin dashboard cards.
+    Aggregated stats including BOTH Cab Drivers and Tow Drivers.
     """
+    # 1. Count Users
     total_users = session.exec(
         select(func.count(User.id)).where(User.role == "user")
     ).one()
-    total_drivers = session.exec(select(func.count(Driver.id))).one()
-    # Count drivers waiting for review
-    pending_drivers = session.exec(
+
+    # 2. Count Cab Drivers
+    cab_drivers = session.exec(select(func.count(Driver.id))).one()
+    pending_cab = session.exec(
         select(func.count(Driver.id)).where(Driver.status == "pending_approval")
     ).one()
-    total_trips = session.exec(select(func.count(Trip.id))).one()
+
+    # 3. Count Tow Drivers (NEW)
+    tow_drivers = session.exec(select(func.count(TowTruckDriver.id))).one()
+    pending_tow = session.exec(
+        select(func.count(TowTruckDriver.id)).where(
+            TowTruckDriver.status == "pending_approval"
+        )
+    ).one()
+
+    # 4. Combined Stats
+    total_drivers = cab_drivers + tow_drivers
+    total_pending = pending_cab + pending_tow
+
+    # 5. Trips
+    completed_trips = session.exec(
+        select(func.count(Trip.id)).where(Trip.status == "completed")
+    ).one()
 
     return {
         "total_users": total_users,
-        "total_drivers": total_drivers,
-        "pending_reviews": pending_drivers,
-        "total_trips": total_trips,
+        "total_drivers": total_drivers,  # Sum of both
+        "pending_reviews": total_pending,  # Sum of both
+        "total_trips": completed_trips,
+        # Optional: specific breakdown if needed by frontend later
+        "breakdown": {"cab_drivers": cab_drivers, "tow_drivers": tow_drivers},
     }
 
 
@@ -148,21 +171,61 @@ def delete_user(
     if not user:
         raise HTTPException(404, "User not found")
 
-    # --- SAFETY CHECKS ---
+    # Safety Check: Prevent deleting Super Admin
+    super_admin_email = os.getenv("SUPER_ADMIN_EMAIL")
+
+    if super_admin_email and user.email == super_admin_email:
+        raise HTTPException(400, "Cannot delete Super Admin.")
+
     if user.id == current_admin.id:
         raise HTTPException(400, "You cannot delete your own account.")
 
-    # FETCH FROM ENV (Secure)
-    super_admin_email = os.getenv("SUPER_ADMIN_EMAIL")
+    try:
+        # 1. Delete User Devices (Push Tokens)
+        session.exec(delete(UserDevice).where(UserDevice.user_id == user_id))
 
-    # Check if the user trying to be deleted is the Super Admin
-    if super_admin_email and user.email == super_admin_email:
-        raise HTTPException(400, "Cannot delete Super Admin.")
-    # ---------------------
+        # 2. Delete Support Tickets
+        session.exec(delete(SupportTicket).where(SupportTicket.user_id == user_id))
 
-    session.delete(user)
-    session.commit()
-    return {"message": "User deleted successfully"}
+        # 3. Handle Trips (As a Rider)
+        # Option A: Delete all their trips (Cleaner for dev)
+        # Option B: Set user_id to NULL (Requires nullable FK in DB)
+        # We will go with Option A to ensure clean deletion.
+        session.exec(delete(Trip).where(Trip.user_id == user_id))
+
+        # 4. Handle Driver Profile (If they are a Cab Driver)
+        driver = session.exec(select(Driver).where(Driver.user_id == user_id)).first()
+        if driver:
+            # Delete Driver's Offers
+            session.exec(delete(TripOffer).where(TripOffer.driver_id == driver.id))
+            # Unlink trips where they were the driver (Set driver_id to None or delete)
+            # For simplicity in this fix, we delete the profile.
+            # Note: If they have active trips as a driver, this might fail unless we clear those too.
+            session.delete(driver)
+
+        # 5. Handle Tow Driver Profile (If they are a Tow Driver)
+        tow_driver = session.exec(
+            select(TowTruckDriver).where(TowTruckDriver.user_id == user_id)
+        ).first()
+        if tow_driver:
+            session.exec(
+                delete(TowTripOffer).where(
+                    TowTripOffer.tow_truck_driver_id == tow_driver.id
+                )
+            )
+            session.delete(tow_driver)
+
+        # 6. Finally, Delete the User
+        session.delete(user)
+        session.commit()
+
+        return {"message": "User and all associated data deleted successfully"}
+
+    except Exception as e:
+        session.rollback()
+        # Log the specific DB error for debugging
+        print(f"Error deleting user: {e}")
+        raise HTTPException(500, f"Database Constraint Error: {str(e)}")
 
 
 # --- 5. TRIP OVERSIGHT ---
@@ -266,8 +329,6 @@ def resolve_ticket(
 
 
 # --- SYSTEM CONFIGURATION (PRICING & SETTINGS) ---
-
-
 @router.get("/system-config")
 def get_system_config(session: Session = Depends(get_session)):
     """

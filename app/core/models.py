@@ -293,6 +293,7 @@ class User(UserBase, table=True):
 
 class UserPublic(SQLModel):
     id: int
+    email: EmailStr
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     force_password_change: bool = False
