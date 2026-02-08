@@ -22,6 +22,8 @@ from app.modules.towing import (
 )
 from app.modules.pricing import router as pricing_router
 from app.modules.tracking import router as tracking_router
+from app.modules.admin import router as admin_router
+from app.modules.support import router as support_router
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -100,6 +102,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(admin_router.router)
 app.include_router(auth_router.router)
 app.include_router(drivers_router.router)
 app.include_router(trips_router.router)
@@ -108,6 +111,7 @@ app.include_router(tow_drivers_router.router)
 app.include_router(tow_trips_router.router)
 app.include_router(tracking_router.router)
 app.include_router(pricing_router.router)
+app.include_router(support_router.router)
 
 
 @app.get("/")

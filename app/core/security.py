@@ -141,3 +141,26 @@ def get_current_active_user(
     ):
         return current_user
     raise HTTPException(status_code=403, detail="Not a valid user")
+
+
+def get_current_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    Dependency to verify if the authenticated user is an Admin.
+    BLOCKS access if the user is required to change their password.
+    """
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required"
+        )
+
+    # --- ADD THIS BLOCKING LOGIC ---
+    if current_user.force_password_change:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password Change Required",
+            headers={"X-Require-Password-Change": "true"},
+        )
+
+    return current_user

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select, desc
 from typing import List
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import NoResultFound
 
 from app.core.database import get_session
 from app.core.models import (
@@ -181,9 +182,18 @@ def accept_tow_offer(
     if offer.status != "pending":
         raise HTTPException(400, "Offer not valid")
 
-    trip = session.get(Trip, offer.trip_id)
+    # CRITICAL: Lock the Trip Row
+    try:
+        # This query will WAIT if another driver is currently trying to accept the same trip
+        statement = select(Trip).where(Trip.id == offer.trip_id).with_for_update()
+        trip = session.exec(statement).one()
+    except NoResultFound:
+        raise HTTPException(404, "Trip not found")
+
+    # Safe Status Check (Guaranteed by Lock)
     if trip.status != "searching":
-        raise HTTPException(400, "Trip taken")
+        session.rollback() # Release lock immediately
+        raise HTTPException(400, "Trip already taken by another driver")
 
     trip.tow_truck_driver_id = current_driver.id
     trip.status = "accepted"

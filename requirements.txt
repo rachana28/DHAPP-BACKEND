@@ -14,3 +14,4 @@ wheel
 dnspython
 redis
 apscheduler
+fastapi_limiter

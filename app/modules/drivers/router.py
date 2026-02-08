@@ -108,7 +108,7 @@ def read_drivers(
         if cached_drivers:
             return json.loads(cached_drivers)
 
-    drivers = session.exec(select(Driver)).all()
+    drivers = session.exec(select(Driver).where(Driver.status == "available")).all()
     public_drivers = []
     for driver in drivers:
         trip_count = session.exec(
