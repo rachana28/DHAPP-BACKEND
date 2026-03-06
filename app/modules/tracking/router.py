@@ -57,7 +57,7 @@ def update_location(
         "heading": location.heading,
         "speed": location.speed,
         "role": current_user.role,
-        "user_id": current_user.id,
+        "user_id": str(current_user.id),
         "trip_id": location.trip_id,
         "updated_at": "now",
     }
