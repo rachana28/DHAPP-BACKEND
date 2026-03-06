@@ -51,17 +51,22 @@ def verify_refresh_token(token: str, session: Session):
     )
     try:
         payload = jwt.decode(token, REFRESH_SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
+        sub: str = payload.get("sub") # 'sub' is phone_number for users, email for admins
         role: str = payload.get("role")
         token_type: str = payload.get("type")
 
-        if email is None or role is None or token_type != "refresh":
+        if sub is None or role is None or token_type != "refresh":
             raise credentials_exception
 
-        # Optional: Check if user still exists/is active here
-        user = session.exec(
-            select(User).where(User.email == email).where(User.role == role)
-        ).first()
+        # DYNAMIC LOOKUP: Admins use email, everyone else uses phone_number
+        if role == "admin":
+            user = session.exec(
+                select(User).where(User.email == sub).where(User.role == role)
+            ).first()
+        else:
+            user = session.exec(
+                select(User).where(User.phone_number == sub).where(User.role == role)
+            ).first()
 
         if user is None:
             raise credentials_exception
