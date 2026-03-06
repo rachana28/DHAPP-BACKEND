@@ -1,3 +1,4 @@
+import uuid
 import requests
 from typing import List, Dict, Any
 from sqlmodel import Session, select
@@ -9,7 +10,7 @@ EXPO_URL = "https://exp.host/--/api/v2/push/send"
 
 def send_push_notification(
     session: Session,
-    user_ids: List[int],
+    user_ids: List[uuid.UUID],
     title: str,
     body: str,
     data: Dict[str, Any] = None,
