@@ -7,6 +7,7 @@ from datetime import datetime
 from app.core.database import get_session, get_redis
 from app.core.models import (
     User,
+    UserLogin,
     Token,
     Driver,
     TowTruckDriver,
@@ -16,6 +17,7 @@ from app.core.models import (
 )
 from app.core.security import (
     get_password_hash,
+    verify_password,
     create_access_token,
     create_refresh_token,
     verify_refresh_token,
@@ -77,6 +79,43 @@ def verify_email(request: EmailVerificationRequest):
         )
 
     return {"message": "Email is valid"}
+
+
+@router.post("/login", response_model=Token)
+def login(user_data: UserLogin, session: Session = Depends(get_session)):
+    """
+    Legacy Login Endpoint: Preserved specifically for the Admin portal
+    which still uses Email and Password authentication.
+    """
+    statement = select(User).where(
+        User.email == user_data.email, User.role == user_data.role
+    )
+    user = session.exec(statement).first()
+
+    # Verify user exists and password is correct
+    if (
+        not user
+        or not user.hashed_password
+        or not verify_password(user_data.password, user.hashed_password)
+    ):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    # Generate Tokens (Notice the 'sub' is set to the email for admins)
+    access_token = create_access_token(data={"sub": user.email, "role": user.role})
+    refresh_token = create_refresh_token(data={"sub": user.email, "role": user.role})
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "id": str(user.id),
+            "name": user.full_name,
+            "email": user.email,
+            "role": user.role,
+            "force_password_change": user.force_password_change,
+        },
+    }
 
 
 @router.post("/send-otp")
