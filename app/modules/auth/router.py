@@ -7,9 +7,6 @@ from datetime import datetime
 from app.core.database import get_session, get_redis
 from app.core.models import (
     User,
-    UserCreate,
-    UserLogin,
-    UserUpdate,
     Token,
     Driver,
     TowTruckDriver,
@@ -32,7 +29,8 @@ from pydantic import BaseModel, EmailStr
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
-DAILY_SMS_LIMIT = 10
+DAILY_SMS_LIMIT = 50
+BYPASS_NUMBERS = ["9999999999", "9876543210", "+919999999999", "+919876543210"]
 
 
 class EmailVerificationRequest(BaseModel):
@@ -98,7 +96,7 @@ def send_otp(request: SendOTPRequest, redis_client: redis.Redis = Depends(get_re
         )
 
     # Static OTP for Apple/Google App Review bypass
-    if phone == "+919999999999":
+    if phone in BYPASS_NUMBERS:
         otp = "1234"
     else:
         otp = str(random.randint(1000, 9999))
@@ -107,7 +105,7 @@ def send_otp(request: SendOTPRequest, redis_client: redis.Redis = Depends(get_re
     redis_client.setex(f"otp:{phone}", 300, otp)
 
     # Send via Fast2SMS
-    if phone != "+919999999999":
+    if phone not in BYPASS_NUMBERS:
         url = "https://www.fast2sms.com/dev/bulkV2"
         payload = f"variables_values={otp}&route=otp&numbers={phone[-10:]}"
         headers = {
@@ -122,7 +120,7 @@ def send_otp(request: SendOTPRequest, redis_client: redis.Redis = Depends(get_re
                 raise HTTPException(
                     status_code=500, detail="Failed to send SMS via provider"
                 )
-        except Exception as e:
+        except Exception:
             raise HTTPException(status_code=500, detail="SMS provider error")
 
     # Increment counter
