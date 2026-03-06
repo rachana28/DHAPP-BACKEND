@@ -1,4 +1,6 @@
+import random
 import redis
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select, delete
 from datetime import datetime
@@ -11,11 +13,12 @@ from app.core.models import (
     Token,
     Driver,
     TowTruckDriver,
+    VerifyOTPRequest,
+    SendOTPRequest,
     UserDevice,
 )
 from app.core.security import (
     get_password_hash,
-    verify_password,
     create_access_token,
     create_refresh_token,
     verify_refresh_token,
@@ -27,6 +30,9 @@ from dns import resolver
 from pydantic import BaseModel, EmailStr
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
+DAILY_SMS_LIMIT = 10
 
 
 class EmailVerificationRequest(BaseModel):
@@ -75,112 +81,152 @@ def verify_email(request: EmailVerificationRequest):
     return {"message": "Email is valid"}
 
 
-@router.post("/signup", response_model=Token)
-def signup(
-    user: UserCreate,
+@router.post("/send-otp")
+def send_otp(request: SendOTPRequest, redis_client: redis.Redis = Depends(get_redis)):
+    if not redis_client:
+        raise HTTPException(status_code=500, detail="Redis connection failed")
+
+    phone = request.phone_number
+
+    # Rate Limiting
+    daily_key = f"daily_otp_limit:{phone}"
+    current_count = redis_client.get(daily_key)
+
+    if current_count and int(current_count) >= DAILY_SMS_LIMIT:
+        raise HTTPException(
+            status_code=429, detail="Daily OTP limit reached. Try again tomorrow."
+        )
+
+    # Static OTP for Apple/Google App Review bypass
+    if phone == "+919999999999":
+        otp = "1234"
+    else:
+        otp = str(random.randint(1000, 9999))
+
+    # Store OTP (Valid for 5 mins)
+    redis_client.setex(f"otp:{phone}", 300, otp)
+
+    # Send via Fast2SMS
+    if phone != "+919999999999":
+        url = "https://www.fast2sms.com/dev/bulkV2"
+        payload = f"variables_values={otp}&route=otp&numbers={phone[-10:]}"
+        headers = {
+            "authorization": FAST2SMS_API_KEY,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        try:
+            response = requests.post(url, data=payload, headers=headers)
+            res_data = response.json()
+            if not res_data.get("return"):
+                raise HTTPException(
+                    status_code=500, detail="Failed to send SMS via provider"
+                )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="SMS provider error")
+
+    # Increment counter
+    redis_client.incr(daily_key)
+    if not current_count:
+        redis_client.expire(daily_key, 86400)
+
+    return {"message": f"OTP sent successfully for role: {request.role}"}
+
+
+@router.post("/verify-otp", response_model=Token)
+def verify_otp(
+    request: VerifyOTPRequest,
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    # Validate based on role
-    if user.role == "user":
-        if not user.full_name:
-            raise HTTPException(status_code=400, detail="Full name is required")
-    elif user.role == "driver":
-        if not user.full_name or not user.license_number or not user.phone_number:
-            raise HTTPException(status_code=400, detail="Missing driver fields")
-    elif user.role == "tow_truck_driver":
-        # Check required fields for Tow Truck Driver
-        if not user.full_name or not user.vehicle_number or not user.phone_number:
+    phone = request.phone_number
+    role = request.role
+
+    # 1. Verify OTP
+    stored_otp = redis_client.get(f"otp:{phone}")
+    if not stored_otp or stored_otp != request.otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+    # Clear OTP
+    redis_client.delete(f"otp:{phone}")
+
+    # 2. Check Database
+    user = session.exec(
+        select(User).where(User.phone_number == phone, User.role == role)
+    ).first()
+
+    # 3. Handle Registration / Signup
+    if not user:
+        if not request.full_name:
             raise HTTPException(
-                status_code=400,
-                detail="Full name, vehicle number, and phone number are required for tow truck driver",
+                status_code=400, detail="Full name required for new registration"
             )
-    else:
-        raise HTTPException(status_code=400, detail="Invalid role")
 
-    # Check duplicates
-    statement = select(User).where(User.email == user.email, User.role == user.role)
-    if session.exec(statement).first():
-        raise HTTPException(
-            status_code=400, detail="Email already registered for this role"
+        # Validate Specific Roles
+        if role == "driver":
+            if not request.license_number:
+                raise HTTPException(
+                    status_code=400,
+                    detail="License number required for driver registration",
+                )
+        elif role == "tow_truck_driver":
+            if not request.vehicle_number:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Vehicle number required for tow truck registration",
+                )
+
+        # Create Base User
+        user = User(
+            phone_number=phone,
+            email=request.email,  # Include email if provided
+            full_name=request.full_name,
+            role=role,
+            provider="local",
         )
-
-    # Create User
-    hashed_pwd = get_password_hash(user.password)
-    db_user = User(
-        email=user.email,
-        hashed_password=hashed_pwd,
-        full_name=user.full_name,
-        provider="local",
-        role=user.role,
-    )
-    session.add(db_user)
-    session.commit()
-    session.refresh(db_user)
-
-    # Create Role Profile
-    if user.role == "driver":
-        db_driver = Driver(
-            name=user.full_name,
-            phone_number=user.phone_number,
-            license_number=user.license_number,
-            vehicle_type=user.vehicle_type,
-            user_id=db_user.id,
-        )
-        session.add(db_driver)
+        session.add(user)
         session.commit()
+        session.refresh(user)
 
-    elif user.role == "tow_truck_driver":
-        db_tow_driver = TowTruckDriver(
-            name=user.full_name,
-            phone_number=user.phone_number,
-            vehicle_number=user.vehicle_number,
-            user_id=db_user.id,
-        )
-        session.add(db_tow_driver)
-        session.commit()
+        # Create Role Profile
+        if role == "driver":
+            db_driver = Driver(
+                name=request.full_name,
+                phone_number=phone,
+                license_number=request.license_number,
+                vehicle_type=request.vehicle_type,
+                user_id=user.id,
+            )
+            session.add(db_driver)
+            session.commit()
 
+        elif role == "tow_truck_driver":
+            db_tow_driver = TowTruckDriver(
+                name=request.full_name,
+                phone_number=phone,
+                vehicle_number=request.vehicle_number,
+                user_id=user.id,
+            )
+            session.add(db_tow_driver)
+            session.commit()
+
+    # 4. Generate Session Tokens
     access_token = create_access_token(
-        data={"sub": db_user.email, "role": db_user.role}
+        data={"sub": user.phone_number, "role": user.role}
     )
     refresh_token = create_refresh_token(
-        data={"sub": db_user.email, "role": db_user.role}
+        data={"sub": user.phone_number, "role": user.role}
     )
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "user": {
-            "name": db_user.full_name,
-            "picture": db_user.avatar_url,
-            "role": db_user.role,
-        },
-    }
-
-
-@router.post("/login", response_model=Token)
-def login(user_data: UserLogin, session: Session = Depends(get_session)):
-    statement = select(User).where(
-        User.email == user_data.email, User.role == user_data.role
-    )
-    user = session.exec(statement).first()
-
-    if not user or not verify_password(user_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-
-    # Generate Tokens
-    access_token = create_access_token(data={"sub": user.email, "role": user.role})
-    refresh_token = create_refresh_token(data={"sub": user.email, "role": user.role})
 
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": {
+            "id": str(user.id),
             "name": user.full_name,
-            "picture": user.avatar_url,
+            "phone_number": user.phone_number,
             "role": user.role,
-            "force_password_change": user.force_password_change,
         },
     }
 

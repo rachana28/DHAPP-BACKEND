@@ -1,7 +1,8 @@
+import uuid
+from pydantic import EmailStr
+from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List
 from datetime import datetime, date
-from sqlmodel import Field, SQLModel, Relationship
-from pydantic import EmailStr
 
 
 # --- Base Models (Shared fields) ---
@@ -34,7 +35,7 @@ class TowTruckDriverBase(SQLModel):
 
 # --- Trip Models ---
 class TripBase(SQLModel):
-    user_id: int = Field(foreign_key="user.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
     driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
     tow_truck_driver_id: Optional[int] = Field(
         default=None, foreign_key="towtruckdriver.id"
@@ -116,7 +117,7 @@ class TripOfferPublic(SQLModel):
 # --- Table Models ---
 class Driver(DriverBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
     rating: float = Field(default=0.0)
 
     user: "User" = Relationship(back_populates="driver_profile")
@@ -127,7 +128,7 @@ class Driver(DriverBase, table=True):
 
 class TowTruckDriver(TowTruckDriverBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
 
     user: "User" = Relationship(back_populates="tow_truck_driver_profile")
     trips: List[Trip] = Relationship(back_populates="tow_truck_driver")
@@ -200,7 +201,7 @@ class TowTruckDriverUpdate(SQLModel):
 
 # --- Review Models ---
 class DriverReviewBase(SQLModel):
-    user_id: int
+    user_id: uuid.UUID
     rating: int = Field(ge=1, le=5)
     comment: Optional[str] = None
 
@@ -221,7 +222,8 @@ class TowTruckDriverReview(DriverReviewBase, table=True):
 
 # --- User Models ---
 class UserBase(SQLModel):
-    email: EmailStr = Field(unique=True, index=True)
+    phone_number: str = Field(unique=True, index=True)
+    email: Optional[EmailStr] = Field(default=None, unique=True, index=True)
     full_name: Optional[str] = None
     provider: str = "local"
     avatar_url: Optional[str] = None
@@ -230,12 +232,11 @@ class UserBase(SQLModel):
 
 class UserDevice(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
     token: str = Field(index=True)  # The Expo Push Token
     platform: Optional[str] = None  # 'ios' or 'android'
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_updated: datetime = Field(default_factory=datetime.utcnow)
-
     user: "User" = Relationship(back_populates="devices")
 
 
@@ -256,7 +257,7 @@ class SupportTicketBase(SQLModel):
 
 class SupportTicket(SupportTicketBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(foreign_key="user.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
     ticket_id: str = Field(index=True)  # Unique ID like "TKT-1001" for display
     status: str = "open"  # open, in_progress, resolved, closed
     admin_response: Optional[str] = None
@@ -279,8 +280,8 @@ class SupportTicketResponse(SupportTicketBase):
 
 
 class User(UserBase, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    hashed_password: str
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
+    hashed_password: Optional[str] = None
     force_password_change: bool = Field(default=False)
     devices: List["UserDevice"] = Relationship(back_populates="user")
     driver_profile: Optional[Driver] = Relationship(back_populates="user")
@@ -292,15 +293,15 @@ class User(UserBase, table=True):
 
 
 class UserPublic(SQLModel):
-    id: int
-    email: EmailStr
+    id: uuid.UUID
+    email: Optional[EmailStr] = None
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     force_password_change: bool = False
 
 
 class UserPrivate(UserBase):
-    id: int
+    id: uuid.UUID
 
 
 class UserUpdate(SQLModel):
@@ -309,7 +310,7 @@ class UserUpdate(SQLModel):
 
 
 class UserCreate(SQLModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None
     password: str
     full_name: Optional[str] = None
     role: str = "user"
@@ -324,7 +325,7 @@ class UserCreate(SQLModel):
 
 
 class UserLogin(SQLModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None
     password: str
     role: str
 
@@ -342,7 +343,7 @@ class TripUpdate(SQLModel):
 
 
 class TripCreate(TripBase):
-    user_id: Optional[int] = None
+    user_id: Optional[uuid.UUID] = None
     driver_id: Optional[int] = None
     tow_truck_driver_id: Optional[int] = None
 
@@ -353,3 +354,22 @@ class LocationUpdate(SQLModel):
     heading: Optional[float] = 0.0
     speed: Optional[float] = 0.0
     trip_id: Optional[int] = None
+
+# Used for Send OTP API
+class SendOTPRequest(SQLModel):
+    phone_number: str
+    role: str = "user"
+    
+# Used for Verify OTP API
+class VerifyOTPRequest(SQLModel):
+    phone_number: str
+    otp: str
+    role: str = "user"  # "user", "driver", or "tow_truck_driver"
+    # Base user fields
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    # Driver Specific Fields
+    license_number: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    # Tow Truck Specific Fields
+    vehicle_number: Optional[str] = None
