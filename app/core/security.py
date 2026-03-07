@@ -51,7 +51,9 @@ def verify_refresh_token(token: str, session: Session):
     )
     try:
         payload = jwt.decode(token, REFRESH_SECRET_KEY, algorithms=[ALGORITHM])
-        sub: str = payload.get("sub") # 'sub' is phone_number for users, email for admins
+        sub: str = payload.get(
+            "sub"
+        )  # 'sub' is phone_number for users, email for admins
         role: str = payload.get("role")
         token_type: str = payload.get("type")
 
@@ -86,16 +88,23 @@ def get_current_user(
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        phone_number: str = payload.get("sub")
+        sub_val: str = payload.get("sub")
         role: str = payload.get("role")
-        if phone_number is None or role is None:
+
+        if sub_val is None or role is None:
             raise credentials_exception
     except JWTError:
         raise credentials_exception
 
-    user = session.exec(
-        select(User).where(User.phone_number == phone_number).where(User.role == role)
-    ).first()
+    # EMAIL VALIDATION AND ROLE CHECK
+    if role == "admin":
+        user = session.exec(
+            select(User).where(User.email == sub_val, User.role == role)
+        ).first()
+    else:
+        user = session.exec(
+            select(User).where(User.phone_number == sub_val, User.role == role)
+        ).first()
 
     if user is None:
         raise credentials_exception

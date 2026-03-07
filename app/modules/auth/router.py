@@ -272,14 +272,19 @@ def verify_otp(
 def change_password(
     data: PasswordChangeRequest,
     session: Session = Depends(get_session),
-    current_user: User = Depends(
-        get_current_user
-    ),  # Use get_current_user (NOT Admin) so they aren't blocked
+    current_user: User = Depends(get_current_user),
 ):
     """
     Endpoint to set a new password.
-    Can be used by any authenticated user, but specifically clears the force_password_change flag.
+    Only accessible by admins. Specifically clears the force_password_change flag.
     """
+    # 1. STRICT ADMIN ROLE CHECK
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only admin users can change passwords. Regular users must use OTP.",
+        )
+
     hashed_pwd = get_password_hash(data.new_password)
 
     current_user.hashed_password = hashed_pwd

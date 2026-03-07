@@ -1,4 +1,5 @@
 import os
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select, func, desc, delete
 from typing import List, Optional
@@ -163,7 +164,7 @@ def get_users_admin(
 
 @router.delete("/users/{user_id}")
 def delete_user(
-    user_id: int,
+    user_id: uuid.UUID,
     session: Session = Depends(get_session),
     current_admin: User = Depends(get_current_admin),
 ):
@@ -240,7 +241,7 @@ def get_all_trips_admin(
 
 @router.get("/users/{user_id}/trips")
 def get_user_trip_history(
-    user_id: int,
+    user_id: uuid.UUID,
     session: Session = Depends(get_session),
     current_admin: User = Depends(get_current_admin),
 ):
