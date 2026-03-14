@@ -1,0 +1,97 @@
+name: Universal Deploy
+
+on:
+  push:
+    branches: [ "main", "DHAPP-BACKEND-STAGE" ]
+
+jobs:
+  # -----------------------------------------------------------------
+  # JOB 1: QUALITY ASSURANCE
+  # -----------------------------------------------------------------
+  quality-check:
+    name: 🛡️ Test Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      
+      - name: Run Syntax Check
+        run: python -m compileall .
+
+  # -----------------------------------------------------------------
+  # JOB 2: RENDER DEPLOY
+  # -----------------------------------------------------------------
+  deploy-render:
+    name: 🚀 Render Deploy
+    needs: quality-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render Deploy (Main)
+        if: github.ref == 'refs/heads/main' && secrets.RENDER_DEPLOY_HOOK != ''
+        run: curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+
+      - name: Trigger Render Deploy (Stage)
+        if: github.ref == 'refs/heads/DHAPP-BACKEND-STAGE' && secrets.RENDER_DEPLOY_HOOK_STG != ''
+        run: curl "${{ secrets.RENDER_DEPLOY_HOOK_STG }}"
+
+  # -----------------------------------------------------------------
+  # JOB 3: AWS DEPLOY
+  # -----------------------------------------------------------------
+  deploy-aws:
+    name: 🔶 AWS Deploy
+    needs: quality-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for AWS Secrets
+        id: check-aws
+        run: |
+          if [ "${{ secrets.AWS_ACCESS_KEY_ID }}" == "" ]; then
+            echo "No AWS Secrets found. Skipping..."
+            echo "has_aws=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_aws=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout Code
+        if: steps.check-aws.outputs.has_aws == 'true'
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        if: steps.check-aws.outputs.has_aws == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        if: steps.check-aws.outputs.has_aws == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+  # -----------------------------------------------------------------
+  # JOB 4: AZURE DEPLOY
+  # -----------------------------------------------------------------
+  deploy-azure:
+    name: 🔷 Azure Deploy
+    needs: quality-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Azure Web App
+        env:
+          AZURE_PROFILE: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        if: env.AZURE_PROFILE != ''
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: 'your-app-name'
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: .

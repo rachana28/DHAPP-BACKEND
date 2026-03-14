@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+google-auth
+requests
+email-validator
+argon2-cffi
+python-dotenv
+pg8000
+wheel
+dnspython
+redis
+apscheduler
+fastapi_limiter

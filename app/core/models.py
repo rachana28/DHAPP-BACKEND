@@ -1,0 +1,375 @@
+import uuid
+from pydantic import EmailStr
+from sqlmodel import Field, SQLModel, Relationship
+from typing import Optional, List
+from datetime import datetime, date
+
+
+# --- Base Models (Shared fields) ---
+class DriverBase(SQLModel):
+    name: str
+    phone_number: str
+    license_number: str
+    address: Optional[str] = None
+    emergency_phone: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+
+    # Professional Details
+    years_of_experience: Optional[int] = None
+    vehicle_type: Optional[str] = None
+    fare_per_km: Optional[float] = None
+    driver_allowance: Optional[float] = None
+    spoken_languages: Optional[str] = None
+    status: str = "pending_approval"
+
+
+class TowTruckDriverBase(SQLModel):
+    name: str
+    phone_number: str
+    vehicle_number: str  # Specific to Tow Truck
+    address: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    status: str = "pending_approval"
+    rating: float = Field(default=0.0)
+
+
+# --- Trip Models ---
+class TripBase(SQLModel):
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+    tow_truck_driver_id: Optional[int] = Field(
+        default=None, foreign_key="towtruckdriver.id"
+    )  # Added
+
+    # Booking Details
+    hiring_type: str
+    vehicle_type: str
+    shift_details: Optional[str] = None
+    start_date: date
+    end_date: date
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    reason: Optional[str] = None
+    fare: Optional[float] = None
+    status: str = "searching"
+    booking_time: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Trip(TripBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver: Optional["Driver"] = Relationship(back_populates="trips")
+    tow_truck_driver: Optional["TowTruckDriver"] = Relationship(
+        back_populates="trips"
+    )  # Added
+    user: "User" = Relationship(back_populates="trips")
+    offers: List["TripOffer"] = Relationship(back_populates="trip")
+    tow_offers: List["TowTripOffer"] = Relationship(back_populates="trip")  # Added
+
+
+class TripOffer(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    driver_id: int = Field(foreign_key="driver.id")
+    status: str = "pending"
+    tier: int = 1
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    trip: Trip = Relationship(back_populates="offers")
+    driver: "Driver" = Relationship(back_populates="offers")
+
+
+class TowTripOffer(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    tow_truck_driver_id: int = Field(foreign_key="towtruckdriver.id")
+    status: str = "pending"
+    tier: int = 1
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    trip: Trip = Relationship(back_populates="tow_offers")
+    driver: "TowTruckDriver" = Relationship(back_populates="offers")
+
+
+# --- SAFETY LAYER: RESPONSE MODELS ---
+class TripSafe(SQLModel):
+    id: int
+    hiring_type: str
+    vehicle_type: str
+    shift_details: Optional[str] = None
+    start_date: date
+    end_date: date
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    reason: Optional[str] = None
+    status: str
+    fare: Optional[float] = None
+    booking_time: datetime
+
+
+class TripOfferPublic(SQLModel):
+    id: int
+    status: str
+    tier: int
+    created_at: datetime
+    trip: TripSafe
+
+
+# --- Table Models ---
+class Driver(DriverBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    rating: float = Field(default=0.0)
+
+    user: "User" = Relationship(back_populates="driver_profile")
+    trips: List[Trip] = Relationship(back_populates="driver")
+    reviews: List["DriverReview"] = Relationship(back_populates="driver")
+    offers: List[TripOffer] = Relationship(back_populates="driver")
+
+
+class TowTruckDriver(TowTruckDriverBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+
+    user: "User" = Relationship(back_populates="tow_truck_driver_profile")
+    trips: List[Trip] = Relationship(back_populates="tow_truck_driver")
+    reviews: List["TowTruckDriverReview"] = Relationship(back_populates="driver")
+    offers: List[TowTripOffer] = Relationship(back_populates="driver")
+
+
+# --- API Response Models ---
+class DriverPublic(SQLModel):
+    id: int
+    name: str
+    rating: float
+    profile_picture_url: Optional[str] = None
+    years_of_experience: Optional[int]
+    vehicle_type: Optional[str]
+    spoken_languages: Optional[str]
+    status: str
+    total_trips: int = 0
+
+
+class TowTruckDriverPublic(SQLModel):
+    id: int
+    name: str
+    rating: float
+    profile_picture_url: Optional[str] = None
+    vehicle_number: str
+    status: str
+    total_trips: int = 0
+
+
+class TripReadUser(TripSafe):
+    driver: Optional[DriverPublic] = None
+    tow_truck_driver: Optional[TowTruckDriverPublic] = (
+        None  # Added support for tow driver details
+    )
+
+
+class DriverPrivate(DriverBase):
+    id: int
+    rating: float
+
+
+class TowTruckDriverPrivate(TowTruckDriverBase):
+    id: int
+
+
+# --- Update Models ---
+class DriverUpdate(SQLModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    phone_number: Optional[str] = None
+    emergency_phone: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    years_of_experience: Optional[int] = None
+    vehicle_type: Optional[str] = None
+    fare_per_km: Optional[float] = None
+    driver_allowance: Optional[float] = None
+    spoken_languages: Optional[str] = None
+    status: Optional[str] = None
+
+
+class TowTruckDriverUpdate(SQLModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    phone_number: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    status: Optional[str] = None
+
+
+# --- Review Models ---
+class DriverReviewBase(SQLModel):
+    user_id: uuid.UUID
+    rating: int = Field(ge=1, le=5)
+    comment: Optional[str] = None
+
+
+class DriverReview(DriverReviewBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver_id: int = Field(foreign_key="driver.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    driver: "Driver" = Relationship(back_populates="reviews")
+
+
+class TowTruckDriverReview(DriverReviewBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver_id: int = Field(foreign_key="towtruckdriver.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    driver: "TowTruckDriver" = Relationship(back_populates="reviews")
+
+
+# --- User Models ---
+class UserBase(SQLModel):
+    phone_number: str = Field(unique=True, index=True)
+    email: Optional[EmailStr] = Field(default=None, unique=True, index=True)
+    full_name: Optional[str] = None
+    provider: str = "local"
+    avatar_url: Optional[str] = None
+    role: str = "user"
+
+
+class UserDevice(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    token: str = Field(index=True)  # The Expo Push Token
+    platform: Optional[str] = None  # 'ios' or 'android'
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
+    user: "User" = Relationship(back_populates="devices")
+
+
+# --- NEW: SYSTEM CONFIGURATION ---
+class SystemConfig(SQLModel, table=True):
+    key: str = Field(primary_key=True)  # e.g., "bike_base_fare", "car_per_km"
+    value: str  # We store as string and cast later (e.g., "450.0")
+    description: Optional[str] = None
+
+
+# --- NEW: SUPPORT TICKET SYSTEM ---
+class SupportTicketBase(SQLModel):
+    subject: str
+    description: str
+    category: str = "general"  # payment, safety, technical, other
+    priority: str = "medium"  # low, medium, high
+
+
+class SupportTicket(SupportTicketBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    ticket_id: str = Field(index=True)  # Unique ID like "TKT-1001" for display
+    status: str = "open"  # open, in_progress, resolved, closed
+    admin_response: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    user: "User" = Relationship(back_populates="tickets")
+
+
+class SupportTicketCreate(SupportTicketBase):
+    pass
+
+
+class SupportTicketResponse(SupportTicketBase):
+    id: int
+    ticket_id: str
+    status: str
+    admin_response: Optional[str]
+    created_at: datetime
+
+
+class User(UserBase, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
+    hashed_password: Optional[str] = None
+    force_password_change: bool = Field(default=False)
+    devices: List["UserDevice"] = Relationship(back_populates="user")
+    driver_profile: Optional[Driver] = Relationship(back_populates="user")
+    tow_truck_driver_profile: Optional[TowTruckDriver] = Relationship(
+        back_populates="user"
+    )
+    trips: List[Trip] = Relationship(back_populates="user")
+    tickets: List["SupportTicket"] = Relationship(back_populates="user")
+
+
+class UserPublic(SQLModel):
+    id: uuid.UUID
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    force_password_change: bool = False
+
+
+class UserPrivate(UserBase):
+    id: uuid.UUID
+
+
+class UserUpdate(SQLModel):
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class UserCreate(SQLModel):
+    email: Optional[EmailStr] = None
+    password: str
+    full_name: Optional[str] = None
+    role: str = "user"
+    # Optional fields for Driver/Tow creation
+    license_number: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    phone_number: Optional[str] = None
+    vehicle_number: Optional[str] = None  # Added for TowTruckDriver
+    org_name: Optional[str] = None
+    contact_number: Optional[str] = None
+    address: Optional[str] = None
+
+
+class UserLogin(SQLModel):
+    email: Optional[EmailStr] = None
+    password: str
+    role: str
+
+
+class Token(SQLModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
+    user: dict
+
+
+# --- Trip API Models ---
+class TripUpdate(SQLModel):
+    status: Optional[str] = None
+
+
+class TripCreate(TripBase):
+    user_id: Optional[uuid.UUID] = None
+    driver_id: Optional[int] = None
+    tow_truck_driver_id: Optional[int] = None
+
+
+class LocationUpdate(SQLModel):
+    latitude: float
+    longitude: float
+    heading: Optional[float] = 0.0
+    speed: Optional[float] = 0.0
+    trip_id: Optional[int] = None
+
+# Used for Send OTP API
+class SendOTPRequest(SQLModel):
+    phone_number: str
+    role: str = "user"
+    
+# Used for Verify OTP API
+class VerifyOTPRequest(SQLModel):
+    phone_number: str
+    otp: str
+    role: str = "user"  # "user", "driver", or "tow_truck_driver"
+    # Base user fields
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    # Driver Specific Fields
+    license_number: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    # Tow Truck Specific Fields
+    vehicle_number: Optional[str] = None
