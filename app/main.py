@@ -11,6 +11,7 @@ from app.core.database import (
     create_db_and_tables,
     engine,
 )
+from app.modules.config import router as config_router
 
 # Import Routers from Modules
 from app.modules.auth import router as auth_router, users as users_router
@@ -112,6 +113,7 @@ app.include_router(tow_trips_router.router)
 app.include_router(tracking_router.router)
 app.include_router(pricing_router.router)
 app.include_router(support_router.router)
+app.include_router(config_router.router)
 
 
 @app.get("/")

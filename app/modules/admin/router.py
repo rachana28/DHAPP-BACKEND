@@ -22,6 +22,8 @@ from app.core.models import (
     SystemConfig,
     SupportTicket,
     SupportTicketResponse,
+    UITheme,
+    UIBanner,
 )
 from app.core.security import get_current_admin
 
@@ -376,3 +378,99 @@ def update_system_config(
         redis_client.set(f"config:{key}", value)
 
     return {"message": f"Config '{key}' updated to '{value}'"}
+
+
+# --- APP CONFIGURATION (THEMES) ---
+
+
+@router.get("/themes", response_model=List[UITheme])
+def get_all_themes(session: Session = Depends(get_session)):
+    """Get all UI themes (Seasons and Festivals)"""
+    return session.exec(select(UITheme)).all()
+
+
+@router.post("/themes", response_model=UITheme)
+def create_theme(theme: UITheme, session: Session = Depends(get_session)):
+    """Create a new UI theme"""
+    session.add(theme)
+    session.commit()
+    session.refresh(theme)
+    return theme
+
+
+@router.put("/themes/{theme_id}", response_model=UITheme)
+def update_theme(
+    theme_id: int, theme_data: dict, session: Session = Depends(get_session)
+):
+    """Update an existing UI theme"""
+    theme = session.get(UITheme, theme_id)
+    if not theme:
+        raise HTTPException(404, "Theme not found")
+
+    for key, value in theme_data.items():
+        if hasattr(theme, key):
+            setattr(theme, key, value)
+
+    session.add(theme)
+    session.commit()
+    session.refresh(theme)
+    return theme
+
+
+@router.delete("/themes/{theme_id}")
+def delete_theme(theme_id: int, session: Session = Depends(get_session)):
+    """Delete a UI theme"""
+    theme = session.get(UITheme, theme_id)
+    if not theme:
+        raise HTTPException(404, "Theme not found")
+    session.delete(theme)
+    session.commit()
+    return {"message": "Theme deleted successfully"}
+
+
+# --- APP CONFIGURATION (BANNERS) ---
+
+
+@router.get("/banners", response_model=List[UIBanner])
+def get_all_banners(session: Session = Depends(get_session)):
+    """Get all promotional auto-scroll banners"""
+    return session.exec(select(UIBanner)).all()
+
+
+@router.post("/banners", response_model=UIBanner)
+def create_banner(banner: UIBanner, session: Session = Depends(get_session)):
+    """Create a new banner"""
+    session.add(banner)
+    session.commit()
+    session.refresh(banner)
+    return banner
+
+
+@router.put("/banners/{banner_id}", response_model=UIBanner)
+def update_banner(
+    banner_id: int, banner_data: dict, session: Session = Depends(get_session)
+):
+    """Update an existing banner"""
+    banner = session.get(UIBanner, banner_id)
+    if not banner:
+        raise HTTPException(404, "Banner not found")
+
+    for key, value in banner_data.items():
+        if hasattr(banner, key):
+            setattr(banner, key, value)
+
+    session.add(banner)
+    session.commit()
+    session.refresh(banner)
+    return banner
+
+
+@router.delete("/banners/{banner_id}")
+def delete_banner(banner_id: int, session: Session = Depends(get_session)):
+    """Delete a banner"""
+    banner = session.get(UIBanner, banner_id)
+    if not banner:
+        raise HTTPException(404, "Banner not found")
+    session.delete(banner)
+    session.commit()
+    return {"message": "Banner deleted successfully"}
