@@ -36,7 +36,7 @@ def get_app_config(session: Session = Depends(get_session)):
     # Fetch active banners
     banner_stmt = select(UIBanner).where(
         UIBanner.is_active,
-        (UIBanner.start_date <= now) | (UITheme.start_date.is_(None)),
+        (UIBanner.start_date <= now) | (UIBanner.start_date.is_(None)),
         (UIBanner.end_date >= now) | (UIBanner.end_date.is_(None)),
     )
     active_banners = session.exec(banner_stmt).all()
