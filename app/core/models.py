@@ -355,11 +355,13 @@ class LocationUpdate(SQLModel):
     speed: Optional[float] = 0.0
     trip_id: Optional[int] = None
 
+
 # Used for Send OTP API
 class SendOTPRequest(SQLModel):
     phone_number: str
     role: str = "user"
-    
+
+
 # Used for Verify OTP API
 class VerifyOTPRequest(SQLModel):
     phone_number: str
@@ -373,3 +375,31 @@ class VerifyOTPRequest(SQLModel):
     vehicle_type: Optional[str] = None
     # Tow Truck Specific Fields
     vehicle_number: Optional[str] = None
+
+
+# --- UI CONFIGURATION MODELS ---
+class UIThemeBase(SQLModel):
+    name: str  # e.g., "Ugadi", "Monsoon", "Deepavali"
+    theme_type: str  # "FESTIVAL" or "SEASON"
+    animation_style: str  # "SNOW", "RAIN", "FLOWERS", "DIYAS", "KITE", "NONE"
+    start_date: Optional[datetime] = None  # Used for time-limited festivals
+    end_date: Optional[datetime] = None
+    is_active: bool = True
+
+
+class UITheme(UIThemeBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True, index=True)
+
+
+class UIBannerBase(SQLModel):
+    image_url: str
+    title: str
+    details_text: str  # Content for the expanded modal
+    action_route: Optional[str] = None  # e.g., "/offers/deepavali"
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    is_active: bool = True
+
+
+class UIBanner(UIBannerBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True, index=True)
