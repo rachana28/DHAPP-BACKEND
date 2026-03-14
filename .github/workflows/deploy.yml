@@ -2,7 +2,7 @@ name: Universal Deploy
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "DHAPP-BACKEND-STAGE" ]
 
 jobs:
   # -----------------------------------------------------------------
@@ -36,11 +36,13 @@ jobs:
     needs: quality-check
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Render Deploy
-        env:
-          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
-        if: env.DEPLOY_HOOK != ''
-        run: curl "$DEPLOY_HOOK"
+      - name: Trigger Render Deploy (Main)
+        if: github.ref == 'refs/heads/main' && secrets.RENDER_DEPLOY_HOOK != ''
+        run: curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+
+      - name: Trigger Render Deploy (Stage)
+        if: github.ref == 'refs/heads/DHAPP-BACKEND-STAGE' && secrets.RENDER_DEPLOY_HOOK_STG != ''
+        run: curl "${{ secrets.RENDER_DEPLOY_HOOK_STG }}"
 
   # -----------------------------------------------------------------
   # JOB 3: AWS DEPLOY
