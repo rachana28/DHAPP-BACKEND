@@ -14,5 +14,5 @@ wheel
 dnspython
 redis
 apscheduler
-fastapi_limiter
+fastapi-limiter==0.1.6
 boto3
