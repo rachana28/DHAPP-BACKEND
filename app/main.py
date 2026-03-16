@@ -64,22 +64,34 @@ def run_scheduled_tow_escalation_check():
 async def lifespan(app: FastAPI):
     create_db_and_tables()
 
+    # --- ASYNC REDIS CONNECTION WITH AUTHENTICATION ---
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
+    redis_password = os.getenv("REDIS_PASSWORD")
+
+    redis_connection = redis_async.Redis(
+        host=redis_host,
+        port=redis_port,
+        username="default",
+        password=redis_password,
+        db=0,
+        decode_responses=True
+    )
+    
+    await FastAPILimiter.init(redis_connection)
+    # ----------------------------------------------------------
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(run_scheduled_escalation_check, "interval", minutes=1)
     scheduler.add_job(run_scheduled_tow_escalation_check, "interval", minutes=1)
     scheduler.start()
-
-    # --- Initialize Rate Limiter ---
-    redis_url = f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
-    redis_connection = redis_async.from_url(
-        redis_url, encoding="utf-8", decode_responses=True
-    )
-    await FastAPILimiter.init(redis_connection)
+    print("🚀 Scheduler started.")
 
     yield
 
     scheduler.shutdown()
-    await redis_connection.close()  # Clean up
+    print("🛑 Scheduler shut down.")
+    await redis_connection.close()
 
 
 app = FastAPI(lifespan=lifespan, title="Driver Hiring Backend")
