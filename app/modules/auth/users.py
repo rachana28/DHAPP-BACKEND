@@ -1,17 +1,12 @@
-import os
-import shutil
 from fastapi import APIRouter, Depends, File, UploadFile
 from sqlmodel import Session
-import time
 
 from app.core.database import get_session
 from app.core.models import User, UserUpdate, UserPrivate
 from app.core.security import get_current_active_user
+from app.utils.storage import upload_profile_picture_to_r2
 
 router = APIRouter(prefix="/users", tags=["Users"])
-
-# Create media directory if it doesn't exist
-os.makedirs("media/profile_pictures", exist_ok=True)
 
 
 @router.get("/me", response_model=UserPrivate)
@@ -47,27 +42,20 @@ def update_current_user_profile(
 
 
 @router.put("/me/profile-picture", response_model=UserPrivate)
-def update_profile_picture(
+async def update_profile_picture(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_active_user),
     file: UploadFile = File(...),
 ):
     """
-    Update the profile picture for the currently authenticated user.
+    Update the profile picture for the currently authenticated user by uploading to Cloudflare R2.
     """
-    timestamp = int(time.time())
-    file_extension = os.path.splitext(file.filename)[1]
-    # Sanitize filename if needed, but here we generate a new one
-    file_path = (
-        f"media/profile_pictures/user_{current_user.id}_{timestamp}{file_extension}"
-    )
+    # Upload to R2 and get the public URL
+    public_url = await upload_profile_picture_to_r2(file, "user", str(current_user.id))
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Update the user's avatar_url. The '/media' part will be used for serving.
-    current_user.avatar_url = f"/{file_path}"
+    # Save the R2 URL to the database
+    current_user.avatar_url = public_url
     session.add(current_user)
     session.commit()
     session.refresh(current_user)

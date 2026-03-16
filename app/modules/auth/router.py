@@ -4,6 +4,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select, delete
 from datetime import datetime
+from fastapi_limiter.depends import RateLimiter
 from app.core.database import get_session, get_redis
 from app.core.models import (
     User,
@@ -81,7 +82,11 @@ def verify_email(request: EmailVerificationRequest):
     return {"message": "Email is valid"}
 
 
-@router.post("/login", response_model=Token)
+@router.post(
+    "/login",
+    response_model=Token,
+    dependencies=[Depends(RateLimiter(times=5, seconds=60))],
+)
 def login(user_data: UserLogin, session: Session = Depends(get_session)):
     """
     Legacy Login Endpoint: Preserved specifically for the Admin portal
@@ -118,7 +123,7 @@ def login(user_data: UserLogin, session: Session = Depends(get_session)):
     }
 
 
-@router.post("/send-otp")
+@router.post("/send-otp", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
 def send_otp(request: SendOTPRequest, redis_client: redis.Redis = Depends(get_redis)):
     if not redis_client:
         raise HTTPException(status_code=500, detail="Redis connection failed")
