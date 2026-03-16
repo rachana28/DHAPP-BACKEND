@@ -1,5 +1,6 @@
 import uuid
-from pydantic import EmailStr
+import html
+from pydantic import EmailStr, field_validator
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List
 from datetime import datetime, date
@@ -249,10 +250,18 @@ class SystemConfig(SQLModel, table=True):
 
 # --- NEW: SUPPORT TICKET SYSTEM ---
 class SupportTicketBase(SQLModel):
-    subject: str
-    description: str
-    category: str = "general"  # payment, safety, technical, other
-    priority: str = "medium"  # low, medium, high
+    subject: str = Field(max_length=150)
+    description: str = Field(max_length=2000)
+    category: str = "general"
+    priority: str = "medium"
+
+    # --- XSS Sanitization ---
+    @field_validator("subject", "description", mode="before")
+    def sanitize_html(cls, v):
+        if isinstance(v, str):
+            # Escapes < to &lt;, > to &gt;, etc.
+            return html.escape(v.strip())
+        return v
 
 
 class SupportTicket(SupportTicketBase, table=True):
@@ -312,7 +321,7 @@ class UserUpdate(SQLModel):
 class UserCreate(SQLModel):
     email: Optional[EmailStr] = None
     password: str
-    full_name: Optional[str] = None
+    full_name: Optional[str] = Field(default=None, max_length=100)
     role: str = "user"
     # Optional fields for Driver/Tow creation
     license_number: Optional[str] = None
@@ -322,6 +331,12 @@ class UserCreate(SQLModel):
     org_name: Optional[str] = None
     contact_number: Optional[str] = None
     address: Optional[str] = None
+
+    @field_validator("full_name", "org_name", "address", mode="before")
+    def sanitize_strings(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
 
 
 class UserLogin(SQLModel):

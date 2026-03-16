@@ -82,8 +82,8 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
 def get_drivers_admin(
     status: Optional[str] = None,  # e.g., 'pending_approval'
     search: Optional[str] = None,
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
     session: Session = Depends(get_session),
 ):
     query = select(Driver)
@@ -152,8 +152,8 @@ def update_tow_driver_status(
 @router.get("/users", response_model=List[UserPublic])
 def get_users_admin(
     search: Optional[str] = None,
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
     session: Session = Depends(get_session),
 ):
     query = select(User).where(User.role == "user")
@@ -234,7 +234,9 @@ def delete_user(
 # --- 5. TRIP OVERSIGHT ---
 @router.get("/trips", response_model=List[TripSafe])
 def get_all_trips_admin(
-    skip: int = 0, limit: int = 50, session: Session = Depends(get_session)
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    session: Session = Depends(get_session),
 ):
     return session.exec(
         select(Trip).order_by(desc(Trip.booking_time)).offset(skip).limit(limit)
@@ -295,8 +297,8 @@ def get_user_trip_history(
 def get_all_tickets(
     status: Optional[str] = None,
     category: Optional[str] = None,
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
     session: Session = Depends(get_session),
 ):
     query = select(SupportTicket).order_by(desc(SupportTicket.created_at))

@@ -1,7 +1,4 @@
 import json
-import os
-import shutil
-import time
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from fastapi.encoders import jsonable_encoder
 from sqlmodel import Session, select, func, desc
@@ -18,10 +15,9 @@ from app.core.models import (
     Trip,
 )
 from app.core.security import get_current_active_driver
+from app.utils.storage import upload_profile_picture_to_r2
 
 router = APIRouter(prefix="/drivers", tags=["Drivers"])
-
-os.makedirs("media/profile_pictures", exist_ok=True)
 
 
 @router.get("/me", response_model=DriverPrivate)
@@ -63,34 +59,25 @@ def update_current_driver_profile(
 
 
 @router.put("/me/profile-picture", response_model=DriverPrivate)
-def update_driver_profile_picture(
+async def update_driver_profile_picture(
     *,
     session: Session = Depends(get_session),
     current_driver: Driver = Depends(get_current_active_driver),
     file: UploadFile = File(...),
-    redis_client: redis.Redis = Depends(get_redis),
 ):
     """
-    Update the profile picture for the currently authenticated driver.
+    Update the profile picture for the currently authenticated user by uploading to Cloudflare R2.
     """
-    timestamp = int(time.time())
-    file_extension = os.path.splitext(file.filename)[1]
-    file_path = (
-        f"media/profile_pictures/driver_{current_driver.id}_{timestamp}{file_extension}"
+    # Upload to R2 and get the public URL
+    public_url = await upload_profile_picture_to_r2(
+        file, "driver", str(current_driver.id)
     )
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    current_driver.profile_picture_url = f"/{file_path}"
+    # Save the R2 URL to the database
+    current_driver.profile_picture_url = public_url
     session.add(current_driver)
     session.commit()
     session.refresh(current_driver)
-
-    # Invalidate cache
-    if redis_client:
-        redis_client.delete("drivers")
-        redis_client.delete(f"driver_{current_driver.id}")
 
     return current_driver
 

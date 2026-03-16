@@ -1,11 +1,13 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from apscheduler.schedulers.asyncio import (
     AsyncIOScheduler,
 )  # You need to install: pip install apscheduler
 from sqlmodel import Session
+from fastapi_limiter import FastAPILimiter
+import redis.asyncio as redis_async
+import os
 
 from app.core.database import (
     create_db_and_tables,
@@ -66,34 +68,21 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(run_scheduled_escalation_check, "interval", minutes=1)
     scheduler.add_job(run_scheduled_tow_escalation_check, "interval", minutes=1)
     scheduler.start()
-    print("🚀 Scheduler started.")
+
+    # --- Initialize Rate Limiter ---
+    redis_url = f"redis://{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}"
+    redis_connection = redis_async.from_url(
+        redis_url, encoding="utf-8", decode_responses=True
+    )
+    await FastAPILimiter.init(redis_connection)
 
     yield
 
     scheduler.shutdown()
-    print("🛑 Scheduler shut down.")
+    await redis_connection.close()  # Clean up
 
 
 app = FastAPI(lifespan=lifespan, title="Driver Hiring Backend")
-
-# --- Static File Serving ---
-# This will serve files from the 'media' directory at the '/media' URL path
-app.mount("/media", StaticFiles(directory="media"), name="media")
-
-# commented to integrate with mobile apps also
-# origins = [
-#     # 1. Production Web Frontend (User & Driver)
-#     "https://dhapp-frontend.onrender.com",
-#     "https://dhire-driverspace.onrender.com",
-
-#     # 2. Local Web Development
-#     "http://localhost:5173",
-#     "http://localhost:3000",
-
-#     # ... web urls ...
-#     "capacitor://localhost", # If using Capacitor
-#     "http://localhost",      # Sometimes iOS simulators send this
-# ]
 
 app.add_middleware(
     CORSMiddleware,

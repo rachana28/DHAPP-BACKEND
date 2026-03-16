@@ -1,5 +1,5 @@
 # 1. Matched to Python 3.11 (same as your GitHub Actions pipeline)
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Set the working directory inside the container
 WORKDIR /app
