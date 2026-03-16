@@ -70,15 +70,18 @@ jobs:
     name: 🚀 Render Deploy
     needs: build-docker # Waits for the Docker image to be pushed first!
     runs-on: ubuntu-latest
+    # Map the secrets to environment variables so they can be evaluated in 'if'
+    env:
+      RENDER_HOOK_MAIN: ${{ secrets.RENDER_DEPLOY_HOOK }}
+      RENDER_HOOK_STAGE: ${{ secrets.RENDER_DEPLOY_HOOK_STG }}
     steps:
       - name: Trigger Render Deploy (Main)
-        if: github.ref == 'refs/heads/main' && secrets.RENDER_DEPLOY_HOOK != ''
-        # Using -X POST is standard practice for triggering webhooks
-        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+        if: github.ref == 'refs/heads/main' && env.RENDER_HOOK_MAIN != ''
+        run: curl -X POST "${{ env.RENDER_HOOK_MAIN }}"
 
       - name: Trigger Render Deploy (Stage)
-        if: github.ref == 'refs/heads/DHAPP-BACKEND-STAGE' && secrets.RENDER_DEPLOY_HOOK_STG != ''
-        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_STG }}"
+        if: github.ref == 'refs/heads/DHAPP-BACKEND-STAGE' && env.RENDER_HOOK_STAGE != ''
+        run: curl -X POST "${{ env.RENDER_HOOK_STAGE }}"
 
   # -----------------------------------------------------------------
   # JOB 4: AWS DEPLOY
