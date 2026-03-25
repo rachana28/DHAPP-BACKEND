@@ -1,4 +1,6 @@
 import redis
+import calendar
+from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select, desc
 from typing import List, Union
@@ -43,6 +45,34 @@ def create_booking_request(
 
     # 1. Save Trip
     trip_data = trip_in.model_dump()
+
+    # --- Calculate Dates for Monthly Bookings ---
+    if trip_data.get("hiring_type") == "Monthly":
+        if not trip_data.get("start_date") or not trip_data.get("end_date"):
+            today = date.today()
+            # Start date is the 1st of the current month
+            start_date = today.replace(day=1)
+            months_count = trip_data.get("months") or 1
+
+            # Calculate end date based on no. of months
+            end_month = start_date.month + months_count - 1
+            end_year = start_date.year + (end_month // 12)
+            end_month = (end_month % 12) + 1
+
+            # Get the last day of the target month
+            _, last_day = calendar.monthrange(end_year, end_month)
+            end_date = date(end_year, end_month, last_day)
+
+            trip_data["start_date"] = start_date
+            trip_data["end_date"] = end_date
+    else:
+        # Enforce date requirements for other hiring types
+        if not trip_data.get("start_date") or not trip_data.get("end_date"):
+            raise HTTPException(
+                400, "start_date and end_date are required for this hiring type."
+            )
+    # --------------------------------------------------------
+
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"
 

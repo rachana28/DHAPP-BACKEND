@@ -40,14 +40,16 @@ class TripBase(SQLModel):
     driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
     tow_truck_driver_id: Optional[int] = Field(
         default=None, foreign_key="towtruckdriver.id"
-    )  # Added
+    )
 
     # Booking Details
     hiring_type: str
     vehicle_type: str
     shift_details: Optional[str] = None
-    start_date: date
-    end_date: date
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    months: Optional[int] = None
+    selected_days: Optional[str] = None
     start_location: Optional[str] = None
     end_location: Optional[str] = None
     reason: Optional[str] = None
@@ -97,8 +99,10 @@ class TripSafe(SQLModel):
     hiring_type: str
     vehicle_type: str
     shift_details: Optional[str] = None
-    start_date: date
-    end_date: date
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    months: Optional[int] = None
+    selected_days: Optional[str] = None
     start_location: Optional[str] = None
     end_location: Optional[str] = None
     reason: Optional[str] = None
