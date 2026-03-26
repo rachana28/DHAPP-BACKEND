@@ -34,6 +34,47 @@ class TowTruckDriverBase(SQLModel):
     rating: float = Field(default=0.0)
 
 
+# --- MECHANIC MODELS ADDITIONS ---
+
+class MechanicBase(SQLModel):
+    name: str
+    phone_number: str
+    specialization: str  # e.g., "Car", "Bike", "Both"
+    address: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    status: str = "pending_approval"
+    rating: float = Field(default=0.0)
+
+
+class Mechanic(MechanicBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+
+    user: "User" = Relationship(back_populates="mechanic_profile")
+    trips: List["Trip"] = Relationship(back_populates="mechanic")
+    offers: List["MechanicOffer"] = Relationship(back_populates="mechanic")
+
+
+class MechanicOffer(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    mechanic_id: int = Field(foreign_key="mechanic.id")
+    status: str = "pending"
+    tier: int = 1
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    trip: "Trip" = Relationship(back_populates="mechanic_offers")
+    mechanic: Mechanic = Relationship(back_populates="offers")
+
+
+class MechanicPublic(SQLModel):
+    id: int
+    name: str
+    rating: float
+    specialization: str
+    status: str
+
+
 # --- Trip Models ---
 class TripBase(SQLModel):
     user_id: uuid.UUID = Field(foreign_key="user.id")
@@ -66,7 +107,10 @@ class Trip(TripBase, table=True):
     )  # Added
     user: "User" = Relationship(back_populates="trips")
     offers: List["TripOffer"] = Relationship(back_populates="trip")
-    tow_offers: List["TowTripOffer"] = Relationship(back_populates="trip")  # Added
+    tow_offers: List["TowTripOffer"] = Relationship(back_populates="trip")
+    mechanic_id: Optional[int] = Field(default=None, foreign_key="mechanic.id")
+    mechanic: Optional["Mechanic"] = Relationship(back_populates="trips")
+    mechanic_offers: List["MechanicOffer"] = Relationship(back_populates="trip")
 
 
 class TripOffer(SQLModel, table=True):
@@ -169,6 +213,7 @@ class TripReadUser(TripSafe):
     tow_truck_driver: Optional[TowTruckDriverPublic] = (
         None  # Added support for tow driver details
     )
+    mechanic: Optional[MechanicPublic] = None
 
 
 class DriverPrivate(DriverBase):
@@ -303,6 +348,7 @@ class User(UserBase, table=True):
     )
     trips: List[Trip] = Relationship(back_populates="user")
     tickets: List["SupportTicket"] = Relationship(back_populates="user")
+    mechanic_profile: Optional[Mechanic] = Relationship(back_populates="user")
 
 
 class UserPublic(SQLModel):

@@ -8,6 +8,7 @@ from app.modules.pricing.pricing_algo import (
     get_road_distance_duration,
     calculate_tow_cost,
     encode_response_data,
+    calculate_mechanic_cost,
 )
 
 router = APIRouter(prefix="/pricing", tags=["Pricing Calculator"])
@@ -51,6 +52,37 @@ def calculate_towing_price(
     }
 
     # 4. Encode Response
+    encoded_payload = encode_response_data(response_data)
+
+    return {"payload": encoded_payload}
+
+
+@router.post("/calculate-mechanic")
+def calculate_mechanic_price(
+    start_lat: float = Form(...),
+    start_lng: float = Form(...),
+    vehicle_type: str = Form(..., regex="^(CAR|BIKE)$"),
+    user_id: Optional[str] = Form(None),
+    # Inject Redis Client
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Calculates the estimated mechanic visiting price.
+    Uses Dynamic Pricing from Redis Config if available.
+    """
+
+    # 1. Run Intelligent Pricing Algorithm
+    pricing_result = calculate_mechanic_cost(vehicle_type, redis_client)
+
+    # 2. Construct Payload
+    response_data = {
+        "status": "success",
+        "currency": "INR",
+        "estimation": pricing_result,
+        # Distance and duration are omitted as the mechanic comes to the user
+    }
+
+    # 3. Encode Response exactly like Tow Trucks
     encoded_payload = encode_response_data(response_data)
 
     return {"payload": encoded_payload}
