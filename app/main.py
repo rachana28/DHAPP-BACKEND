@@ -27,7 +27,10 @@ from app.modules.pricing import router as pricing_router
 from app.modules.tracking import router as tracking_router
 from app.modules.admin import router as admin_router
 from app.modules.support import router as support_router
-from app.modules.mechanic import trip_router as mechanic_router
+from app.modules.mechanic import (
+    trip_router as mechanic_router,
+    profile_router as mechanic_profile_router,
+)
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -76,9 +79,9 @@ async def lifespan(app: FastAPI):
         username="default",
         password=redis_password,
         db=0,
-        decode_responses=True
+        decode_responses=True,
     )
-    
+
     await FastAPILimiter.init(redis_connection)
     # ----------------------------------------------------------
 
@@ -117,6 +120,7 @@ app.include_router(pricing_router.router)
 app.include_router(support_router.router)
 app.include_router(config_router.router)
 app.include_router(mechanic_router.router)
+app.include_router(mechanic_profile_router.router)
 
 
 @app.get("/")

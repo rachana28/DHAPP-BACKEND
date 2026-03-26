@@ -12,6 +12,7 @@ from app.core.models import (
     Token,
     Driver,
     TowTruckDriver,
+    Mechanic,
     VerifyOTPRequest,
     SendOTPRequest,
     UserDevice,
@@ -217,6 +218,12 @@ def verify_otp(
                     status_code=400,
                     detail="Vehicle number required for tow truck registration",
                 )
+        elif role == "mechanic":
+            if not request.specialization:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Specialization required for mechanic registration",
+                )
 
         # Create Base User
         user = User(
@@ -250,6 +257,15 @@ def verify_otp(
                 user_id=user.id,
             )
             session.add(db_tow_driver)
+            session.commit()
+        elif role == "mechanic":
+            new_mechanic = Mechanic(
+                user_id=user.id,
+                name=request.full_name,
+                phone_number=phone,
+                specialization=request.specialization,
+            )
+            session.add(new_mechanic)
             session.commit()
 
     # 4. Generate Session Tokens

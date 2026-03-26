@@ -172,6 +172,7 @@ def get_current_active_user(
         current_user.role == "user"
         or current_user.role == "driver"
         or current_user.role == "tow_truck_driver"
+        or current_user.role == "mechanic"
     ):
         return current_user
     raise HTTPException(status_code=403, detail="Not a valid user")

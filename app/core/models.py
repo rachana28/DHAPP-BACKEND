@@ -67,12 +67,40 @@ class MechanicOffer(SQLModel, table=True):
     mechanic: Mechanic = Relationship(back_populates="offers")
 
 
+class MechanicUpdate(SQLModel):
+    name: Optional[str] = None
+    phone_number: Optional[str] = None
+    specialization: Optional[str] = None
+    address: Optional[str] = None
+    status: Optional[str] = None
+
+
 class MechanicPublic(SQLModel):
     id: int
     name: str
-    rating: float
     specialization: str
     status: str
+    rating: float
+    profile_picture_url: Optional[str] = None
+    total_trips: Optional[int] = 0
+
+
+class MechanicPrivate(MechanicPublic):
+    phone_number: str
+    address: Optional[str] = None
+    user_id: uuid.UUID
+
+
+class MechanicReviewBase(SQLModel):
+    rating: float
+    comment: Optional[str] = None
+
+
+class MechanicReview(MechanicReviewBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    mechanic_id: int = Field(foreign_key="mechanic.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # --- Trip Models ---
@@ -440,6 +468,7 @@ class VerifyOTPRequest(SQLModel):
     vehicle_type: Optional[str] = None
     # Tow Truck Specific Fields
     vehicle_number: Optional[str] = None
+    specialization: Optional[str] = None
 
 
 # --- UI CONFIGURATION MODELS ---
