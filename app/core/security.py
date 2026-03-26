@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 import uuid
 
 from app.core.database import get_session
-from app.core.models import User, Driver, TowTruckDriver
+from app.core.models import User, Driver, TowTruckDriver, Mechanic
 
 SECRET_KEY = "supersecretkey_change_this_in_production"
 REFRESH_SECRET_KEY = "refresh_supersecretkey_change_this_too"
@@ -143,6 +143,26 @@ def get_current_active_tow_truck_driver(
         )
 
     return driver_profile
+
+
+def get_current_active_mechanic(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> Mechanic:
+    if current_user.role != "mechanic":
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    mechanic = session.exec(
+        select(Mechanic).where(Mechanic.user_id == current_user.id)
+    ).first()
+
+    if not mechanic:
+        raise HTTPException(status_code=404, detail="Mechanic profile not found")
+
+    if mechanic.status != "available":  # Or whatever active status you define
+        raise HTTPException(status_code=400, detail="Mechanic is not active/available")
+
+    return mechanic
 
 
 def get_current_active_user(

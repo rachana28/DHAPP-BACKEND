@@ -131,6 +131,60 @@ def calculate_tow_cost(
     }
 
 
+def calculate_mechanic_cost(
+    vehicle_type: str, redis_client: Optional[object] = None
+) -> dict:
+    """
+    Pricing Algorithm for Mechanic Services.
+    Fetches dynamic visiting charge from Redis if available.
+    """
+    current_hour = datetime.now().hour
+
+    # 1. Base Parameters (Defaults for Visiting Charge)
+    if vehicle_type.upper() == "BIKE":
+        base_visit_charge = 150.0
+    else:  # CAR / SUV
+        base_visit_charge = 300.0
+
+    # 2. Dynamic Override (Check Admin Config)
+    if redis_client:
+        try:
+            v_key = vehicle_type.lower()
+            # Look for a specific mechanic config, e.g., config:mechanic_bike_base
+            dyn_base = redis_client.get(f"config:mechanic_{v_key}_base")
+            if dyn_base:
+                base_visit_charge = float(dyn_base)
+        except Exception as e:
+            print(f"Mechanic Pricing Config Fetch Error: {e}")
+
+    # 3. Time Multiplier (AI Heuristic - mirrors Tow Truck logic)
+    if 22 <= current_hour or current_hour < 5:
+        time_multiplier = 1.5  # Night
+        time_label = "Night"
+    elif 18 <= current_hour < 22:
+        time_multiplier = 1.25  # Evening
+        time_label = "Evening"
+    else:
+        time_multiplier = 1.0  # Day
+        time_label = "Day"
+
+    # 4. Final Calculation
+    total_price = base_visit_charge * time_multiplier
+
+    # Round to nearest 10
+    final_price = math.ceil(total_price / 10.0) * 10
+
+    return {
+        "final_price": final_price,
+        "breakdown": {
+            "base_visit_charge": base_visit_charge,
+            "time_multiplier": time_multiplier,
+            "time_slot": time_label,
+            "vehicle_type": vehicle_type,
+        },
+    }
+
+
 def encode_response_data(data: dict) -> str:
     json_str = json.dumps(data)
     encoded_bytes = base64.b64encode(json_str.encode("utf-8"))
