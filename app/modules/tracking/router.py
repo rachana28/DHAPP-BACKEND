@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlmodel import Session, select
 from app.core.database import get_redis, get_session
-from app.core.models import LocationUpdate, User, Trip, TowTruckDriver
+from app.core.models import LocationUpdate, User, Trip, TowTruckDriver, Mechanic
 from app.core.security import get_current_user
 from sqlalchemy.orm import selectinload
 import redis
@@ -19,28 +19,41 @@ def update_location(
     redis_client: redis.Redis = Depends(get_redis),
 ):
     """
-    Updates location ONLY for Tow Truck Drivers and ONLY if there is an active trip.
+    Updates location ONLY for Tow Truck Drivers and Mechanics, and ONLY if there is an active trip.
     """
-    if current_user.role != "tow_truck_driver":
-        raise HTTPException(403, "Tracking is only enabled for Tow Truck Drivers.")
+    # 1. Allow both tow truck drivers and mechanics
+    if current_user.role not in ["tow_truck_driver", "mechanic"]:
+        raise HTTPException(403, "Tracking is only enabled for Service Professionals.")
 
     if not location.trip_id:
         raise HTTPException(400, "Active trip ID is required for location updates.")
-
-    driver = session.exec(
-        select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
-    ).first()
-    if not driver:
-        raise HTTPException(404, "Tow Driver profile not found.")
 
     trip = session.get(Trip, location.trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found.")
 
-    if trip.tow_truck_driver_id != driver.id:
-        raise HTTPException(
-            403, "You are not authorized to update location for this trip."
-        )
+    # 2. Role-specific validation
+    if current_user.role == "tow_truck_driver":
+        driver = session.exec(
+            select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
+        ).first()
+        if not driver:
+            raise HTTPException(404, "Tow Driver profile not found.")
+        if trip.tow_truck_driver_id != driver.id:
+            raise HTTPException(
+                403, "You are not authorized to update location for this trip."
+            )
+
+    elif current_user.role == "mechanic":
+        mechanic = session.exec(
+            select(Mechanic).where(Mechanic.user_id == current_user.id)
+        ).first()
+        if not mechanic:
+            raise HTTPException(404, "Mechanic profile not found.")
+        if trip.mechanic_id != mechanic.id:
+            raise HTTPException(
+                403, "You are not authorized to update location for this trip."
+            )
 
     if trip.status not in ["accepted", "in_progress", "arrived"]:
         raise HTTPException(400, "Tracking is not allowed for inactive trips.")
@@ -76,10 +89,11 @@ def get_trip_location(
         if direct_trip_data:
             return json.loads(direct_trip_data)
 
+    # 3. Load both potential relationships
     statement = (
         select(Trip)
         .where(Trip.id == trip_id)
-        .options(selectinload(Trip.tow_truck_driver))
+        .options(selectinload(Trip.tow_truck_driver), selectinload(Trip.mechanic))
     )
     trip = session.exec(statement).first()
 
@@ -87,11 +101,18 @@ def get_trip_location(
         raise HTTPException(404, "Trip not found")
 
     target_user_id = None
+
+    # 4. Extract the correct user_id based on who accepted the trip
     if trip.tow_truck_driver_id and trip.tow_truck_driver:
         target_user_id = trip.tow_truck_driver.user_id
+    elif trip.mechanic_id and trip.mechanic:
+        target_user_id = trip.mechanic.user_id
 
     if not target_user_id:
-        return {"status": "waiting_for_driver", "detail": "No tow driver assigned yet"}
+        return {
+            "status": "waiting_for_professional",
+            "detail": "No professional assigned yet",
+        }
 
     if redis_client:
         data = redis_client.get(f"loc:{target_user_id}")
@@ -124,15 +145,27 @@ async def tracking_websocket(
                 if direct_trip_data:
                     data = direct_trip_data
                 else:
-                    # Fallback to fetching trip -> driver -> cached location
+                    # Fallback to fetching trip -> professional -> cached location
+                    # 5. Apply the same multi-role check here
                     statement = (
                         select(Trip)
                         .where(Trip.id == trip_id)
-                        .options(selectinload(Trip.tow_truck_driver))
+                        .options(
+                            selectinload(Trip.tow_truck_driver),
+                            selectinload(Trip.mechanic),
+                        )
                     )
                     trip = session.exec(statement).first()
-                    if trip and trip.tow_truck_driver_id and trip.tow_truck_driver:
-                        data = redis_client.get(f"loc:{trip.tow_truck_driver.user_id}")
+
+                    target_user_id = None
+                    if trip:
+                        if trip.tow_truck_driver_id and trip.tow_truck_driver:
+                            target_user_id = trip.tow_truck_driver.user_id
+                        elif trip.mechanic_id and trip.mechanic:
+                            target_user_id = trip.mechanic.user_id
+
+                    if target_user_id:
+                        data = redis_client.get(f"loc:{target_user_id}")
 
             if data:
                 # Decode bytes if needed

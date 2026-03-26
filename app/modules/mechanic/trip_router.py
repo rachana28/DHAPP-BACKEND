@@ -6,7 +6,15 @@ from sqlalchemy.exc import NoResultFound
 from pydantic import BaseModel
 
 from app.core.database import get_session
-from app.core.models import Trip, TripCreate, TripSafe, Mechanic, MechanicOffer, User, TripReadUser
+from app.core.models import (
+    Trip,
+    TripCreate,
+    TripSafe,
+    Mechanic,
+    MechanicOffer,
+    User,
+    TripReadUser,
+)
 from app.core.security import get_current_user, get_current_active_mechanic
 from app.modules.mechanic.mechanic_allocation import (
     rank_mechanics,
@@ -16,6 +24,14 @@ from app.modules.mechanic.mechanic_allocation import (
 from app.utils.notifications import send_push_notification
 
 router = APIRouter(prefix="/mechanic-trips", tags=["Mechanic Trips"])
+
+
+class MechanicOfferWithTrip(MechanicOffer):
+    """
+    Extends the base MechanicOffer to explicitly include the Trip data
+    in the JSON response so the frontend doesn't get 'undefined'.
+    """
+    trip: TripSafe
 
 
 class StatusUpdate(BaseModel):
@@ -52,6 +68,7 @@ def create_mechanic_booking_request(
 
     return db_trip
 
+
 @router.get("/my-bookings", response_model=List[TripReadUser])
 def get_my_mechanic_bookings(
     session: Session = Depends(get_session),
@@ -65,7 +82,7 @@ def get_my_mechanic_bookings(
         mechanic = session.exec(
             select(Mechanic).where(Mechanic.user_id == current_user.id)
         ).first()
-        
+
         if not mechanic:
             return []
 
@@ -84,12 +101,15 @@ def get_my_mechanic_bookings(
             .where(Trip.user_id == current_user.id)
             .where(Trip.hiring_type == "Mechanic Service")
             .order_by(desc(Trip.booking_time))
-            .options(selectinload(Trip.mechanic)) # Ensure Mechanic relationship is loaded
+            .options(
+                selectinload(Trip.mechanic)
+            )
         )
         return session.exec(statement).all()
 
     else:
         return []
+
 
 @router.post("/{trip_id}/cancel")
 def cancel_mechanic_trip(
@@ -137,19 +157,17 @@ def cancel_mechanic_trip(
     return {"message": "Mechanic trip cancelled successfully"}
 
 
-@router.get(
-    "/mechanic/offers", response_model=List[MechanicOffer]
-)  # Adjust response model as needed
+@router.get("/mechanic/offers", response_model=List[MechanicOfferWithTrip])
 def get_mechanic_offers(
     session: Session = Depends(get_session),
-    current_mechanic: Mechanic = Depends(get_current_active_mechanic),  # See Step 2
+    current_mechanic: Mechanic = Depends(get_current_active_mechanic),
 ):
     """Fetch pending offers for the logged-in mechanic."""
     statement = (
         select(MechanicOffer)
         .where(MechanicOffer.mechanic_id == current_mechanic.id)
         .where(MechanicOffer.status == "pending")
-        .options(selectinload(MechanicOffer.trip))
+        .options(selectinload(MechanicOffer.trip))  # Loads the nested trip data from DB
     )
     offers = session.exec(statement).all()
     return offers
