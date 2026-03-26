@@ -34,7 +34,13 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
 DAILY_SMS_LIMIT = 50
-BYPASS_NUMBERS = ["9999999999", "9876543210", "+919999999999", "+919876543210"]
+BYPASS_NUMBERS = [
+    "9999999999",
+    "9876543210",
+    "+919999999999",
+    "+919876543210",
+    "8296789262",
+]
 
 
 class EmailVerificationRequest(BaseModel):
