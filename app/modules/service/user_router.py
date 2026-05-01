@@ -361,10 +361,19 @@ def cancel_service_booking(
 
     # Free up slot capacity if slot-based
     if booking.slot_id:
-        slot = session.get(ServiceSlot, booking.slot_id)
-        if slot and slot.booked_count > 0:
-            slot.booked_count -= 1
-            session.add(slot)
+        try:
+            statement = (
+                select(ServiceSlot)
+                .where(ServiceSlot.id == booking.slot_id)
+                .with_for_update()
+            )
+            slot = session.exec(statement).one()
+
+            if slot.booked_count > 0:
+                slot.booked_count -= 1
+                session.add(slot)
+        except NoResultFound:
+            pass
 
     booking.status = "cancelled"
     session.add(booking)
