@@ -21,8 +21,9 @@ s3_client = boto3.client(
     region_name="auto",
 )
 
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+DOC_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf", ".doc", ".docx"}
 
 
 async def upload_profile_picture_to_r2(
@@ -45,7 +46,7 @@ async def upload_profile_picture_to_r2(
     # 2. Validate File Size safely (Using FastAPI's built-in size attribute)
     if file.size and file.size > MAX_FILE_SIZE:
         raise HTTPException(
-            status_code=413, detail="File size too large. Maximum allowed is 5MB."
+            status_code=413, detail="File size too large. Maximum allowed is 10MB."
         )
 
     # 3. Generate Unique Filename
@@ -77,4 +78,52 @@ async def upload_profile_picture_to_r2(
         await file.close()
 
     # 5. Return the Public URL
+    return f"{R2_PUBLIC_URL}/{object_name}"
+
+
+async def upload_document_to_r2(
+    file: UploadFile, user_prefix: str, user_id: str
+) -> str:
+    """
+    Validates and uploads KYC documents (including PDFs) to Cloudflare R2.
+    """
+    if not R2_PUBLIC_URL:
+        raise HTTPException(status_code=500, detail="Unexpected Error")
+
+    # 1. Validate Document Extension
+    file_extension = os.path.splitext(file.filename)[1].lower()
+    if file_extension not in DOC_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(DOC_ALLOWED_EXTENSIONS)}",
+        )
+
+    # 2. Validate File Size
+    if file.size and file.size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413, detail="File size too large. Maximum allowed is 10MB."
+        )
+
+    # 3. Generate Unique Filename in a dedicated documents folder
+    timestamp = int(time.time())
+    object_name = f"kyc_documents/{user_prefix}_{user_id}_{timestamp}{file_extension}"
+
+    # 4. Upload to Cloudflare R2
+    try:
+        file_contents = await file.read()
+        await asyncio.to_thread(
+            s3_client.put_object,
+            Bucket=BUCKET_NAME,
+            Key=object_name,
+            Body=file_contents,
+            ContentType=file.content_type,
+        )
+    except ClientError as e:
+        print(f"R2 Document Upload Error: {e}")
+        raise HTTPException(
+            status_code=500, detail="Failed to upload document to storage."
+        )
+    finally:
+        await file.close()
+
     return f"{R2_PUBLIC_URL}/{object_name}"
