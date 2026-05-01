@@ -151,6 +151,15 @@ def update_driver_status(
     if redis_client:
         redis_client.delete("drivers")
         redis_client.delete(f"driver_{driver.id}")
+    
+    if status in ["rejected", "banned"]:
+        send_push_notification(
+            session=session,
+            user_ids=[driver.user_id],
+            title="Account Status Update",
+            body=f"Your profile has been {status} by the administrator.",
+            data={"type": "account_restricted"}
+        )
 
     return {"message": f"Driver status updated to {status}"}
 
@@ -179,6 +188,16 @@ def update_tow_driver_status(
     driver.status = status
     session.add(driver)
     session.commit()
+
+    if status in ["rejected", "banned"]:
+        send_push_notification(
+            session=session,
+            user_ids=[driver.user_id],
+            title="Account Status Update",
+            body=f"Your profile has been {status} by the administrator.",
+            data={"type": "account_restricted"}
+        )
+
     return {"message": f"Tow Driver status updated to {status}"}
 
 
@@ -206,6 +225,16 @@ def update_mechanic_status(
     mechanic.status = status
     session.add(mechanic)
     session.commit()
+
+    if status in ["rejected", "banned"]:
+        send_push_notification(
+            session=session,
+            user_ids=[mechanic.user_id],
+            title="Account Status Update",
+            body=f"Your profile has been {status} by the administrator.",
+            data={"type": "account_restricted"}
+        )
+
     return {"message": f"Mechanic status updated to {status}"}
 
 
