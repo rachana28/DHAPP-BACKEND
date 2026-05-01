@@ -124,6 +124,16 @@ def get_current_active_driver(
     if not driver_profile:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
+    if driver_profile.status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail="ACCOUNT_BANNED: Your account has been permanently suspended.",
+        )
+
+    # 2. REJECTED (Needs Correction)
+    if driver_profile.status == "rejected":
+        pass
+
     return driver_profile
 
 
@@ -142,6 +152,16 @@ def get_current_active_tow_truck_driver(
             status_code=404, detail="Tow truck driver profile not found"
         )
 
+    if driver_profile.status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail="ACCOUNT_BANNED: Your account has been permanently suspended.",
+        )
+
+    # 2. REJECTED (Needs Correction)
+    if driver_profile.status == "rejected":
+        pass
+
     return driver_profile
 
 
@@ -159,8 +179,15 @@ def get_current_active_mechanic(
     if not mechanic:
         raise HTTPException(status_code=404, detail="Mechanic profile not found")
 
-    if mechanic.status != "available":  # Or whatever active status you define
-        raise HTTPException(status_code=400, detail="Mechanic is not active/available")
+    if mechanic.status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail="ACCOUNT_BANNED: Your account has been permanently suspended.",
+        )
+
+    # 2. REJECTED (Needs Correction)
+    if mechanic.status == "rejected":
+        pass
 
     return mechanic
 
@@ -183,8 +210,15 @@ def get_current_active_service_center(
     if not service_center:
         raise HTTPException(status_code=404, detail="Service center profile not found")
 
-    if service_center.status not in ["available", "pending_approval"]:
-        raise HTTPException(status_code=400, detail="Service center is not active/available")
+    if service_center.status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail="ACCOUNT_BANNED: Your account has been permanently suspended.",
+        )
+
+    # 2. REJECTED (Needs Correction)
+    if service_center.status == "rejected":
+        pass
 
     return service_center
 

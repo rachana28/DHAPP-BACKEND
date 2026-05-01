@@ -24,6 +24,7 @@ class DriverBase(SQLModel):
     verification_documents: List[str] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
+    admin_notes: Optional[str] = None
 
 
 class TowTruckDriverBase(SQLModel):
@@ -37,6 +38,7 @@ class TowTruckDriverBase(SQLModel):
     verification_documents: List[str] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
+    admin_notes: Optional[str] = None
 
 
 # --- MECHANIC MODELS ADDITIONS ---
@@ -53,6 +55,7 @@ class MechanicBase(SQLModel):
     verification_documents: List[str] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
+    admin_notes: Optional[str] = None
 
 
 class Mechanic(MechanicBase, table=True):
@@ -127,6 +130,7 @@ class ServiceCenterBase(SQLModel):
     verification_documents: List[str] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
+    admin_notes: Optional[str] = None
 
 
 class ServiceCenter(ServiceCenterBase, table=True):
