@@ -27,7 +27,7 @@ from app.core.models import (
     ServiceSlotUpdate,
 )
 from app.core.security import get_current_active_service_center
-from app.utils.storage import upload_profile_picture_to_r2
+from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
 
 router = APIRouter(prefix="/service-centers", tags=["Service Centers"])
 
@@ -72,6 +72,7 @@ def update_current_service_center_profile(
 
     return current_center
 
+
 @router.post("/me/documents")
 async def upload_verification_document(
     *,
@@ -83,24 +84,25 @@ async def upload_verification_document(
     Upload KYC documents, licenses, or garage photos for admin approval.
     """
     # Reuse your R2 storage utility, but change the prefix folder
-    public_url = await upload_profile_picture_to_r2(
+    public_url = await upload_document_to_r2(
         file, "kyc_documents", str(current_center.id)
     )
-    
+
     # Append the new document URL to the JSON array safely
     current_docs = current_center.verification_documents or []
-    
+
     # Create a new list to trigger SQLAlchemy's JSON mutation detection
     current_center.verification_documents = [*current_docs, public_url]
-    
+
     session.add(current_center)
     session.commit()
     session.refresh(current_center)
-    
+
     return {
-        "message": "Document uploaded successfully", 
-        "documents": current_center.verification_documents
+        "message": "Document uploaded successfully",
+        "documents": current_center.verification_documents,
     }
+
 
 @router.put("/me/profile-picture", response_model=ServiceCenterPrivate)
 async def update_profile_picture(

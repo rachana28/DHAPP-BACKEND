@@ -13,7 +13,7 @@ from app.core.models import (
     Trip,
 )
 from app.core.security import get_current_active_tow_truck_driver
-from app.utils.storage import upload_profile_picture_to_r2
+from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
 
 router = APIRouter(prefix="/tow-truck-drivers", tags=["Tow Truck Drivers"])
 
@@ -116,7 +116,7 @@ async def upload_verification_document(
     Upload KYC documents, licenses, or garage photos for admin approval.
     """
     # Reuse your R2 storage utility, but change the prefix folder
-    public_url = await upload_profile_picture_to_r2(
+    public_url = await upload_document_to_r2(
         file, "kyc_documents", str(current_driver.id)
     )
 
