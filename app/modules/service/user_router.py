@@ -19,6 +19,7 @@ from app.core.models import (
 )
 from app.core.security import get_current_user
 from app.utils.notifications import send_push_notification
+import math
 
 router = APIRouter(prefix="/services", tags=["User Services"])
 
@@ -33,18 +34,16 @@ def list_service_centers(
     limit: int = Query(20, gt=0, le=100),
     latitude: float = Query(None),
     longitude: float = Query(None),
-    service_type: str = Query(None),  # Optional filter by service type
+    service_type: str = Query(None),
 ):
     """
-    List all available service centers.
-    Functionality: Retrieve list of approved service centers, optionally filtered by location/service type
+    List all available service centers, sorted by distance if coordinates are provided.
     """
     offset = (page - 1) * limit
 
     # Base query: only approved centers
     query = select(ServiceCenter).where(ServiceCenter.status == "available")
 
-    # Optional: filter by service type if provided
     if service_type:
         query = (
             query.distinct()
@@ -52,8 +51,25 @@ def list_service_centers(
             .where(CenterService.service_type == service_type)
         )
 
+    # Standard fallback sort by rating
     query = query.order_by(desc(ServiceCenter.rating))
     centers = session.exec(query.offset(offset).limit(limit)).all()
+
+    # Helper function to calculate distance in km
+    def calculate_distance(lat1, lon1, lat2, lon2):
+        if None in (lat1, lon1, lat2, lon2):
+            return None
+        R = 6371.0  # Earth radius in kilometers
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlon / 2) ** 2
+        )
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return round(R * c, 1)
 
     result = []
     for center in centers:
@@ -62,9 +78,21 @@ def list_service_centers(
                 ServiceRequest.service_center_id == center.id
             )
         ).one()
-        result.append(
-            ServiceCenterPublic(**center.model_dump(), total_bookings=booking_count)
+
+        # Calculate distance
+        dist = calculate_distance(
+            latitude, longitude, center.latitude, center.longitude
         )
+
+        result.append(
+            ServiceCenterPublic(
+                **center.model_dump(), total_bookings=booking_count, distance=dist
+            )
+        )
+
+    # If the mobile app provided coordinates, overwrite the rating sort with a distance sort
+    if latitude and longitude:
+        result.sort(key=lambda x: x.distance if x.distance is not None else 9999.0)
 
     return result
 

@@ -247,6 +247,7 @@ class ServiceCenterPublic(SQLModel):
     status: str
     rating: float
     total_bookings: Optional[int] = 0
+    distance: Optional[float] = None
 
 
 class ServiceCenterPrivate(ServiceCenterBase):
