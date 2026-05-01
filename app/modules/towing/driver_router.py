@@ -103,3 +103,34 @@ def get_tow_driver_reviews(
         .limit(limit)
     ).all()
     return reviews
+
+
+@router.post("/me/documents")
+async def upload_verification_document(
+    *,
+    session: Session = Depends(get_session),
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+    file: UploadFile = File(...),
+):
+    """
+    Upload KYC documents, licenses, or garage photos for admin approval.
+    """
+    # Reuse your R2 storage utility, but change the prefix folder
+    public_url = await upload_profile_picture_to_r2(
+        file, "kyc_documents", str(current_driver.id)
+    )
+
+    # Append the new document URL to the JSON array safely
+    current_docs = current_driver.verification_documents or []
+
+    # Create a new list to trigger SQLAlchemy's JSON mutation detection
+    current_driver.verification_documents = [*current_docs, public_url]
+
+    session.add(current_driver)
+    session.commit()
+    session.refresh(current_driver)
+
+    return {
+        "message": "Document uploaded successfully",
+        "documents": current_driver.verification_documents,
+    }

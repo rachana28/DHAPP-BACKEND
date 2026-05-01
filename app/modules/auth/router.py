@@ -13,6 +13,7 @@ from app.core.models import (
     Driver,
     TowTruckDriver,
     Mechanic,
+    ServiceCenter,
     VerifyOTPRequest,
     SendOTPRequest,
     UserDevice,
@@ -211,26 +212,6 @@ def verify_otp(
                 status_code=400, detail="Full name required for new registration"
             )
 
-        # Validate Specific Roles
-        if role == "driver":
-            if not request.license_number:
-                raise HTTPException(
-                    status_code=400,
-                    detail="License number required for driver registration",
-                )
-        elif role == "tow_truck_driver":
-            if not request.vehicle_number:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Vehicle number required for tow truck registration",
-                )
-        elif role == "mechanic":
-            if not request.specialization:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Specialization required for mechanic registration",
-                )
-
         # Create Base User
         user = User(
             phone_number=phone,
@@ -246,32 +227,30 @@ def verify_otp(
         # Create Role Profile
         if role == "driver":
             db_driver = Driver(
-                name=request.full_name,
-                phone_number=phone,
-                license_number=request.license_number,
-                vehicle_type=request.vehicle_type,
-                user_id=user.id,
+                name=request.full_name, phone_number=phone, user_id=user.id
             )
             session.add(db_driver)
             session.commit()
-
         elif role == "tow_truck_driver":
             db_tow_driver = TowTruckDriver(
-                name=request.full_name,
-                phone_number=phone,
-                vehicle_number=request.vehicle_number,
-                user_id=user.id,
+                name=request.full_name, phone_number=phone, user_id=user.id
             )
             session.add(db_tow_driver)
             session.commit()
         elif role == "mechanic":
             new_mechanic = Mechanic(
+                user_id=user.id, name=request.full_name, phone_number=phone
+            )
+            session.add(new_mechanic)
+            session.commit()
+        elif role == "service_center":
+            new_service_center = ServiceCenter(
                 user_id=user.id,
                 name=request.full_name,
                 phone_number=phone,
-                specialization=request.specialization,
+                status="pending_approval",
             )
-            session.add(new_mechanic)
+            session.add(new_service_center)
             session.commit()
 
     # 4. Generate Session Tokens
@@ -292,6 +271,43 @@ def verify_otp(
             "phone_number": user.phone_number,
             "role": user.role,
         },
+    }
+
+
+@router.get("/verification-details/{role}/{profile_id}")
+def get_verification_details(
+    role: str, profile_id: int, session: Session = Depends(get_session)
+):
+    """
+    Fetch documents and missing fields for profile validation.
+    Used by Admin to approve/reject pending registrations.
+    """
+    if role == "driver":
+        profile = session.get(Driver, profile_id)
+    elif role == "tow_truck_driver":
+        profile = session.get(TowTruckDriver, profile_id)
+    elif role == "mechanic":
+        profile = session.get(Mechanic, profile_id)
+    elif role == "service_center":
+        profile = session.get(ServiceCenter, profile_id)
+    else:
+        raise HTTPException(
+            400,
+            "Invalid role parameter. Use driver, tow_truck_driver, mechanic, or service_center.",
+        )
+
+    if not profile:
+        raise HTTPException(404, f"{role} profile not found")
+
+    return {
+        "profile_id": profile.id,
+        "role": role,
+        "name": profile.name,
+        "status": profile.status,
+        "profile_picture": profile.profile_picture_url,
+        "phone_number": profile.phone_number,
+        "verification_documents": profile.verification_documents,
+        "details": profile.model_dump(),
     }
 
 

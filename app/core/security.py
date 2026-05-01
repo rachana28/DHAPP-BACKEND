@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 import uuid
 
 from app.core.database import get_session
-from app.core.models import User, Driver, TowTruckDriver, Mechanic
+from app.core.models import User, Driver, TowTruckDriver, Mechanic, ServiceCenter
 
 SECRET_KEY = "supersecretkey_change_this_in_production"
 REFRESH_SECRET_KEY = "refresh_supersecretkey_change_this_too"
@@ -165,6 +165,30 @@ def get_current_active_mechanic(
     return mechanic
 
 
+def get_current_active_service_center(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ServiceCenter:
+    """
+    Dependency to verify if the authenticated user is a Service Center.
+    Functionality: Validate service center authentication and retrieve profile
+    """
+    if current_user.role != "service_center":
+        raise HTTPException(status_code=403, detail="Not a service center")
+
+    service_center = session.exec(
+        select(ServiceCenter).where(ServiceCenter.user_id == current_user.id)
+    ).first()
+
+    if not service_center:
+        raise HTTPException(status_code=404, detail="Service center profile not found")
+
+    if service_center.status not in ["available", "pending_approval"]:
+        raise HTTPException(status_code=400, detail="Service center is not active/available")
+
+    return service_center
+
+
 def get_current_active_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
@@ -173,6 +197,7 @@ def get_current_active_user(
         or current_user.role == "driver"
         or current_user.role == "tow_truck_driver"
         or current_user.role == "mechanic"
+        or current_user.role == "service_center"
     ):
         return current_user
     raise HTTPException(status_code=403, detail="Not a valid user")
