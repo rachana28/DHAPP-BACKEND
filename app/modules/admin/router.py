@@ -8,12 +8,15 @@ from datetime import datetime
 
 from app.core.database import get_session, get_redis
 from app.core.models import (
+    CenterService,
     User,
     UserPublic,
     Driver,
     DriverPrivate,
     TowTruckDriver,
     TowTruckDriverPrivate,
+    ServiceCenter,
+    ServiceCenterPrivate,
     Trip,
     TripOffer,
     TowTripOffer,
@@ -24,8 +27,12 @@ from app.core.models import (
     SupportTicketResponse,
     UITheme,
     UIBanner,
+    ServiceRequest,
+    ServiceSlot,
+    ServiceCenterReview,
 )
 from app.core.security import get_current_admin
+from app.utils.notifications import send_push_notification
 
 # Protect ENTIRE router with Admin check
 router = APIRouter(
@@ -37,7 +44,8 @@ router = APIRouter(
 @router.get("/dashboard-stats")
 def get_dashboard_stats(session: Session = Depends(get_session)):
     """
-    Aggregated stats including BOTH Cab Drivers and Tow Drivers.
+    Aggregated stats including BOTH Cab Drivers, Tow Drivers, and Service Centers.
+    Functionality: Dashboard overview with user, driver, and service center statistics
     """
     # 1. Count Users
     total_users = session.exec(
@@ -50,7 +58,7 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
         select(func.count(Driver.id)).where(Driver.status == "pending_approval")
     ).one()
 
-    # 3. Count Tow Drivers (NEW)
+    # 3. Count Tow Drivers
     tow_drivers = session.exec(select(func.count(TowTruckDriver.id))).one()
     pending_tow = session.exec(
         select(func.count(TowTruckDriver.id)).where(
@@ -58,22 +66,38 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
         )
     ).one()
 
-    # 4. Combined Stats
-    total_drivers = cab_drivers + tow_drivers
-    total_pending = pending_cab + pending_tow
+    # 4. Count Service Centers
+    service_centers = session.exec(select(func.count(ServiceCenter.id))).one()
+    pending_service_centers = session.exec(
+        select(func.count(ServiceCenter.id)).where(
+            ServiceCenter.status == "pending_approval"
+        )
+    ).one()
 
-    # 5. Trips
+    # 5. Combined Stats
+    total_drivers = cab_drivers + tow_drivers
+    total_pending = pending_cab + pending_tow + pending_service_centers
+
+    # 6. Trips
     completed_trips = session.exec(
         select(func.count(Trip.id)).where(Trip.status == "completed")
     ).one()
 
     return {
         "total_users": total_users,
-        "total_drivers": total_drivers,  # Sum of both
-        "pending_reviews": total_pending,  # Sum of both
+        "total_drivers": total_drivers,  # Sum of cab and tow drivers
+        "total_service_centers": service_centers,
+        "pending_reviews": total_pending,  # Sum of all pending approvals
         "total_trips": completed_trips,
         # Optional: specific breakdown if needed by frontend later
-        "breakdown": {"cab_drivers": cab_drivers, "tow_drivers": tow_drivers},
+        "breakdown": {
+            "cab_drivers": cab_drivers,
+            "tow_drivers": tow_drivers,
+            "service_centers": service_centers,
+            "pending_cab_drivers": pending_cab,
+            "pending_tow_drivers": pending_tow,
+            "pending_service_centers": pending_service_centers,
+        },
     }
 
 
@@ -148,6 +172,85 @@ def update_tow_driver_status(
     return {"message": f"Tow Driver status updated to {status}"}
 
 
+# --- 4. SERVICE CENTER MANAGEMENT ---
+
+
+@router.get("/service-centers", response_model=List[ServiceCenterPrivate])
+def get_service_centers_admin(
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    session: Session = Depends(get_session),
+):
+    """
+    Get all service centers with optional filters.
+    Functionality: Admin views all service centers, filtered by status or search
+    """
+    query = select(ServiceCenter)
+    if status:
+        query = query.where(ServiceCenter.status == status)
+    if search:
+        query = query.where(ServiceCenter.name.contains(search))
+
+    centers = session.exec(query.offset(skip).limit(limit)).all()
+    return [ServiceCenterPrivate(**c.model_dump()) for c in centers]
+
+
+@router.patch("/service-centers/{center_id}/status")
+def update_service_center_status(
+    center_id: int,
+    status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
+    session: Session = Depends(get_session),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Approve or Reject a service center.
+    Functionality: Admin approves/rejects service center signup applications
+    """
+    center = session.get(ServiceCenter, center_id)
+    if not center:
+        raise HTTPException(404, "Service center not found")
+
+    center.status = status
+    session.add(center)
+
+    if status in ["banned", "rejected"]:
+        active_bookings = session.exec(
+            select(ServiceRequest).where(
+                ServiceRequest.service_center_id == center.id,
+                ServiceRequest.status.in_(["booked", "checked_in", "in_service"]),
+            )
+        ).all()
+
+        for booking in active_bookings:
+            booking.status = "cancelled"
+            session.add(booking)
+
+            # Revert slot capacity if applicable
+            if booking.slot_id:
+                slot = session.get(ServiceSlot, booking.slot_id)
+                if slot and slot.booked_count > 0:
+                    slot.booked_count -= 1
+                    session.add(slot)
+
+            send_push_notification(
+                session,
+                [booking.user_id],
+                "Booking Cancelled",
+                "The service center is no longer available.",
+            )
+
+    session.commit()
+
+    # Invalidate cache so changes reflect immediately
+    if redis_client:
+        redis_client.delete("service_centers")
+        redis_client.delete(f"service_center_{center.id}")
+
+    return {"message": f"Service center status updated to {status}"}
+
+
 # --- 4. USER MANAGEMENT ---
 @router.get("/users", response_model=List[UserPublic])
 def get_users_admin(
@@ -218,7 +321,36 @@ def delete_user(
             )
             session.delete(tow_driver)
 
-        # 6. Finally, Delete the User
+        # 6. Handle Service Center Profile (If they are a Service Center)
+        service_center = session.exec(
+            select(ServiceCenter).where(ServiceCenter.user_id == user_id)
+        ).first()
+        if service_center:
+            # Delete Center's Reviews, Bookings, Slots, and Services
+            session.exec(
+                delete(ServiceCenterReview).where(
+                    ServiceCenterReview.service_center_id == service_center.id
+                )
+            )
+            session.exec(
+                delete(ServiceRequest).where(
+                    ServiceRequest.service_center_id == service_center.id
+                )
+            )
+            session.exec(
+                delete(ServiceSlot).where(
+                    ServiceSlot.service_center_id == service_center.id
+                )
+            )
+            session.exec(
+                delete(CenterService).where(
+                    CenterService.service_center_id == service_center.id
+                )
+            )
+            # Delete the Center itself
+            session.delete(service_center)
+
+        # 7. Finally, Delete the User
         session.delete(user)
         session.commit()
 
@@ -253,42 +385,60 @@ def get_user_trip_history(
     Fetches ALL trips for a specific user from the single 'Trip' table.
     Differentiates between 'Ride' and 'Tow' using 'hiring_type'.
     """
-    # 1. Fetch ALL trips for the user in one query, sorted by time
+    # 1. Fetch Trips
     trips = session.exec(
         select(Trip).where(Trip.user_id == user_id).order_by(desc(Trip.booking_time))
     ).all()
 
-    # 2. Normalize Data for Frontend Table
+    # 2. Fetch Service Requests
+    service_requests = session.exec(
+        select(ServiceRequest)
+        .where(ServiceRequest.user_id == user_id)
+        .order_by(desc(ServiceRequest.booking_time))
+    ).all()
+
     history = []
 
+    # Process Trips
     for t in trips:
-        # Determine Service Type
-        # If hiring_type is "Tow Service", categorize as Tow
         service_type = "Tow" if t.hiring_type == "Tow Service" else "Ride"
-
-        # Determine specific Driver ID (Tow Driver or Regular Driver)
         assigned_driver_id = (
             t.tow_truck_driver_id if service_type == "Tow" else t.driver_id
         )
-
-        # Generate a unique display ID (e.g., TOW-101 or RIDE-101)
-        display_id = f"{service_type.upper()}-{t.id}"
-
         history.append(
             {
-                "id": display_id,  # Composite ID for Frontend keys
-                "original_id": t.id,  # Real DB ID
+                "id": f"{service_type.upper()}-{t.id}",
+                "original_id": t.id,
                 "service_type": service_type,
                 "booking_time": t.booking_time,
                 "status": t.status,
                 "price": t.fare if t.fare else 0.0,
                 "source": t.start_location or "N/A",
                 "destination": t.end_location or "N/A",
-                "driver_id": assigned_driver_id,
-                "vehicle_type": t.vehicle_type,  # Useful extra info
+                "driver_or_center_id": assigned_driver_id,
+                "vehicle_type": t.vehicle_type,
             }
         )
 
+    # Process Service Requests
+    for sr in service_requests:
+        history.append(
+            {
+                "id": f"SERVICE-{sr.id}",
+                "original_id": sr.id,
+                "service_type": "Vehicle Service",
+                "booking_time": sr.booking_time,
+                "status": sr.status,
+                "price": 0.0,  # Handled offline/at garage
+                "source": sr.service_type,  # e.g. "wash", "ppf"
+                "destination": "Garage Drop-off",
+                "driver_or_center_id": sr.service_center_id,
+                "vehicle_type": sr.vehicle_type,
+            }
+        )
+
+    # Sort combined history by booking_time descending
+    history.sort(key=lambda x: x["booking_time"], reverse=True)
     return history
 
 

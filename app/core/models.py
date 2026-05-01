@@ -4,46 +4,55 @@ from pydantic import EmailStr, field_validator
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List
 from datetime import datetime, date
+from sqlalchemy import UniqueConstraint, JSON, Column
 
 
 # --- Base Models (Shared fields) ---
 class DriverBase(SQLModel):
     name: str
     phone_number: str
-    license_number: str
+    license_number: Optional[str] = None
     address: Optional[str] = None
     emergency_phone: Optional[str] = None
     profile_picture_url: Optional[str] = None
-
-    # Professional Details
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
     fare_per_km: Optional[float] = None
     driver_allowance: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: str = "pending_approval"
+    verification_documents: List[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
 
 
 class TowTruckDriverBase(SQLModel):
     name: str
     phone_number: str
-    vehicle_number: str  # Specific to Tow Truck
+    vehicle_number: Optional[str] = None
     address: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: str = "pending_approval"
     rating: float = Field(default=0.0)
+    verification_documents: List[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
 
 
 # --- MECHANIC MODELS ADDITIONS ---
 
+
 class MechanicBase(SQLModel):
     name: str
     phone_number: str
-    specialization: str  # e.g., "Car", "Bike", "Both"
+    specialization: Optional[str] = None
     address: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: str = "pending_approval"
     rating: float = Field(default=0.0)
+    verification_documents: List[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
 
 
 class Mechanic(MechanicBase, table=True):
@@ -101,6 +110,247 @@ class MechanicReview(MechanicReviewBase, table=True):
     mechanic_id: int = Field(foreign_key="mechanic.id")
     user_id: uuid.UUID = Field(foreign_key="user.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# --- SERVICE CENTER MODELS ---
+
+
+class ServiceCenterBase(SQLModel):
+    name: str
+    phone_number: str
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    profile_picture_url: Optional[str] = None
+    status: str = "pending_approval"
+    rating: float = Field(default=0.0)
+    verification_documents: List[str] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+
+
+class ServiceCenter(ServiceCenterBase, table=True):
+    """Service center/garage profile (e.g., for vehicle service, PPF, wash, etc.)"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    user: "User" = Relationship(back_populates="service_center_profile")
+    services: List["CenterService"] = Relationship(back_populates="service_center")
+    slots: List["ServiceSlot"] = Relationship(back_populates="service_center")
+    bookings: List["ServiceRequest"] = Relationship(back_populates="service_center")
+    reviews: List["ServiceCenterReview"] = Relationship(back_populates="service_center")
+
+
+class CenterService(SQLModel, table=True):
+    """Service type offered by a service center (e.g., PPF, Wash, General Service, Breakdown & Repair)"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service_center_id: int = Field(foreign_key="servicecenter.id")
+    service_type: str  # "breakdown_repair", "ppf", "wash", "general_service"
+    expected_duration_hours: int = 0  # For slot-based services (0 means manual)
+    price: Optional[float] = None  # Optional service price
+    description: Optional[str] = None  # What the center offers for this service
+    is_available: bool = True  # For breakdown & repair: availability flag
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    service_center: ServiceCenter = Relationship(back_populates="services")
+    slots: List["ServiceSlot"] = Relationship(back_populates="center_service")
+    bookings: List["ServiceRequest"] = Relationship(back_populates="center_service")
+
+
+class ServiceSlot(SQLModel, table=True):
+    """Time slots for slot-based services (PPF, Wash, General Service)"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service_center_id: int = Field(foreign_key="servicecenter.id")
+    center_service_id: int = Field(foreign_key="centerservice.id")
+    start_time: datetime
+    end_time: datetime
+    capacity: int = 1  # How many vehicles can be served in this slot
+    booked_count: int = 0  # How many are currently booked
+    is_available: bool = True
+
+    service_center: ServiceCenter = Relationship(back_populates="slots")
+    center_service: CenterService = Relationship(back_populates="slots")
+    bookings: List["ServiceRequest"] = Relationship(back_populates="slot")
+
+
+class ServiceRequest(SQLModel, table=True):
+    """Service booking/request by user"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    service_center_id: int = Field(foreign_key="servicecenter.id")
+    center_service_id: int = Field(foreign_key="centerservice.id")
+    service_type: str  # "breakdown_repair", "ppf", "wash", "general_service"
+    vehicle_type: str  # "car", "bike"
+    vehicle_number: Optional[str] = None
+    slot_id: Optional[int] = Field(default=None, foreign_key="serviceslot.id")
+
+    # Booking Status: For slot-based: searching->booked->completed
+    # For breakdown: searching->booked->checked_in->in_service->completed
+    status: str = "searching"
+
+    requested_date: Optional[date] = None  # Date user wants service
+    requested_time: Optional[str] = None  # Time in HH:MM format (for slot-based)
+    expected_return_date: Optional[date] = (
+        None  # Auto-calculated for slot-based, manual for breakdown
+    )
+    expected_return_time: Optional[str] = (
+        None  # Auto-calculated for slot-based, manual for breakdown
+    )
+    actual_return_date: Optional[date] = None
+    actual_return_time: Optional[str] = None
+
+    booking_time: datetime = Field(default_factory=datetime.utcnow)
+    checked_in_time: Optional[datetime] = None  # For breakdown & repair manual check-in
+    completed_time: Optional[datetime] = None
+    price_at_booking: Optional[float] = None
+
+    user: "User" = Relationship(back_populates="service_bookings")
+    service_center: ServiceCenter = Relationship(back_populates="bookings")
+    center_service: CenterService = Relationship(back_populates="bookings")
+    slot: Optional[ServiceSlot] = Relationship(back_populates="bookings")
+
+
+class ServiceCenterReviewBase(SQLModel):
+    rating: int = Field(ge=1, le=5)
+    comment: Optional[str] = None
+
+
+class ServiceCenterReview(ServiceCenterReviewBase, table=True):
+    """Review for service center"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service_center_id: int = Field(foreign_key="servicecenter.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    service_request_id: Optional[int] = Field(foreign_key="servicerequest.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    service_center: ServiceCenter = Relationship(back_populates="reviews")
+
+
+# --- API Response Models for Service Center ---
+class ServiceCenterPublic(SQLModel):
+    id: int
+    name: str
+    address: str
+    latitude: float
+    longitude: float
+    profile_picture_url: Optional[str] = None
+    status: str
+    rating: float
+    total_bookings: Optional[int] = 0
+
+
+class ServiceCenterPrivate(ServiceCenterBase):
+    id: int
+    user_id: uuid.UUID
+    created_at: datetime
+
+
+class ServiceCenterUpdate(SQLModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    profile_picture_url: Optional[str] = None
+    status: Optional[str] = None
+
+
+# --- API Models for Services ---
+class CenterServicePublic(SQLModel):
+    id: int
+    service_type: str
+    expected_duration_hours: int
+    price: Optional[float] = None
+    description: Optional[str] = None
+    is_available: bool
+
+
+class CenterServiceCreate(SQLModel):
+    service_type: str
+    expected_duration_hours: int = 0
+    price: Optional[float] = None
+    description: Optional[str] = None
+    is_available: bool = True
+
+
+class CenterServiceUpdate(SQLModel):
+    expected_duration_hours: Optional[int] = None
+    price: Optional[float] = None
+    description: Optional[str] = None
+    is_available: Optional[bool] = None
+
+
+# --- API Models for Slots ---
+class ServiceSlotPublic(SQLModel):
+    id: int
+    start_time: datetime
+    end_time: datetime
+    capacity: int
+    booked_count: int
+    is_available: bool
+
+
+class ServiceSlotCreate(SQLModel):
+    start_time: datetime
+    end_time: datetime
+    capacity: int = 1
+    is_available: bool = True
+
+
+# --- API Models for Service Requests ---
+class ServiceRequestBase(SQLModel):
+    service_type: str
+    vehicle_type: str
+    vehicle_number: Optional[str] = None
+    requested_date: Optional[date] = None
+    requested_time: Optional[str] = None
+
+
+class ServiceRequestCreate(ServiceRequestBase):
+    service_center_id: int
+    center_service_id: int
+    slot_id: Optional[int] = None  # Required for slot-based, None for breakdown
+
+
+class ServiceRequestPublic(SQLModel):
+    id: int
+    user_id: uuid.UUID
+    service_center_id: int
+    service_type: str
+    vehicle_type: str
+    vehicle_number: Optional[str] = None
+    status: str
+    requested_date: Optional[date] = None
+    requested_time: Optional[str] = None
+    expected_return_date: Optional[date] = None
+    expected_return_time: Optional[str] = None
+    booking_time: datetime
+
+
+class ServiceRequestPrivate(ServiceRequestPublic):
+    center_service_id: int
+    slot_id: Optional[int] = None
+    checked_in_time: Optional[datetime] = None
+    actual_return_date: Optional[date] = None
+    actual_return_time: Optional[str] = None
+
+
+class ServiceRequestUpdate(SQLModel):
+    status: Optional[str] = None
+    expected_return_date: Optional[date] = None
+    expected_return_time: Optional[str] = None
+
+
+class ServiceSlotUpdate(SQLModel):
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    capacity: Optional[int] = None
+    is_available: Optional[bool] = None
 
 
 # --- Trip Models ---
@@ -300,7 +550,7 @@ class TowTruckDriverReview(DriverReviewBase, table=True):
 
 # --- User Models ---
 class UserBase(SQLModel):
-    phone_number: str = Field(unique=True, index=True)
+    phone_number: str = Field(index=True)
     email: Optional[EmailStr] = Field(default=None, unique=True, index=True)
     full_name: Optional[str] = None
     provider: str = "local"
@@ -366,6 +616,7 @@ class SupportTicketResponse(SupportTicketBase):
 
 
 class User(UserBase, table=True):
+    __table_args__ = (UniqueConstraint("phone_number", "role", name="uix_phone_role"),)
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
     hashed_password: Optional[str] = None
     force_password_change: bool = Field(default=False)
@@ -377,6 +628,10 @@ class User(UserBase, table=True):
     trips: List[Trip] = Relationship(back_populates="user")
     tickets: List["SupportTicket"] = Relationship(back_populates="user")
     mechanic_profile: Optional[Mechanic] = Relationship(back_populates="user")
+    service_center_profile: Optional["ServiceCenter"] = Relationship(
+        back_populates="user"
+    )
+    service_bookings: List["ServiceRequest"] = Relationship(back_populates="user")
 
 
 class UserPublic(SQLModel):
@@ -459,7 +714,9 @@ class SendOTPRequest(SQLModel):
 class VerifyOTPRequest(SQLModel):
     phone_number: str
     otp: str
-    role: str = "user"  # "user", "driver", or "tow_truck_driver"
+    role: str = (
+        "user"  # "user", "driver", "tow_truck_driver", "mechanic", "service_center"
+    )
     # Base user fields
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
@@ -469,6 +726,10 @@ class VerifyOTPRequest(SQLModel):
     # Tow Truck Specific Fields
     vehicle_number: Optional[str] = None
     specialization: Optional[str] = None
+    # Service Center Specific Fields
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 # --- UI CONFIGURATION MODELS ---

@@ -31,6 +31,10 @@ from app.modules.mechanic import (
     trip_router as mechanic_router,
     profile_router as mechanic_profile_router,
 )
+from app.modules.service import (
+    center_router as service_center_router,
+    user_router as service_user_router,
+)
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -121,6 +125,8 @@ app.include_router(support_router.router)
 app.include_router(config_router.router)
 app.include_router(mechanic_router.router)
 app.include_router(mechanic_profile_router.router)
+app.include_router(service_center_router.router)
+app.include_router(service_user_router.router)
 
 
 @app.get("/")

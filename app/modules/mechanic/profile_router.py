@@ -103,3 +103,34 @@ def get_mechanic_reviews(
         .limit(limit)
     ).all()
     return reviews
+
+
+@router.post("/me/documents")
+async def upload_verification_document(
+    *,
+    session: Session = Depends(get_session),
+    current_mechanic: Mechanic = Depends(get_current_active_mechanic),
+    file: UploadFile = File(...),
+):
+    """
+    Upload KYC documents, licenses, or garage photos for admin approval.
+    """
+    # Reuse your R2 storage utility, but change the prefix folder
+    public_url = await upload_profile_picture_to_r2(
+        file, "kyc_documents", str(current_mechanic.id)
+    )
+
+    # Append the new document URL to the JSON array safely
+    current_docs = current_mechanic.verification_documents or []
+
+    # Create a new list to trigger SQLAlchemy's JSON mutation detection
+    current_mechanic.verification_documents = [*current_docs, public_url]
+
+    session.add(current_mechanic)
+    session.commit()
+    session.refresh(current_mechanic)
+
+    return {
+        "message": "Document uploaded successfully",
+        "documents": current_mechanic.verification_documents,
+    }
