@@ -27,6 +27,9 @@ from app.core.models import (
     SupportTicketResponse,
     UITheme,
     UIBanner,
+    Mechanic,
+    MechanicOffer,
+    MechanicReview,
     ServiceRequest,
     ServiceSlot,
     ServiceCenterReview,
@@ -66,6 +69,11 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
         )
     ).one()
 
+    mechanics = session.exec(select(func.count(Mechanic.id))).one()
+    pending_mechanics = session.exec(
+        select(func.count(Mechanic.id)).where(Mechanic.status == "pending_approval")
+    ).one()
+
     # 4. Count Service Centers
     service_centers = session.exec(select(func.count(ServiceCenter.id))).one()
     pending_service_centers = session.exec(
@@ -75,8 +83,8 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
     ).one()
 
     # 5. Combined Stats
-    total_drivers = cab_drivers + tow_drivers
-    total_pending = pending_cab + pending_tow + pending_service_centers
+    total_drivers = cab_drivers + tow_drivers + mechanics
+    total_pending = pending_cab + pending_tow + pending_service_centers + pending_mechanics
 
     # 6. Trips
     completed_trips = session.exec(
@@ -97,6 +105,8 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
             "pending_cab_drivers": pending_cab,
             "pending_tow_drivers": pending_tow,
             "pending_service_centers": pending_service_centers,
+            "mechanics": mechanics,
+            "pending_mechanics": pending_mechanics,
         },
     }
 
@@ -172,9 +182,34 @@ def update_tow_driver_status(
     return {"message": f"Tow Driver status updated to {status}"}
 
 
+# --- 3.5 MECHANIC MANAGEMENT ---
+@router.get("/mechanics")
+def get_mechanics_admin(
+    status: Optional[str] = None, session: Session = Depends(get_session)
+):
+    query = select(Mechanic)
+    if status:
+        query = query.where(Mechanic.status == status)
+    return session.exec(query).all()
+
+
+@router.patch("/mechanics/{mechanic_id}/status")
+def update_mechanic_status(
+    mechanic_id: int,
+    status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
+    session: Session = Depends(get_session),
+):
+    mechanic = session.get(Mechanic, mechanic_id)
+    if not mechanic:
+        raise HTTPException(404, "Mechanic not found")
+
+    mechanic.status = status
+    session.add(mechanic)
+    session.commit()
+    return {"message": f"Mechanic status updated to {status}"}
+
+
 # --- 4. SERVICE CENTER MANAGEMENT ---
-
-
 @router.get("/service-centers", response_model=List[ServiceCenterPrivate])
 def get_service_centers_admin(
     status: Optional[str] = None,
@@ -251,6 +286,44 @@ def update_service_center_status(
     return {"message": f"Service center status updated to {status}"}
 
 
+# --- VERIFICATION DETAILS ---
+@router.get("/verification-details/{role}/{profile_id}")
+def get_verification_details(
+    role: str, profile_id: int, session: Session = Depends(get_session)
+):
+    """
+    Fetch documents and missing fields for profile validation.
+    Used by Admin to approve/reject pending registrations.
+    """
+    if role == "driver":
+        profile = session.get(Driver, profile_id)
+    elif role == "tow_truck_driver":
+        profile = session.get(TowTruckDriver, profile_id)
+    elif role == "mechanic":
+        profile = session.get(Mechanic, profile_id)
+    elif role == "service_center":
+        profile = session.get(ServiceCenter, profile_id)
+    else:
+        raise HTTPException(
+            400,
+            "Invalid role parameter. Use driver, tow_truck_driver, mechanic, or service_center.",
+        )
+
+    if not profile:
+        raise HTTPException(404, f"{role} profile not found")
+
+    return {
+        "profile_id": profile.id,
+        "role": role,
+        "name": profile.name,
+        "status": profile.status,
+        "profile_picture": profile.profile_picture_url,
+        "phone_number": profile.phone_number,
+        "verification_documents": getattr(profile, "verification_documents", []),
+        "details": profile.model_dump(),
+    }
+
+
 # --- 4. USER MANAGEMENT ---
 @router.get("/users", response_model=List[UserPublic])
 def get_users_admin(
@@ -320,6 +393,18 @@ def delete_user(
                 )
             )
             session.delete(tow_driver)
+
+        mechanic = session.exec(
+            select(Mechanic).where(Mechanic.user_id == user_id)
+        ).first()
+        if mechanic:
+            session.exec(
+                delete(MechanicOffer).where(MechanicOffer.mechanic_id == mechanic.id)
+            )
+            session.exec(
+                delete(MechanicReview).where(MechanicReview.mechanic_id == mechanic.id)
+            )
+            session.delete(mechanic)
 
         # 6. Handle Service Center Profile (If they are a Service Center)
         service_center = session.exec(

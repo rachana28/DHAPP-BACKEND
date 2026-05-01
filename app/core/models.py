@@ -339,6 +339,9 @@ class ServiceRequestPrivate(ServiceRequestPublic):
     actual_return_date: Optional[date] = None
     actual_return_time: Optional[str] = None
 
+class ServiceRequestForCenter(ServiceRequestPublic):
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
 
 class ServiceRequestUpdate(SQLModel):
     status: Optional[str] = None

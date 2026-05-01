@@ -1,14 +1,9 @@
-"""
-Service Center API Endpoints
-Handles service center profile management, service offerings, slots, and booking management
-"""
-
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from sqlmodel import Session, select, func, desc
 from typing import List
 import redis
 from datetime import datetime, date
-
+from sqlalchemy.exc import NoResultFound
 from app.core.database import get_session, get_redis
 from app.core.models import (
     ServiceCenter,
@@ -25,9 +20,11 @@ from app.core.models import (
     ServiceRequest,
     ServiceRequestPublic,
     ServiceSlotUpdate,
+    ServiceRequestForCenter,
 )
 from app.core.security import get_current_active_service_center
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
+from sqlalchemy.orm import selectinload
 
 router = APIRouter(prefix="/service-centers", tags=["Service Centers"])
 
@@ -421,8 +418,10 @@ def get_center_bookings(
     Functionality: Service center views all customer bookings with optional status filter
     """
     offset = (page - 1) * limit
-    query = select(ServiceRequest).where(
-        ServiceRequest.service_center_id == current_center.id
+    query = (
+        select(ServiceRequest)
+        .where(ServiceRequest.service_center_id == current_center.id)
+        .options(selectinload(ServiceRequest.user))
     )
 
     if status:
@@ -431,7 +430,14 @@ def get_center_bookings(
     query = query.order_by(desc(ServiceRequest.booking_time))
     bookings = session.exec(query.offset(offset).limit(limit)).all()
 
-    return [ServiceRequestPublic(**b.model_dump()) for b in bookings]
+    result = []
+    for b in bookings:
+        b_dict = b.model_dump()
+        b_dict["customer_name"] = b.user.full_name if b.user else "Unknown"
+        b_dict["customer_phone"] = b.user.phone_number if b.user else "Unknown"
+        result.append(ServiceRequestForCenter(**b_dict))
+
+    return result
 
 
 @router.patch("/me/bookings/{booking_id}/status")
@@ -473,12 +479,20 @@ def update_booking_status(
         booking.actual_return_date = date.today()
         booking.actual_return_time = datetime.utcnow().strftime("%H:%M")
 
-    # Free up slot capacity if center cancels
     elif new_status == "cancelled" and booking.slot_id:
-        slot = session.get(ServiceSlot, booking.slot_id)
-        if slot and slot.booked_count > 0:
-            slot.booked_count -= 1
-            session.add(slot)
+        try:
+            statement = (
+                select(ServiceSlot)
+                .where(ServiceSlot.id == booking.slot_id)
+                .with_for_update()
+            )
+            slot = session.exec(statement).one()
+
+            if slot.booked_count > 0:
+                slot.booked_count -= 1
+                session.add(slot)
+        except NoResultFound:
+            pass
 
     session.add(booking)
     session.commit()
