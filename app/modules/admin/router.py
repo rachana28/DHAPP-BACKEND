@@ -84,7 +84,9 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
 
     # 5. Combined Stats
     total_drivers = cab_drivers + tow_drivers + mechanics
-    total_pending = pending_cab + pending_tow + pending_service_centers + pending_mechanics
+    total_pending = (
+        pending_cab + pending_tow + pending_service_centers + pending_mechanics
+    )
 
     # 6. Trips
     completed_trips = session.exec(
@@ -133,6 +135,7 @@ def get_drivers_admin(
 def update_driver_status(
     driver_id: int,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
+    admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):
@@ -144,6 +147,12 @@ def update_driver_status(
         raise HTTPException(404, "Driver not found")
 
     driver.status = status
+
+    if admin_notes:
+        driver.admin_notes = admin_notes
+    elif status == "available":
+        driver.admin_notes = None
+
     session.add(driver)
     session.commit()
 
@@ -151,14 +160,14 @@ def update_driver_status(
     if redis_client:
         redis_client.delete("drivers")
         redis_client.delete(f"driver_{driver.id}")
-    
+
     if status in ["rejected", "banned"]:
         send_push_notification(
             session=session,
             user_ids=[driver.user_id],
             title="Account Status Update",
             body=f"Your profile has been {status} by the administrator.",
-            data={"type": "account_restricted"}
+            data={"type": "account_restricted"},
         )
 
     return {"message": f"Driver status updated to {status}"}
@@ -179,6 +188,7 @@ def get_tow_drivers_admin(
 def update_tow_driver_status(
     driver_id: int,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
+    admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
 ):
     driver = session.get(TowTruckDriver, driver_id)
@@ -186,6 +196,12 @@ def update_tow_driver_status(
         raise HTTPException(404, "Tow Driver not found")
 
     driver.status = status
+
+    if admin_notes:
+        driver.admin_notes = admin_notes
+    elif status == "available":
+        driver.admin_notes = None
+
     session.add(driver)
     session.commit()
 
@@ -195,7 +211,7 @@ def update_tow_driver_status(
             user_ids=[driver.user_id],
             title="Account Status Update",
             body=f"Your profile has been {status} by the administrator.",
-            data={"type": "account_restricted"}
+            data={"type": "account_restricted"},
         )
 
     return {"message": f"Tow Driver status updated to {status}"}
@@ -216,6 +232,7 @@ def get_mechanics_admin(
 def update_mechanic_status(
     mechanic_id: int,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
+    admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
 ):
     mechanic = session.get(Mechanic, mechanic_id)
@@ -223,6 +240,12 @@ def update_mechanic_status(
         raise HTTPException(404, "Mechanic not found")
 
     mechanic.status = status
+
+    if admin_notes:
+        mechanic.admin_notes = admin_notes
+    elif status == "available":
+        mechanic.admin_notes = None
+
     session.add(mechanic)
     session.commit()
 
@@ -232,7 +255,7 @@ def update_mechanic_status(
             user_ids=[mechanic.user_id],
             title="Account Status Update",
             body=f"Your profile has been {status} by the administrator.",
-            data={"type": "account_restricted"}
+            data={"type": "account_restricted"},
         )
 
     return {"message": f"Mechanic status updated to {status}"}
@@ -265,6 +288,7 @@ def get_service_centers_admin(
 def update_service_center_status(
     center_id: int,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
+    admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):
@@ -277,6 +301,12 @@ def update_service_center_status(
         raise HTTPException(404, "Service center not found")
 
     center.status = status
+
+    if admin_notes:
+        center.admin_notes = admin_notes
+    elif status == "available":
+        center.admin_notes = None
+
     session.add(center)
 
     if status in ["banned", "rejected"]:

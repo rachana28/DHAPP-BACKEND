@@ -36,6 +36,9 @@ def update_current_mechanic_profile(
     update_data = mechanic_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(current_mechanic, key, value)
+    
+    if current_mechanic.status == "rejected":
+        current_mechanic.status = "pending_approval"
 
     session.add(current_mechanic)
     session.commit()
@@ -125,6 +128,9 @@ async def upload_verification_document(
 
     # Create a new list to trigger SQLAlchemy's JSON mutation detection
     current_mechanic.verification_documents = [*current_docs, public_url]
+
+    if current_mechanic.status == "rejected":
+        current_mechanic.status = "pending_approval"
 
     session.add(current_mechanic)
     session.commit()

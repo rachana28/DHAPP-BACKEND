@@ -46,6 +46,9 @@ def update_current_driver_profile(
     for key, value in update_data.items():
         setattr(current_driver, key, value)
 
+    if current_driver.status == "rejected":
+        current_driver.status = "pending_approval"
+
     session.add(current_driver)
     session.commit()
     session.refresh(current_driver)
@@ -191,6 +194,9 @@ async def upload_verification_document(
 
     # Create a new list to trigger SQLAlchemy's JSON mutation detection
     current_driver.verification_documents = [*current_docs, public_url]
+
+    if current_driver.status == "rejected":
+        current_driver.status = "pending_approval"
 
     session.add(current_driver)
     session.commit()

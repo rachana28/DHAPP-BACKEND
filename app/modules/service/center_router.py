@@ -59,6 +59,9 @@ def update_current_service_center_profile(
     for key, value in update_data.items():
         setattr(current_center, key, value)
 
+    if current_center.status == "rejected":
+        current_center.status = "pending_approval"
+
     session.add(current_center)
     session.commit()
     session.refresh(current_center)
@@ -90,6 +93,9 @@ async def upload_verification_document(
 
     # Create a new list to trigger SQLAlchemy's JSON mutation detection
     current_center.verification_documents = [*current_docs, public_url]
+
+    if current_center.status == "rejected":
+        current_center.status = "pending_approval"
 
     session.add(current_center)
     session.commit()
