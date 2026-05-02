@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlmodel import Session, select, desc, func
-from typing import List
-from datetime import datetime, date, timedelta
+from typing import List, Dict, Any
+from datetime import datetime, date, timedelta, time
 from sqlalchemy.exc import NoResultFound
+from sqlalchemy import cast, String
 from app.core.database import get_session
 from app.core.models import (
     ServiceCenter,
@@ -10,12 +11,13 @@ from app.core.models import (
     CenterService,
     CenterServicePublic,
     ServiceSlot,
-    ServiceSlotPublic,
     ServiceRequest,
     ServiceRequestCreate,
     ServiceRequestPublic,
     ServiceCenterReview,
     User,
+    BookingType,
+    ServiceStatus,
 )
 from app.core.security import get_current_user
 from app.utils.notifications import send_push_notification
@@ -34,7 +36,8 @@ def list_service_centers(
     limit: int = Query(20, gt=0, le=100),
     latitude: float = Query(None),
     longitude: float = Query(None),
-    service_type: str = Query(None),
+    service_name: str = Query(None),
+    vehicle_type: str = Query(None),
 ):
     """
     List all available service centers, sorted by distance if coordinates are provided.
@@ -44,12 +47,16 @@ def list_service_centers(
     # Base query: only approved centers
     query = select(ServiceCenter).where(ServiceCenter.status == "available")
 
-    if service_type:
-        query = (
-            query.distinct()
-            .join(CenterService)
-            .where(CenterService.service_type == service_type)
-        )
+    if service_name or vehicle_type:
+        query = query.distinct().join(CenterService)
+
+        if service_name:
+            query = query.where(CenterService.service_name.ilike(f"%{service_name}%"))
+
+        if vehicle_type:
+            query = query.where(
+                cast(CenterService.vehicle_types, String).ilike(f'%"{vehicle_type}"%')
+            )
 
     # Standard fallback sort by rating
     query = query.order_by(desc(ServiceCenter.rating))
@@ -104,7 +111,6 @@ def get_service_center_details(
 ):
     """
     Get detailed information about a specific service center.
-    Functionality: View service center profile with location and rating
     """
     center = session.get(ServiceCenter, center_id)
     if not center:
@@ -129,105 +135,138 @@ def get_service_center_details(
 def list_center_services(
     center_id: int,
     session: Session = Depends(get_session),
+    vehicle_type: str = Query(None),
 ):
     """
     Get all services offered by a specific service center.
-    Functionality: View service types and details available at a particular center
+    Optionally filter by vehicle type.
     """
     center = session.get(ServiceCenter, center_id)
     if not center:
         raise HTTPException(status_code=404, detail="Service center not found")
 
-    services = session.exec(
-        select(CenterService).where(CenterService.service_center_id == center_id)
-    ).all()
+    query = select(CenterService).where(CenterService.service_center_id == center_id)
 
+    # Filter by vehicle type if provided
+    if vehicle_type:
+        services = session.exec(query).all()
+        services = [
+            s
+            for s in services
+            if vehicle_type in s.vehicle_types or not s.vehicle_types
+        ]
+        return [CenterServicePublic(**s.model_dump()) for s in services]
+
+    services = session.exec(query).all()
     return [CenterServicePublic(**s.model_dump()) for s in services]
 
 
 @router.get(
-    "/centers/{center_id}/services/{service_type}/slots",
-    response_model=List[ServiceSlotPublic],
+    "/centers/{center_id}/services/{service_id}/available-times",
+    response_model=List[Dict[str, Any]],
 )
-def get_available_slots(
+def get_available_times(
     center_id: int,
-    service_type: str,
-    session: Session = Depends(get_session),
-    from_date: date = Query(None),  # Start date range
-    to_date: date = Query(None),  # End date range
-):
-    """
-    Get available time slots for a specific service at a service center.
-    Functionality: List available slots for slot-based services (PPF, wash, general service)
-    """
-    # Verify service exists and is not breakdown_repair (no slots for that)
-    service = session.exec(
-        select(CenterService).where(
-            CenterService.service_center_id == center_id,
-            CenterService.service_type == service_type,
-        )
-    ).first()
-
-    if not service:
-        raise HTTPException(status_code=404, detail="Service not found at this center")
-
-    if service.service_type == "breakdown_repair":
-        raise HTTPException(
-            status_code=400, detail="Breakdown & repair service doesn't use time slots"
-        )
-
-    # Query slots
-    query = select(ServiceSlot).where(
-        ServiceSlot.center_service_id == service.id,
-        ServiceSlot.is_available,
-        ServiceSlot.booked_count < ServiceSlot.capacity,  # Available capacity
-    )
-
-    # Filter by date range if provided
-    if from_date:
-        query = query.where(
-            ServiceSlot.start_time >= datetime.combine(from_date, datetime.min.time())
-        )
-    if to_date:
-        query = query.where(
-            ServiceSlot.end_time <= datetime.combine(to_date, datetime.max.time())
-        )
-
-    slots = session.exec(query.order_by(ServiceSlot.start_time)).all()
-
-    return [ServiceSlotPublic(**s.model_dump()) for s in slots]
-
-
-@router.get("/centers/{center_id}/services/{service_type}/availability")
-def check_breakdown_availability(
-    center_id: int,
-    service_type: str,
+    service_id: int,
+    target_date: date = Query(...),
     session: Session = Depends(get_session),
 ):
     """
-    Check availability for breakdown & repair services (no time slots).
-    Functionality: Get availability status for breakdown services at a center
+    Dynamically generates available start times for a given day based on service rules
+    and existing bookings.
     """
-    service = session.exec(
-        select(CenterService).where(
-            CenterService.service_center_id == center_id,
-            CenterService.service_type == service_type,
-        )
-    ).first()
-
-    if not service:
+    service = session.get(CenterService, service_id)
+    if not service or service.service_center_id != center_id:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    if service.service_type != "breakdown_repair":
+    if service.booking_type == BookingType.WALK_IN:
+        return [{"message": "Walk-in service. No specific slots required."}]
+
+    if not service.slot_start_time or not service.slot_end_time:
         raise HTTPException(
-            status_code=400,
-            detail="This endpoint is for breakdown & repair services only",
+            status_code=400, detail="Provider has not configured operating hours."
+        )
+
+    # 1. Check Max Bookings Per Day
+    start_of_day = datetime.combine(target_date, time.min)
+    end_of_day = datetime.combine(target_date, time.max)
+
+    daily_bookings_count = session.exec(
+        select(func.count(ServiceSlot.id)).where(
+            ServiceSlot.center_service_id == service.id,
+            ServiceSlot.start_time >= start_of_day,
+            ServiceSlot.start_time <= end_of_day,
+        )
+    ).one()
+
+    if daily_bookings_count >= service.max_daily_bookings:
+        return []  # Fully booked for the day
+
+    # 2. Generate Potential Start Times
+    available_times = []
+
+    # FIX: Parse string times to datetime.time objects
+    start_t = datetime.strptime(service.slot_start_time, "%H:%M").time()
+    end_t = datetime.strptime(service.slot_end_time, "%H:%M").time()
+
+    current_time = datetime.combine(target_date, start_t)
+    end_operating_time = datetime.combine(target_date, end_t)
+
+    # Convert duration to timedelta
+    duration_delta = timedelta(hours=service.service_duration_hours)
+
+    while current_time < end_operating_time:
+        potential_end_time = current_time + duration_delta
+
+        # 3. Check Overlaps
+        overlap_count = session.exec(
+            select(func.count(ServiceSlot.id)).where(
+                ServiceSlot.center_service_id == service.id,
+                ServiceSlot.start_time < potential_end_time,
+                ServiceSlot.end_time > current_time,
+            )
+        ).one()
+
+        if overlap_count < service.max_concurrent_bookings:
+            available_times.append(
+                {
+                    "start_time": current_time.isoformat(),
+                    "end_time": potential_end_time.isoformat(),
+                }
+            )
+
+        current_time += timedelta(minutes=service.slot_interval_minutes)
+
+    return available_times
+
+
+@router.get("/centers/{center_id}/services/{service_id}/walk-in-availability")
+def check_walk_in_availability(
+    center_id: int,
+    service_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Check availability for walk-in services.
+    """
+    service = session.get(CenterService, service_id)
+    if not service or service.service_center_id != center_id:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    if service.booking_type != BookingType.WALK_IN or not service.is_walk_in_allowed:
+        raise HTTPException(
+            status_code=400, detail="This service is not available for walk-in bookings"
         )
 
     return {
-        "service_type": service.service_type,
+        "service_id": service.id,
+        "service_name": service.service_name,
+        "booking_type": service.booking_type.value,
         "is_available": service.is_available,
-        "message": "Available" if service.is_available else "Currently unavailable",
+        "is_walk_in_allowed": service.is_walk_in_allowed,
+        "message": "Available for walk-in"
+        if service.is_available
+        else "Currently unavailable",
     }
 
 
@@ -244,7 +283,7 @@ def book_service(
 ):
     """
     Book a service at a service center.
-    Functionality: User creates service booking (slot-based or breakdown)
+    Auto-accepts booking based on availability and configured rules.
     """
     if current_user.role != "user":
         raise HTTPException(status_code=403, detail="Only users can book services")
@@ -259,61 +298,120 @@ def book_service(
     if not service or service.service_center_id != booking_data.service_center_id:
         raise HTTPException(status_code=404, detail="Service not found at this center")
 
-    # Service type validation
-    if service.service_type != booking_data.service_type:
-        raise HTTPException(status_code=400, detail="Service type mismatch")
-
-    # For slot-based services: verify slot and update capacity
-    if service.service_type != "breakdown_repair":
-        if not booking_data.slot_id:
-            raise HTTPException(
-                status_code=400, detail="Slot ID required for slot-based services"
-            )
-
-        # MODIFIED: Lock the row with_for_update() to prevent race conditions
-        try:
-            statement = (
-                select(ServiceSlot)
-                .where(ServiceSlot.id == booking_data.slot_id)
-                .with_for_update()
-            )
-            slot = session.exec(statement).one()
-        except NoResultFound:
-            raise HTTPException(status_code=404, detail="Slot not found")
-
-        if slot.center_service_id != booking_data.center_service_id:
-            raise HTTPException(status_code=404, detail="Slot does not match service")
-
-        if slot.booked_count >= slot.capacity:
-            session.rollback()  # Release lock
-            raise HTTPException(
-                status_code=400, detail="No capacity remaining in this slot"
-            )
-
-        # Update slot booking count
-        slot.booked_count += 1
-        session.add(slot)
-
-        # Calculate expected return date based on service duration
-        expected_return_datetime = slot.end_time + timedelta(
-            hours=service.expected_duration_hours
+    # Verify vehicle type is in allowed types
+    if booking_data.vehicle_type not in service.vehicle_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Vehicle type '{booking_data.vehicle_type}' not supported for this service",
         )
+
+    # Verify booking_type matches service booking_type
+    if booking_data.booking_type != service.booking_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Booking type mismatch. Service is {service.booking_type.value}",
+        )
+
+    expected_return_date = None
+    expected_return_time = None
+    price_at_booking = None
+    price_components = []
+    slot_id = None
+
+    # --- SLOT-BASED BOOKING ---
+    if service.booking_type == BookingType.SLOT_BASED:
+        if not booking_data.requested_start_time:
+            raise HTTPException(
+                400, "requested_start_time is required for slot-based services."
+            )
+
+        start_time = booking_data.requested_start_time
+        end_time = start_time + timedelta(hours=service.service_duration_hours)
+
+        # Check overlaps
+        overlap_count = session.exec(
+            select(func.count(ServiceSlot.id)).where(
+                ServiceSlot.center_service_id == service.id,
+                ServiceSlot.start_time < end_time,
+                ServiceSlot.end_time > start_time,
+            )
+        ).one()
+
+        if overlap_count >= service.max_concurrent_bookings:
+            raise HTTPException(400, "This time slot is no longer available.")
+
+        # Create the physical locked slot
+        locked_slot = ServiceSlot(
+            service_center_id=service.service_center_id,
+            center_service_id=service.id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        session.add(locked_slot)
+        session.flush()  # Get the slot ID
+
+        slot_id = locked_slot.id
+
+        # INTELLIGENT EXPECTED RETURN (Rollover check)
+        end_t = datetime.strptime(service.slot_end_time, "%H:%M").time()
+        operating_end = datetime.combine(start_time.date(), end_t)
+
+        if end_time > operating_end:
+            overtime = end_time - operating_end
+            next_day = start_time.date() + timedelta(days=1)
+
+            start_t = datetime.strptime(service.slot_start_time, "%H:%M").time()
+            next_day_start = datetime.combine(next_day, start_t)
+
+            expected_return_datetime = next_day_start + overtime
+        else:
+            expected_return_datetime = end_time
+
         expected_return_date = expected_return_datetime.date()
         expected_return_time = expected_return_datetime.strftime("%H:%M")
-    else:
-        # For breakdown: no slot, no auto-calculated return
-        expected_return_date = None
-        expected_return_time = None
 
-    # Create booking
+        # Price is locked for slot-based bookings
+        price_at_booking = service.price
+        price_components = service.pricing_components or []
+        booking_status = ServiceStatus.BOOKED
+
+    # --- WALK-IN BOOKING ---
+    elif service.booking_type == BookingType.WALK_IN:
+        if not service.is_walk_in_allowed or not service.is_available:
+            raise HTTPException(
+                status_code=400, detail="Walk-in service is not available"
+            )
+
+        # For walk-in: price and return are initially blank (filled after inspection)
+        price_at_booking = None
+        price_components = []
+        booking_status = ServiceStatus.ACCEPTED
+
+    else:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown booking type: {service.booking_type}"
+        )
+
+    # Create booking with auto-accept status
     new_booking = ServiceRequest(
         user_id=current_user.id,
-        **booking_data.model_dump(),
-        status="booked",
+        service_center_id=booking_data.service_center_id,
+        center_service_id=booking_data.center_service_id,
+        booking_type=booking_data.booking_type,
+        service_name=service.service_name,
+        vehicle_type=booking_data.vehicle_type,
+        vehicle_number=booking_data.vehicle_number,
+        slot_id=slot_id,
+        status=booking_status,
         booking_time=datetime.utcnow(),
+        requested_date=booking_data.requested_date,
+        requested_time=booking_data.requested_time,
         expected_return_date=expected_return_date,
         expected_return_time=expected_return_time,
-        price_at_booking=service.price,
+        price_at_booking=price_at_booking,
+        final_price=price_at_booking,
+        price_locked=service.booking_type == BookingType.SLOT_BASED,
+        price_components=price_components,
     )
 
     session.add(new_booking)
@@ -321,12 +419,13 @@ def book_service(
     session.refresh(new_booking)
 
     # Notify service center about new booking
+    booking_type_label = service.booking_type.value.replace("_", "-").title()
     background_tasks.add_task(
         send_push_notification,
         session=session,
         user_ids=[center.user_id],
-        title="New Booking 📅",
-        body=f"New {booking_data.service_type} booking from customer",
+        title="New Booking \U0001f4c5",
+        body=f"New {booking_type_label} booking for {service.service_name}",
         data={"booking_id": new_booking.id, "type": "new_booking"},
     )
 
@@ -346,7 +445,6 @@ def get_my_service_bookings(
 ):
     """
     Get all service bookings for the current user.
-    Functionality: User views their own service bookings with optional status filter
     """
     if current_user.role != "user":
         raise HTTPException(
@@ -374,14 +472,13 @@ def cancel_service_booking(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Cancel a service booking.
-    Functionality: User cancels their booking and frees up slot capacity
+    Cancel a service booking and free up the slot.
     """
     booking = session.get(ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    if booking.status in ["completed", "cancelled"]:
+    if booking.status in [ServiceStatus.COMPLETED.value, ServiceStatus.CANCELLED.value]:
         raise HTTPException(
             status_code=400,
             detail="Cannot cancel a completed or already cancelled booking",
@@ -390,20 +487,13 @@ def cancel_service_booking(
     # Free up slot capacity if slot-based
     if booking.slot_id:
         try:
-            statement = (
-                select(ServiceSlot)
-                .where(ServiceSlot.id == booking.slot_id)
-                .with_for_update()
-            )
-            slot = session.exec(statement).one()
-
-            if slot.booked_count > 0:
-                slot.booked_count -= 1
-                session.add(slot)
+            slot = session.get(ServiceSlot, booking.slot_id)
+            if slot:
+                session.delete(slot)
         except NoResultFound:
             pass
 
-    booking.status = "cancelled"
+    booking.status = ServiceStatus.CANCELLED.value
     session.add(booking)
     session.commit()
 
@@ -414,7 +504,7 @@ def cancel_service_booking(
             send_push_notification,
             session=session,
             user_ids=[center.user_id],
-            title="Booking Cancelled ❌",
+            title="Booking Cancelled \u274c",
             body="A customer cancelled their service booking",
             data={"booking_id": booking.id, "type": "cancellation"},
         )
@@ -436,13 +526,12 @@ def submit_service_review(
 ):
     """
     Submit a review for a completed service.
-    Functionality: User rates and reviews service center after service completion
     """
     booking = session.get(ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    if booking.status != "completed":
+    if booking.status != ServiceStatus.COMPLETED.value:
         raise HTTPException(
             status_code=400, detail="Can only review completed bookings"
         )
@@ -502,7 +591,6 @@ def get_service_center_reviews(
 ):
     """
     Get all reviews for a service center.
-    Functionality: View user reviews and ratings for a service center
     """
     center = session.get(ServiceCenter, center_id)
     if not center:

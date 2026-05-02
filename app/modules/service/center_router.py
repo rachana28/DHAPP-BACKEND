@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Body
 from sqlmodel import Session, select, func, desc
-from typing import List
+from typing import List, Dict, Any
 import redis
 from datetime import datetime, date
 from sqlalchemy.exc import NoResultFound
@@ -21,6 +21,8 @@ from app.core.models import (
     ServiceRequestPublic,
     ServiceSlotUpdate,
     ServiceRequestForCenter,
+    BookingType,
+    ServiceStatus,
 )
 from app.core.security import get_current_active_service_center
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
@@ -165,30 +167,48 @@ def add_service(
     service_data: CenterServiceCreate,
 ):
     """
-    Add a new service to the service center's offerings.
-    Functionality: Service center can add services (breakdown_repair, ppf, wash, general_service) with duration and price
+    Add a new custom service to the service center's offerings.
+    Functionality: Service center can add custom services with flexible booking types
     """
-    # Validate service type
-    valid_types = ["breakdown_repair", "ppf", "wash", "general_service"]
-    if service_data.service_type not in valid_types:
+    # Validate vehicle types are not empty
+    if not service_data.vehicle_types:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid service type. Must be one of: {', '.join(valid_types)}",
+            detail="At least one vehicle type must be specified",
         )
 
-    # Check if service already exists for this center
-    existing = session.exec(
-        select(CenterService).where(
-            CenterService.service_center_id == current_center.id,
-            CenterService.service_type == service_data.service_type,
-        )
-    ).first()
+    # Validate slot configuration for slot-based services
+    if service_data.booking_type == BookingType.SLOT_BASED:
+        if service_data.service_duration_hours <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Service duration must be greater than 0 for slot-based services",
+            )
+        if service_data.slot_interval_minutes <= 0 or service_data.slot_interval_minutes > 120:
+            raise HTTPException(
+                status_code=400,
+                detail="Slot interval must be between 1 and 120 minutes",
+            )
+        if service_data.max_daily_bookings <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Max daily bookings must be greater than 0",
+            )
 
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Service center already offers {service_data.service_type}",
-        )
+    # Validate pricing components
+    total_price = 0.0
+    if service_data.pricing_components:
+        for component in service_data.pricing_components:
+            if "amount" not in component or component["amount"] < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each pricing component must have a valid amount",
+                )
+            total_price += component["amount"]
+        
+        # Calculate price from components if not provided
+        if not service_data.price:
+            service_data.price = total_price
 
     new_service = CenterService(
         service_center_id=current_center.id, **service_data.model_dump()
@@ -226,14 +246,30 @@ def update_service(
     service_update: CenterServiceUpdate,
 ):
     """
-    Update service details (duration, price, availability).
-    Functionality: Modify expected duration, pricing, or availability of a service
+    Update service details.
+    Functionality: Modify service name, duration, pricing, vehicle types, or availability
     """
     service = session.get(CenterService, service_id)
     if not service or service.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Service not found")
 
     update_data = service_update.model_dump(exclude_unset=True)
+    
+    # Validate pricing components if provided
+    if "pricing_components" in update_data and update_data["pricing_components"]:
+        total_price = 0.0
+        for component in update_data["pricing_components"]:
+            if "amount" not in component or component["amount"] < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each pricing component must have a valid amount",
+                )
+            total_price += component["amount"]
+        
+        # Auto-calculate price from components
+        if "price" not in update_data or update_data["price"] is None:
+            update_data["price"] = total_price
+    
     for key, value in update_data.items():
         setattr(service, key, value)
 
@@ -257,17 +293,17 @@ def create_service_slot(
 ):
     """
     Create a time slot for a slot-based service.
-    Functionality: Service center creates time slots for PPF, wash, general service bookings
+    Functionality: Service center creates time slots for slot-based services
     """
     service = session.get(CenterService, service_id)
     if not service or service.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    # Slot-based services only
-    if service.service_type == "breakdown_repair":
+    # Only for slot-based services
+    if service.booking_type != BookingType.SLOT_BASED:
         raise HTTPException(
             status_code=400,
-            detail="Slots are not applicable for breakdown & repair service",
+            detail=f"Slots are not applicable for {service.booking_type} services",
         )
 
     # Validate time
@@ -463,14 +499,7 @@ def update_booking_status(
         raise HTTPException(status_code=404, detail="Booking not found")
 
     # Validate status transitions
-    valid_statuses = [
-        "searching",
-        "booked",
-        "checked_in",
-        "in_service",
-        "completed",
-        "cancelled",
-    ]
+    valid_statuses = [e.value for e in ServiceStatus]
     if new_status not in valid_statuses:
         raise HTTPException(
             status_code=400,
@@ -522,18 +551,18 @@ def checkin_vehicle(
         raise HTTPException(status_code=404, detail="Booking not found")
 
     service = session.get(CenterService, booking.center_service_id)
-    if service.service_type != "breakdown_repair":
+    if service.booking_type != BookingType.WALK_IN:
         raise HTTPException(
-            status_code=400, detail="Check-in is only for breakdown & repair services"
+            status_code=400, detail="Check-in is only for walk-in services"
         )
 
-    if booking.status != "booked":
+    if booking.status != ServiceStatus.ACCEPTED.value:
         raise HTTPException(
             status_code=400,
-            detail="Vehicle can only be checked in from 'booked' status",
+            detail="Vehicle can only be checked in from 'accepted' status",
         )
 
-    booking.status = "checked_in"
+    booking.status = ServiceStatus.CHECKED_IN.value
     booking.checked_in_time = datetime.utcnow()
 
     session.add(booking)
@@ -546,7 +575,7 @@ def checkin_vehicle(
 def set_expected_return_date(
     booking_id: int,
     expected_return_date: date = Query(...),
-    expected_return_time: str = Query(...),  # Format: HH:MM
+    expected_return_time: str = Query(...), 
     *,
     session: Session = Depends(get_session),
     current_center: ServiceCenter = Depends(get_current_active_service_center),
@@ -560,10 +589,10 @@ def set_expected_return_date(
         raise HTTPException(status_code=404, detail="Booking not found")
 
     service = session.get(CenterService, booking.center_service_id)
-    if service.service_type != "breakdown_repair":
+    if service.booking_type != BookingType.WALK_IN:
         raise HTTPException(
             status_code=400,
-            detail="Expected return date is only for breakdown & repair services",
+            detail="Expected return date is only for walk-in services",
         )
 
     if booking.status != "checked_in":
@@ -589,4 +618,144 @@ def set_expected_return_date(
         "message": "Expected return date set successfully",
         "expected_return_date": expected_return_date,
         "expected_return_time": expected_return_time,
+    }
+
+
+# --- WALK-IN SERVICE MANAGEMENT ---
+
+
+@router.patch("/me/bookings/{booking_id}/walk-in-price-duration")
+def update_walkin_price_and_duration(
+    booking_id: int,
+    expected_price: float = Query(..., gt=0),
+    expected_return_datetime: datetime = Query(...),
+    price_components: List[Dict[str, Any]] = Body(default=[]),
+    *,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """
+    Update price and expected return datetime for walk-in services.
+    Only allowed when booking is in 'accepted' or 'service_ongoing' status.
+    After 'service_accepted' status, price is locked and only datetime can be changed.
+    Functionality: Service center updates walk-in service price and expected return after inspection
+    """
+    booking = session.get(ServiceRequest, booking_id)
+    if not booking or booking.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    service = session.get(CenterService, booking.center_service_id)
+    if service.booking_type != BookingType.WALK_IN:
+        raise HTTPException(
+            status_code=400,
+            detail="This endpoint is only for walk-in services",
+        )
+
+    # Check if price can be modified
+    if booking.price_locked:
+        raise HTTPException(
+            status_code=400,
+            detail="Price is locked. Cannot modify after service acceptance",
+        )
+
+    # Check booking status
+    if booking.status not in [ServiceStatus.ACCEPTED, ServiceStatus.SERVICE_ONGOING]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot update price for booking in '{booking.status.value}' status",
+        )
+
+    # Validate and set price components
+    if price_components:
+        total_price = 0.0
+        for component in price_components:
+            if "amount" not in component or component["amount"] < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each pricing component must have a valid amount",
+                )
+            total_price += component["amount"]
+        booking.price_components = price_components
+        booking.final_price = total_price
+    else:
+        booking.final_price = expected_price
+
+    # If price is not set, update it
+    if booking.price_at_booking is None:
+        booking.price_at_booking = expected_price
+
+    # Set expected return datetime
+    booking.expected_return_date = expected_return_datetime.date()
+    booking.expected_return_time = expected_return_datetime.strftime("%H:%M")
+
+    # Transition to service_ongoing if still in accepted
+    if booking.status == ServiceStatus.ACCEPTED:
+        booking.status = ServiceStatus.SERVICE_ONGOING
+
+    session.add(booking)
+    session.commit()
+
+    return {
+        "message": "Walk-in service price and duration updated successfully",
+        "booking_id": booking.id,
+        "final_price": booking.final_price,
+        "price_components": booking.price_components,
+        "expected_return_date": booking.expected_return_date,
+        "expected_return_time": booking.expected_return_time,
+        "status": booking.status.value,
+    }
+
+
+@router.patch("/me/bookings/{booking_id}/accept-service")
+def accept_walkin_service(
+    booking_id: int,
+    *,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """
+    Accept walk-in service after price and duration are set.
+    Transitions status from 'service_ongoing' to 'service_accepted'.
+    After this, price is locked but expected_return_datetime can still be changed.
+    Functionality: Service center confirms walk-in service details and locks price
+    """
+    booking = session.get(ServiceRequest, booking_id)
+    if not booking or booking.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    service = session.get(CenterService, booking.center_service_id)
+    if service.booking_type != BookingType.WALK_IN:
+        raise HTTPException(
+            status_code=400,
+            detail="This endpoint is only for walk-in services",
+        )
+
+    if booking.status != ServiceStatus.SERVICE_ONGOING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Service can only be accepted from 'service_ongoing' status, currently in '{booking.status.value}'",
+        )
+
+    # Check that price and return datetime are set
+    if booking.final_price is None or booking.expected_return_date is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Price and expected return datetime must be set before acceptance",
+        )
+
+    # Lock the price and transition status
+    booking.price_locked = True
+    booking.status = ServiceStatus.SERVICE_ACCEPTED
+    booking.service_accepted_time = datetime.utcnow()
+
+    session.add(booking)
+    session.commit()
+
+    return {
+        "message": "Walk-in service accepted and price locked",
+        "booking_id": booking.id,
+        "status": booking.status.value,
+        "final_price": booking.final_price,
+        "price_locked": booking.price_locked,
+        "service_accepted_time": booking.service_accepted_time,
     }

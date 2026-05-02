@@ -573,8 +573,8 @@ def get_user_trip_history(
                 "service_type": "Vehicle Service",
                 "booking_time": sr.booking_time,
                 "status": sr.status,
-                "price": 0.0,  # Handled offline/at garage
-                "source": sr.service_type,  # e.g. "wash", "ppf"
+                "price": sr.final_price if sr.final_price else 0.0,
+                "source": sr.service_name,
                 "destination": "Garage Drop-off",
                 "driver_or_center_id": sr.service_center_id,
                 "vehicle_type": sr.vehicle_type,
