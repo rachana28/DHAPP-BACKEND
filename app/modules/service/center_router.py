@@ -184,7 +184,10 @@ def add_service(
                 status_code=400,
                 detail="Service duration must be greater than 0 for slot-based services",
             )
-        if service_data.slot_interval_minutes <= 0 or service_data.slot_interval_minutes > 120:
+        if (
+            service_data.slot_interval_minutes <= 0
+            or service_data.slot_interval_minutes > 120
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Slot interval must be between 1 and 120 minutes",
@@ -205,7 +208,7 @@ def add_service(
                     detail="Each pricing component must have a valid amount",
                 )
             total_price += component["amount"]
-        
+
         # Calculate price from components if not provided
         if not service_data.price:
             service_data.price = total_price
@@ -254,7 +257,7 @@ def update_service(
         raise HTTPException(status_code=404, detail="Service not found")
 
     update_data = service_update.model_dump(exclude_unset=True)
-    
+
     # Validate pricing components if provided
     if "pricing_components" in update_data and update_data["pricing_components"]:
         total_price = 0.0
@@ -265,11 +268,11 @@ def update_service(
                     detail="Each pricing component must have a valid amount",
                 )
             total_price += component["amount"]
-        
+
         # Auto-calculate price from components
         if "price" not in update_data or update_data["price"] is None:
             update_data["price"] = total_price
-    
+
     for key, value in update_data.items():
         setattr(service, key, value)
 
@@ -575,7 +578,7 @@ def checkin_vehicle(
 def set_expected_return_date(
     booking_id: int,
     expected_return_date: date = Query(...),
-    expected_return_time: str = Query(...), 
+    expected_return_time: str = Query(...),
     *,
     session: Session = Depends(get_session),
     current_center: ServiceCenter = Depends(get_current_active_service_center),
@@ -659,7 +662,7 @@ def update_walkin_price_and_duration(
         )
 
     # Check booking status
-    if booking.status not in [ServiceStatus.ACCEPTED, ServiceStatus.SERVICE_ONGOING]:
+    if booking.status not in [ServiceStatus.CHECKED_IN, ServiceStatus.SERVICE_ONGOING]:
         raise HTTPException(
             status_code=400,
             detail=f"Cannot update price for booking in '{booking.status.value}' status",
@@ -688,8 +691,7 @@ def update_walkin_price_and_duration(
     booking.expected_return_date = expected_return_datetime.date()
     booking.expected_return_time = expected_return_datetime.strftime("%H:%M")
 
-    # Transition to service_ongoing if still in accepted
-    if booking.status == ServiceStatus.ACCEPTED:
+    if booking.status == ServiceStatus.CHECKED_IN:
         booking.status = ServiceStatus.SERVICE_ONGOING
 
     session.add(booking)
