@@ -48,7 +48,7 @@ def list_service_centers(
     query = select(ServiceCenter).where(ServiceCenter.status == "available")
 
     if service_name or vehicle_type:
-        query = query.distinct().join(CenterService)
+        query = query.join(CenterService)
 
         if service_name:
             query = query.where(CenterService.service_name.ilike(f"%{service_name}%"))
@@ -60,7 +60,15 @@ def list_service_centers(
 
     # Standard fallback sort by rating
     query = query.order_by(desc(ServiceCenter.rating))
-    centers = session.exec(query.offset(offset).limit(limit)).all()
+    raw_centers = session.exec(query).all()
+
+    unique_centers_map = {}
+    for center in raw_centers:
+        if center.id not in unique_centers_map:
+            unique_centers_map[center.id] = center
+
+    # Convert back to list and apply pagination
+    centers = list(unique_centers_map.values())[offset : offset + limit]
 
     # Helper function to calculate distance in km
     def calculate_distance(lat1, lon1, lat2, lon2):
