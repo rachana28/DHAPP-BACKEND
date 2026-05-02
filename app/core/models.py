@@ -1,8 +1,9 @@
 import uuid
 import html
+from enum import Enum
 from pydantic import EmailStr, field_validator
 from sqlmodel import Field, SQLModel, Relationship
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime, date
 from sqlalchemy import UniqueConstraint, JSON, Column
 
@@ -115,6 +116,32 @@ class MechanicReview(MechanicReviewBase, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+# --- SERVICE BOOKING TYPE AND STATUS ENUMS ---
+class BookingType(str, Enum):
+    """Enum for service booking types"""
+
+    SLOT_BASED = "slot_based"
+    WALK_IN = "walk_in"
+
+
+class ServiceStatus(str, Enum):
+    """Enum for service request status"""
+
+    # Shared statuses
+    SEARCHING = "searching"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+
+    # Slot-based specific
+    BOOKED = "booked"
+    CHECKED_IN = "checked_in"
+
+    # Walk-in specific
+    ACCEPTED = "accepted"
+    SERVICE_ONGOING = "service_ongoing"
+    SERVICE_ACCEPTED = "service_accepted"
+
+
 # --- SERVICE CENTER MODELS ---
 
 
@@ -148,15 +175,32 @@ class ServiceCenter(ServiceCenterBase, table=True):
 
 
 class CenterService(SQLModel, table=True):
-    """Service type offered by a service center (e.g., PPF, Wash, General Service, Breakdown & Repair)"""
+    """Custom Service type offered by a service center"""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     service_center_id: int = Field(foreign_key="servicecenter.id")
-    service_type: str  # "breakdown_repair", "ppf", "wash", "general_service"
-    expected_duration_hours: int = 0  # For slot-based services (0 means manual)
-    price: Optional[float] = None  # Optional service price
-    description: Optional[str] = None  # What the center offers for this service
-    is_available: bool = True  # For breakdown & repair: availability flag
+
+    service_name: str
+    booking_type: BookingType = BookingType.SLOT_BASED
+
+    vehicle_types: List[str] = Field(default_factory=list, sa_column=Column(JSON))
+    is_walk_in_allowed: bool = False
+
+    max_daily_bookings: int = 5
+    service_duration_hours: float = 2.0
+    slot_start_time: str = "10:00"
+    slot_end_time: str = "19:00"
+    slot_interval_minutes: int = 30
+
+    allow_overlapping_bookings: bool = False
+    max_concurrent_bookings: int = 1
+
+    pricing_components: List[Dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    price: Optional[float] = None
+    description: Optional[str] = None
+    is_available: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     service_center: ServiceCenter = Relationship(back_populates="services")
@@ -164,16 +208,33 @@ class CenterService(SQLModel, table=True):
     bookings: List["ServiceRequest"] = Relationship(back_populates="center_service")
 
 
+class PricingComponent(SQLModel, table=True):
+    """Pricing component breakdown for services and bookings (for transparency)"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service_id: Optional[int] = Field(default=None, foreign_key="centerservice.id")
+    booking_id: Optional[int] = Field(default=None, foreign_key="servicerequest.id")
+
+    component_name: str  # "Labor", "Material", "Tax", "Installation", etc.
+    amount: float  # Amount for this component
+    percentage: Optional[float] = None  # Percentage of total
+    description: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class ServiceSlot(SQLModel, table=True):
-    """Time slots for slot-based services (PPF, Wash, General Service)"""
+    """Time slots for slot-based services with overlapping support"""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     service_center_id: int = Field(foreign_key="servicecenter.id")
     center_service_id: int = Field(foreign_key="centerservice.id")
     start_time: datetime
     end_time: datetime
-    capacity: int = 1  # How many vehicles can be served in this slot
-    booked_count: int = 0  # How many are currently booked
+
+    # Capacity management
+    max_capacity: int = 1  # Maximum concurrent bookings allowed
+    booked_count: int = 0  # Current bookings in this slot
     is_available: bool = True
 
     service_center: ServiceCenter = Relationship(back_populates="slots")
@@ -182,36 +243,36 @@ class ServiceSlot(SQLModel, table=True):
 
 
 class ServiceRequest(SQLModel, table=True):
-    """Service booking/request by user"""
-
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     service_center_id: int = Field(foreign_key="servicecenter.id")
     center_service_id: int = Field(foreign_key="centerservice.id")
-    service_type: str  # "breakdown_repair", "ppf", "wash", "general_service"
-    vehicle_type: str  # "car", "bike"
+
+    booking_type: BookingType = BookingType.SLOT_BASED
+    service_name: str  # REPLACED service_type
+    vehicle_type: str
     vehicle_number: Optional[str] = None
     slot_id: Optional[int] = Field(default=None, foreign_key="serviceslot.id")
 
-    # Booking Status: For slot-based: searching->booked->completed
-    # For breakdown: searching->booked->checked_in->in_service->completed
-    status: str = "searching"
-
-    requested_date: Optional[date] = None  # Date user wants service
-    requested_time: Optional[str] = None  # Time in HH:MM format (for slot-based)
-    expected_return_date: Optional[date] = (
-        None  # Auto-calculated for slot-based, manual for breakdown
-    )
-    expected_return_time: Optional[str] = (
-        None  # Auto-calculated for slot-based, manual for breakdown
-    )
+    status: ServiceStatus = ServiceStatus.SEARCHING
+    requested_date: Optional[date] = None
+    requested_time: Optional[str] = None
+    expected_return_date: Optional[date] = None
+    expected_return_time: Optional[str] = None
     actual_return_date: Optional[date] = None
     actual_return_time: Optional[str] = None
 
     booking_time: datetime = Field(default_factory=datetime.utcnow)
-    checked_in_time: Optional[datetime] = None  # For breakdown & repair manual check-in
+    checked_in_time: Optional[datetime] = None
+    service_accepted_time: Optional[datetime] = None
     completed_time: Optional[datetime] = None
+
     price_at_booking: Optional[float] = None
+    final_price: Optional[float] = None
+    price_locked: bool = False
+    price_components: List[Dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
 
     user: "User" = Relationship(back_populates="service_bookings")
     service_center: ServiceCenter = Relationship(back_populates="bookings")
@@ -268,23 +329,45 @@ class ServiceCenterUpdate(SQLModel):
 # --- API Models for Services ---
 class CenterServicePublic(SQLModel):
     id: int
-    service_type: str
-    expected_duration_hours: int
+    service_center_id: int
+    service_name: str
+    booking_type: BookingType
+    vehicle_types: List[str]
+    is_walk_in_allowed: bool
     price: Optional[float] = None
     description: Optional[str] = None
     is_available: bool
 
 
 class CenterServiceCreate(SQLModel):
-    service_type: str
-    expected_duration_hours: int = 0
+    service_name: str
+    booking_type: BookingType = BookingType.SLOT_BASED
+    vehicle_types: List[str]
+    is_walk_in_allowed: bool = False
+    max_daily_bookings: int = 5
+    service_duration_hours: float = 2.0
+    slot_start_time: str = "10:00"
+    slot_end_time: str = "19:00"
+    slot_interval_minutes: int = 30
+    allow_overlapping_bookings: bool = False
+    max_concurrent_bookings: int = 1
+    pricing_components: List[Dict[str, Any]] = Field(default_factory=list)
     price: Optional[float] = None
     description: Optional[str] = None
     is_available: bool = True
 
 
 class CenterServiceUpdate(SQLModel):
-    expected_duration_hours: Optional[int] = None
+    service_name: Optional[str] = None
+    vehicle_types: Optional[List[str]] = None
+    is_walk_in_allowed: Optional[bool] = None
+    max_daily_bookings: Optional[int] = None
+    service_duration_hours: Optional[float] = None
+    slot_start_time: Optional[str] = None
+    slot_end_time: Optional[str] = None
+    allow_overlapping_bookings: Optional[bool] = None
+    max_concurrent_bookings: Optional[int] = None
+    pricing_components: Optional[List[Dict[str, Any]]] = None
     price: Optional[float] = None
     description: Optional[str] = None
     is_available: Optional[bool] = None
@@ -295,7 +378,7 @@ class ServiceSlotPublic(SQLModel):
     id: int
     start_time: datetime
     end_time: datetime
-    capacity: int
+    max_capacity: int
     booked_count: int
     is_available: bool
 
@@ -303,61 +386,75 @@ class ServiceSlotPublic(SQLModel):
 class ServiceSlotCreate(SQLModel):
     start_time: datetime
     end_time: datetime
-    capacity: int = 1
+    max_capacity: int = 1
     is_available: bool = True
 
 
 # --- API Models for Service Requests ---
 class ServiceRequestBase(SQLModel):
-    service_type: str
     vehicle_type: str
     vehicle_number: Optional[str] = None
     requested_date: Optional[date] = None
     requested_time: Optional[str] = None
 
 
-class ServiceRequestCreate(ServiceRequestBase):
+class ServiceRequestCreate(SQLModel):
     service_center_id: int
     center_service_id: int
-    slot_id: Optional[int] = None  # Required for slot-based, None for breakdown
+    booking_type: BookingType = BookingType.SLOT_BASED
+    vehicle_type: str
+    vehicle_number: Optional[str] = None
+    requested_date: Optional[date] = None
+    requested_time: Optional[str] = None
+    slot_id: Optional[int] = None
 
 
 class ServiceRequestPublic(SQLModel):
     id: int
     user_id: uuid.UUID
     service_center_id: int
-    service_type: str
+    center_service_id: int
+    booking_type: BookingType
+    service_name: str
     vehicle_type: str
     vehicle_number: Optional[str] = None
-    status: str
+    status: ServiceStatus
     requested_date: Optional[date] = None
     requested_time: Optional[str] = None
     expected_return_date: Optional[date] = None
     expected_return_time: Optional[str] = None
     booking_time: datetime
+    price_at_booking: Optional[float] = None
+    final_price: Optional[float] = None
+    price_components: List[Dict[str, Any]]
 
 
 class ServiceRequestPrivate(ServiceRequestPublic):
-    center_service_id: int
     slot_id: Optional[int] = None
     checked_in_time: Optional[datetime] = None
+    service_accepted_time: Optional[datetime] = None
     actual_return_date: Optional[date] = None
     actual_return_time: Optional[str] = None
+    price_locked: bool = False
+
 
 class ServiceRequestForCenter(ServiceRequestPublic):
     customer_name: Optional[str] = None
     customer_phone: Optional[str] = None
 
+
 class ServiceRequestUpdate(SQLModel):
-    status: Optional[str] = None
+    status: Optional[ServiceStatus] = None
     expected_return_date: Optional[date] = None
     expected_return_time: Optional[str] = None
+    final_price: Optional[float] = None
+    price_components: Optional[List[Dict[str, Any]]] = None
 
 
 class ServiceSlotUpdate(SQLModel):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    capacity: Optional[int] = None
+    max_capacity: Optional[int] = None
     is_available: Optional[bool] = None
 
 
