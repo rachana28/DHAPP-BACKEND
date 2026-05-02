@@ -328,12 +328,28 @@ def book_service(
 
     # --- SLOT-BASED BOOKING ---
     if service.booking_type == BookingType.SLOT_BASED:
-        if not booking_data.requested_start_time:
+        if not booking_data.requested_date or not booking_data.requested_time:
             raise HTTPException(
-                400, "requested_start_time is required for slot-based services."
+                400,
+                "requested_date and requested_time are required for slot-based services.",
             )
 
-        start_time = booking_data.requested_start_time
+        try:
+            req_time_obj = datetime.strptime(
+                booking_data.requested_time, "%H:%M"
+            ).time()
+            start_time = datetime.combine(booking_data.requested_date, req_time_obj)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="Invalid time format. Use HH:MM"
+            )
+
+        if start_time < datetime.utcnow():
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot book a time slot in the past. Please select a future time.",
+            )
+
         end_time = start_time + timedelta(hours=service.service_duration_hours)
 
         # Check overlaps
@@ -432,7 +448,7 @@ def book_service(
         send_push_notification,
         session=session,
         user_ids=[center.user_id],
-        title="New Booking \U0001f4c5",
+        title="New Booking 📅",
         body=f"New {booking_type_label} booking for {service.service_name}",
         data={"booking_id": new_booking.id, "type": "new_booking"},
     )
