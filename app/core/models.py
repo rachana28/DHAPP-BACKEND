@@ -125,21 +125,15 @@ class BookingType(str, Enum):
 
 
 class ServiceStatus(str, Enum):
-    """Enum for service request status"""
-
-    # Shared statuses
     SEARCHING = "searching"
-    CANCELLED = "cancelled"
-    COMPLETED = "completed"
-
-    # Slot-based specific
     BOOKED = "booked"
-    CHECKED_IN = "checked_in"
-
-    # Walk-in specific
     ACCEPTED = "accepted"
+    CHECKED_IN = "checked_in"
     SERVICE_ONGOING = "service_ongoing"
     SERVICE_ACCEPTED = "service_accepted"
+    IN_SERVICE = "in_service"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
 
 # --- SERVICE CENTER MODELS ---
