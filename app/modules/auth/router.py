@@ -227,19 +227,29 @@ def verify_otp(
         # Create Role Profile
         if role == "driver":
             db_driver = Driver(
-                name=request.full_name, phone_number=phone, user_id=user.id
+                name=request.full_name,
+                phone_number=phone,
+                user_id=user.id,
+                license_number=request.license_number,
+                vehicle_type=request.vehicle_type,
             )
             session.add(db_driver)
             session.commit()
         elif role == "tow_truck_driver":
             db_tow_driver = TowTruckDriver(
-                name=request.full_name, phone_number=phone, user_id=user.id
+                name=request.full_name,
+                phone_number=phone,
+                user_id=user.id,
+                vehicle_number=request.vehicle_number,
             )
             session.add(db_tow_driver)
             session.commit()
         elif role == "mechanic":
             new_mechanic = Mechanic(
-                user_id=user.id, name=request.full_name, phone_number=phone
+                user_id=user.id,
+                name=request.full_name,
+                phone_number=phone,
+                specialization=request.specialization,
             )
             session.add(new_mechanic)
             session.commit()
@@ -249,6 +259,9 @@ def verify_otp(
                 name=request.full_name,
                 phone_number=phone,
                 status="pending_approval",
+                address=request.address,
+                latitude=request.latitude,
+                longitude=request.longitude,
             )
             session.add(new_service_center)
             session.commit()
