@@ -283,6 +283,51 @@ def update_service(
     return CenterServicePublic(**service.model_dump())
 
 
+@router.delete("/me/services/{service_id}")
+def delete_service(
+    service_id: int,
+    *,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """
+    Delete a custom service.
+    Functionality: Remove a service offering from the center.
+    """
+    service = session.get(CenterService, service_id)
+    if not service or service.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    # Safety check: Prevent deletion if there are active bookings
+    active_bookings = session.exec(
+        select(ServiceRequest).where(
+            ServiceRequest.center_service_id == service_id,
+            ServiceRequest.status.notin_(
+                [ServiceStatus.COMPLETED, ServiceStatus.CANCELLED]
+            ),
+        )
+    ).first()
+
+    if active_bookings:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete a service that has active ongoing bookings. Please cancel or complete them first.",
+        )
+
+    # Optionally: Clean up associated slots if it's a slot-based service
+    if service.booking_type == BookingType.SLOT_BASED:
+        slots = session.exec(
+            select(ServiceSlot).where(ServiceSlot.center_service_id == service_id)
+        ).all()
+        for slot in slots:
+            session.delete(slot)
+
+    session.delete(service)
+    session.commit()
+
+    return {"message": "Service deleted successfully"}
+
+
 # --- SLOT MANAGEMENT (for slot-based services) ---
 
 
