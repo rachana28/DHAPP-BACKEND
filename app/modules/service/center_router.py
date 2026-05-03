@@ -534,6 +534,7 @@ def get_center_bookings(
 def update_booking_status(
     booking_id: int,
     new_status: str = Query(...),
+    cancellation_reason: str = Query(None),
     *,
     session: Session = Depends(get_session),
     current_center: ServiceCenter = Depends(get_current_active_service_center),
@@ -541,6 +542,7 @@ def update_booking_status(
     """
     Update the status of a service booking.
     Functionality: Service center updates booking status (searching->booked->completed, etc.)
+    For cancellation: Provide cancellation_reason that will be visible to the user
     """
     booking = session.get(ServiceRequest, booking_id)
     if not booking or booking.service_center_id != current_center.id:
@@ -562,25 +564,28 @@ def update_booking_status(
         booking.actual_return_date = date.today()
         booking.actual_return_time = datetime.utcnow().strftime("%H:%M")
 
-    elif new_status == "cancelled" and booking.slot_id:
-        try:
-            statement = (
-                select(ServiceSlot)
-                .where(ServiceSlot.id == booking.slot_id)
-                .with_for_update()
-            )
-            slot = session.exec(statement).one()
+    elif new_status == "cancelled":
+        booking.cancellation_time = datetime.utcnow()
+        # Store cancellation reason if provided
+        if cancellation_reason:
+            booking.cancellation_reason = cancellation_reason
 
-            if slot.booked_count > 0:
-                slot.booked_count -= 1
-                session.add(slot)
-        except NoResultFound:
-            pass
+        # Delete slot if it exists (for slot-based bookings)
+        if booking.slot_id:
+            try:
+                slot = session.get(ServiceSlot, booking.slot_id)
+                if slot:
+                    session.delete(slot)
+            except NoResultFound:
+                pass
 
     session.add(booking)
     session.commit()
 
-    return {"message": f"Booking status updated to {new_status}"}
+    return {
+        "message": f"Booking status updated to {new_status}",
+        "booking_id": booking_id,
+    }
 
 
 @router.post("/me/bookings/{booking_id}/checkin")
@@ -707,10 +712,13 @@ def update_walkin_price_and_duration(
         )
 
     # Check booking status
-    if booking.status not in [ServiceStatus.CHECKED_IN, ServiceStatus.SERVICE_ONGOING]:
+    if booking.status not in [
+        ServiceStatus.CHECKED_IN.value,
+        ServiceStatus.SERVICE_ONGOING.value,
+    ]:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot update price for booking in '{booking.status.value}' status",
+            detail=f"Cannot update price for booking in '{booking.status}' status",
         )
 
     # Validate and set price components
@@ -749,7 +757,7 @@ def update_walkin_price_and_duration(
         "price_components": booking.price_components,
         "expected_return_date": booking.expected_return_date,
         "expected_return_time": booking.expected_return_time,
-        "status": booking.status.value,
+        "status": booking.status,
     }
 
 
@@ -777,10 +785,10 @@ def accept_walkin_service(
             detail="This endpoint is only for walk-in services",
         )
 
-    if booking.status != ServiceStatus.SERVICE_ONGOING:
+    if booking.status != ServiceStatus.SERVICE_ONGOING.value:
         raise HTTPException(
             status_code=400,
-            detail=f"Service can only be accepted from 'service_ongoing' status, currently in '{booking.status.value}'",
+            detail=f"Service can only be accepted from 'service_ongoing' status, currently in '{booking.status}'",
         )
 
     # Check that price and return datetime are set
@@ -801,7 +809,7 @@ def accept_walkin_service(
     return {
         "message": "Walk-in service accepted and price locked",
         "booking_id": booking.id,
-        "status": booking.status.value,
+        "status": booking.status,
         "final_price": booking.final_price,
         "price_locked": booking.price_locked,
         "service_accepted_time": booking.service_accepted_time,

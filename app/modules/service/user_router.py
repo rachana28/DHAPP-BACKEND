@@ -330,8 +330,8 @@ def book_service(
     if service.booking_type == BookingType.SLOT_BASED:
         if not booking_data.requested_date or not booking_data.requested_time:
             raise HTTPException(
-                400,
-                "requested_date and requested_time are required for slot-based services.",
+                status_code=400,
+                detail="requested_date and requested_time are required for slot-based services.",
             )
 
         try:
@@ -362,7 +362,9 @@ def book_service(
         ).one()
 
         if overlap_count >= service.max_concurrent_bookings:
-            raise HTTPException(400, "This time slot is no longer available.")
+            raise HTTPException(
+                status_code=400, detail="This time slot is no longer available."
+            )
 
         # Create the physical locked slot
         locked_slot = ServiceSlot(
@@ -425,6 +427,7 @@ def book_service(
         service_name=service.service_name,
         vehicle_type=booking_data.vehicle_type,
         vehicle_number=booking_data.vehicle_number,
+        vehicle_model=booking_data.vehicle_model,
         slot_id=slot_id,
         status=booking_status,
         booking_time=datetime.utcnow(),
@@ -490,13 +493,15 @@ def get_my_service_bookings(
 @router.patch("/my-bookings/{booking_id}/cancel")
 def cancel_service_booking(
     booking_id: int,
-    background_tasks: BackgroundTasks,
+    cancellation_reason: str = Query(None),
     *,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
     Cancel a service booking and free up the slot.
+    User can optionally provide cancellation reason for reference.
     """
     booking = session.get(ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
@@ -518,6 +523,11 @@ def cancel_service_booking(
             pass
 
     booking.status = ServiceStatus.CANCELLED.value
+    booking.cancellation_time = datetime.utcnow()
+    # Store user's cancellation reason if provided
+    if cancellation_reason:
+        booking.cancellation_reason = cancellation_reason
+
     session.add(booking)
     session.commit()
 
@@ -528,12 +538,50 @@ def cancel_service_booking(
             send_push_notification,
             session=session,
             user_ids=[center.user_id],
-            title="Booking Cancelled \u274c",
+            title="Booking Cancelled ❌",
             body="A customer cancelled their service booking",
             data={"booking_id": booking.id, "type": "cancellation"},
         )
 
     return {"message": "Booking cancelled successfully"}
+
+
+@router.patch("/my-bookings/{booking_id}", response_model=ServiceRequestPublic)
+def update_service_booking(
+    booking_id: int,
+    vehicle_number: str = Query(None),
+    vehicle_model: str = Query(None),
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Update booking details (vehicle_number and vehicle_model).
+    Functionality: User can edit vehicle details before service is completed.
+    Only allows editing if booking hasn't been completed or cancelled.
+    """
+    booking = session.get(ServiceRequest, booking_id)
+    if not booking or booking.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    # Allow editing only if booking is not completed or cancelled
+    if booking.status in [ServiceStatus.COMPLETED.value, ServiceStatus.CANCELLED.value]:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot edit a completed or cancelled booking",
+        )
+
+    # Update provided fields
+    if vehicle_number is not None:
+        booking.vehicle_number = vehicle_number
+    if vehicle_model is not None:
+        booking.vehicle_model = vehicle_model
+
+    session.add(booking)
+    session.commit()
+    session.refresh(booking)
+
+    return ServiceRequestPublic(**booking.model_dump())
 
 
 # --- REVIEWS ---
