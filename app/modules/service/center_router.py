@@ -534,7 +534,7 @@ def get_center_bookings(
 def update_booking_status(
     booking_id: int,
     new_status: str = Query(...),
-    cancellation_reason: str = Query(None),
+    cancellation_reason: str = Body(None),
     *,
     session: Session = Depends(get_session),
     current_center: ServiceCenter = Depends(get_current_active_service_center),
