@@ -493,7 +493,7 @@ def get_my_service_bookings(
 @router.patch("/my-bookings/{booking_id}/cancel")
 def cancel_service_booking(
     booking_id: int,
-    cancellation_reason: str = Body(None),
+    cancellation_reason: str = Body(None, embed=True),
     *,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
