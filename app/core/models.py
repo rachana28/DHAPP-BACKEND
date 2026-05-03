@@ -246,6 +246,7 @@ class ServiceRequest(SQLModel, table=True):
     service_name: str  # REPLACED service_type
     vehicle_type: str
     vehicle_number: Optional[str] = None
+    vehicle_model: Optional[str] = None
     slot_id: Optional[int] = Field(default=None, foreign_key="serviceslot.id")
 
     status: ServiceStatus = ServiceStatus.SEARCHING
@@ -260,6 +261,7 @@ class ServiceRequest(SQLModel, table=True):
     checked_in_time: Optional[datetime] = None
     service_accepted_time: Optional[datetime] = None
     completed_time: Optional[datetime] = None
+    cancellation_time: Optional[datetime] = None
 
     price_at_booking: Optional[float] = None
     final_price: Optional[float] = None
@@ -267,6 +269,7 @@ class ServiceRequest(SQLModel, table=True):
     price_components: List[Dict[str, Any]] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
+    cancellation_reason: Optional[str] = None
 
     user: "User" = Relationship(back_populates="service_bookings")
     service_center: ServiceCenter = Relationship(back_populates="bookings")
@@ -388,6 +391,7 @@ class ServiceSlotCreate(SQLModel):
 class ServiceRequestBase(SQLModel):
     vehicle_type: str
     vehicle_number: Optional[str] = None
+    vehicle_model: Optional[str] = None
     requested_date: Optional[date] = None
     requested_time: Optional[str] = None
 
@@ -398,6 +402,7 @@ class ServiceRequestCreate(SQLModel):
     booking_type: BookingType = BookingType.SLOT_BASED
     vehicle_type: str
     vehicle_number: Optional[str] = None
+    vehicle_model: Optional[str] = None
     requested_date: Optional[date] = None
     requested_time: Optional[str] = None
     slot_id: Optional[int] = None
@@ -412,6 +417,7 @@ class ServiceRequestPublic(SQLModel):
     service_name: str
     vehicle_type: str
     vehicle_number: Optional[str] = None
+    vehicle_model: Optional[str] = None
     status: ServiceStatus
     requested_date: Optional[date] = None
     requested_time: Optional[str] = None
@@ -421,6 +427,7 @@ class ServiceRequestPublic(SQLModel):
     price_at_booking: Optional[float] = None
     final_price: Optional[float] = None
     price_components: List[Dict[str, Any]]
+    cancellation_reason: Optional[str] = None
 
 
 class ServiceRequestPrivate(ServiceRequestPublic):
@@ -430,6 +437,7 @@ class ServiceRequestPrivate(ServiceRequestPublic):
     actual_return_date: Optional[date] = None
     actual_return_time: Optional[str] = None
     price_locked: bool = False
+    cancellation_time: Optional[datetime] = None
 
 
 class ServiceRequestForCenter(ServiceRequestPublic):
@@ -443,6 +451,7 @@ class ServiceRequestUpdate(SQLModel):
     expected_return_time: Optional[str] = None
     final_price: Optional[float] = None
     price_components: Optional[List[Dict[str, Any]]] = None
+    cancellation_reason: Optional[str] = None
 
 
 class ServiceSlotUpdate(SQLModel):
