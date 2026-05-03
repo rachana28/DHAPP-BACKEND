@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, BackgroundTasks
 from sqlmodel import Session, select, desc, func
 from typing import List, Dict, Any
 from datetime import datetime, date, timedelta, time
@@ -493,7 +493,7 @@ def get_my_service_bookings(
 @router.patch("/my-bookings/{booking_id}/cancel")
 def cancel_service_booking(
     booking_id: int,
-    cancellation_reason: str = Query(None),
+    cancellation_reason: str = Body(None),
     *,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
