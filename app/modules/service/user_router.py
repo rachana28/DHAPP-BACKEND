@@ -549,8 +549,8 @@ def cancel_service_booking(
 @router.patch("/my-bookings/{booking_id}", response_model=ServiceRequestPublic)
 def update_service_booking(
     booking_id: int,
-    vehicle_number: str = Query(None),
-    vehicle_model: str = Query(None),
+    vehicle_number: str = Body(None, embed=True),
+    vehicle_model: str = Body(None, embed=True),
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
