@@ -480,7 +480,23 @@ class TripBase(SQLModel):
     start_location: Optional[str] = None
     end_location: Optional[str] = None
     reason: Optional[str] = None
+
+    # Geographic info for outstation pricing.
+    # State for permit calculation is derived from end_location text + (optional) end coords;
+    # distance can be supplied directly or computed from start/end coords (Haversine).
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+
+    # Fare: 'fare' is the computed total (kept as float for back-compat with payment helpers).
+    # 'fare_breakdown' is the per-component split (JSON), populated by the pricing engine.
     fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+
     status: str = "searching"
     booking_time: datetime = Field(default_factory=datetime.utcnow)
 
@@ -556,6 +572,12 @@ class TripSafe(SQLModel):
     reason: Optional[str] = None
     status: str
     fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
     booking_time: datetime
 
 
@@ -1110,6 +1132,36 @@ class UserPaymentRequest(SQLModel):
     trip_id: int
     amount: float
     payment_method: str = "card"
+
+
+class FareEstimateRequest(SQLModel):
+    """
+    Booking inputs needed to compute the fare BEFORE the trip is created.
+    Mirrors the bookable subset of TripCreate. The same calculator is used
+    server-side at /trips/book-request, so the estimate is authoritative.
+
+    Geographic resolution (Outstation):
+      - State for permit fee is derived from `end_location` text (substring match
+        against the known Indian state/UT list).
+      - Distance is taken from `distance_km` if provided; otherwise computed via
+        Haversine from start/end coords; otherwise treated as 0.
+    """
+
+    hiring_type: str                     # "Daily" | "Monthly" | "Outstation"
+    vehicle_type: str
+    shift_details: Optional[str] = None  # e.g. "8 Hours (15:00)"
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    months: Optional[int] = None
+    selected_days: Optional[str] = None
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+    booking_time: Optional[datetime] = None  # used for night-surcharge check; defaults to now
 
 
 class BillPaymentRequest(SQLModel):

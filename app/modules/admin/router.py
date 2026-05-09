@@ -649,8 +649,10 @@ def update_system_config(
     """
     Update or Create a system setting.
     """
+    # Any key whose name starts with one of these prefixes is treated as numeric.
+    numeric_prefixes = ("pricing_", "state_permit_")
     pricing_keys = ["base_fare", "rate_per_km", "min_charge", "driver_acceptance_fee"]
-    if any(pk in key for pk in pricing_keys):
+    if key.startswith(numeric_prefixes) or any(pk in key for pk in pricing_keys):
         try:
             float(value)  # Try casting to ensure it's a number
         except ValueError:
