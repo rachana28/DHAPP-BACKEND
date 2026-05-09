@@ -39,6 +39,13 @@ from app.modules.service import (
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
 from app.modules.towing.tow_allocation import process_tow_tier_escalation
+from app.modules.trips.scheduler_jobs import (
+    generate_otp_for_trip_scheduler,
+    expire_otp_for_trip_scheduler,
+    auto_end_trip_scheduler,
+    driver_payment_timeout_scheduler,
+    daily_settlement_scheduler,
+)
 
 
 def run_scheduled_escalation_check():
@@ -92,6 +99,12 @@ async def lifespan(app: FastAPI):
     scheduler = AsyncIOScheduler()
     scheduler.add_job(run_scheduled_escalation_check, "interval", minutes=1)
     scheduler.add_job(run_scheduled_tow_escalation_check, "interval", minutes=1)
+    # Trip OTP / payment / billing automation
+    scheduler.add_job(generate_otp_for_trip_scheduler, "interval", minutes=1)
+    scheduler.add_job(expire_otp_for_trip_scheduler, "interval", minutes=5)
+    scheduler.add_job(auto_end_trip_scheduler, "interval", minutes=2)
+    scheduler.add_job(driver_payment_timeout_scheduler, "interval", minutes=1)
+    scheduler.add_job(daily_settlement_scheduler, "cron", hour=23, minute=59)
     scheduler.start()
     print("🚀 Scheduler started.")
 
