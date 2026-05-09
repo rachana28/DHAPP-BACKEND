@@ -25,6 +25,7 @@ from app.core.models import (
     UserPaymentRequest,
     BillPaymentRequest,
     MarkBillPaidRequest,
+    FareEstimateRequest,
     TripAttendance,
     TripBill,
     TripSettlement,
@@ -40,6 +41,10 @@ from app.modules.trips.otp_service import OTPService
 from app.modules.trips.payment_service import PaymentService, get_driver_acceptance_fee
 from app.modules.trips.trip_service import TripService
 from app.modules.trips.billing_service import BillingService
+from app.modules.trips.pricing_calculator import (
+    calculate_fare,
+    validate_pricing_inputs,
+)
 from app.utils.notifications import send_push_notification
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
@@ -47,11 +52,69 @@ router = APIRouter(prefix="/trips", tags=["Trips"])
 TIER_SIZE = 3  # Configurable: How many drivers per batch
 
 
+@router.post("/estimate-fare")
+def estimate_fare_for_booking(
+    fare_req: FareEstimateRequest,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """
+    Compute the bill BEFORE creating a trip. Same calculator runs on /book-request,
+    so the user always sees the exact amount they will be charged.
+
+    Returns:
+      {
+        "total": 3622.5,
+        "subtotal": 3450.0,
+        "tax": 172.5,
+        "currency": "INR",
+        "components": [{name, amount}, ...],
+        "meta": {hiring_type, num_days, hours_per_day, distance_km, is_night_booking, ...}
+      }
+    """
+    if not fare_req.vehicle_type:
+        raise HTTPException(400, "vehicle_type is required")
+
+    ok, err = validate_pricing_inputs(
+        hiring_type=fare_req.hiring_type,
+        distance_km=fare_req.distance_km,
+        start_lat=fare_req.start_lat,
+        start_lng=fare_req.start_lng,
+        end_lat=fare_req.end_lat,
+        end_lng=fare_req.end_lng,
+        end_location=fare_req.end_location,
+    )
+    if not ok:
+        raise HTTPException(400, err)
+
+    return calculate_fare(
+        session,
+        redis_client,
+        hiring_type=fare_req.hiring_type,
+        vehicle_type=fare_req.vehicle_type,
+        shift_details=fare_req.shift_details,
+        start_date=fare_req.start_date,
+        end_date=fare_req.end_date,
+        months=fare_req.months,
+        selected_days=fare_req.selected_days,
+        start_location=fare_req.start_location,
+        end_location=fare_req.end_location,
+        start_lat=fare_req.start_lat,
+        start_lng=fare_req.start_lng,
+        end_lat=fare_req.end_lat,
+        end_lng=fare_req.end_lng,
+        distance_km=fare_req.distance_km,
+        booking_time=fare_req.booking_time or datetime.utcnow(),
+    )
+
+
 @router.post("/book-request", response_model=TripSafe)
 def create_booking_request(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
     trip_in: TripCreate,
 ):
     """
@@ -120,6 +183,44 @@ def create_booking_request(
                 400, "start_date and end_date are required for this hiring type."
             )
     # --------------------------------------------------------
+
+    # ── Server-side fare calculation (authoritative — ignore any client-supplied fare) ──
+    ok, err = validate_pricing_inputs(
+        hiring_type=trip_data.get("hiring_type"),
+        distance_km=trip_data.get("distance_km"),
+        start_lat=trip_data.get("start_lat"),
+        start_lng=trip_data.get("start_lng"),
+        end_lat=trip_data.get("end_lat"),
+        end_lng=trip_data.get("end_lng"),
+        end_location=trip_data.get("end_location"),
+    )
+    if not ok:
+        raise HTTPException(400, err)
+
+    fare_dict = calculate_fare(
+        session,
+        redis_client,
+        hiring_type=trip_data.get("hiring_type"),
+        vehicle_type=trip_data.get("vehicle_type"),
+        shift_details=trip_data.get("shift_details"),
+        start_date=trip_data.get("start_date"),
+        end_date=trip_data.get("end_date"),
+        months=trip_data.get("months"),
+        selected_days=trip_data.get("selected_days"),
+        start_location=trip_data.get("start_location"),
+        end_location=trip_data.get("end_location"),
+        start_lat=trip_data.get("start_lat"),
+        start_lng=trip_data.get("start_lng"),
+        end_lat=trip_data.get("end_lat"),
+        end_lng=trip_data.get("end_lng"),
+        distance_km=trip_data.get("distance_km"),
+        booking_time=datetime.utcnow(),
+    )
+    trip_data["fare"] = fare_dict["total"]
+    trip_data["fare_breakdown"] = fare_dict
+    # Backfill resolved distance onto the Trip row so reports/refund logic see it.
+    if trip_data.get("distance_km") is None and fare_dict["meta"].get("distance_km"):
+        trip_data["distance_km"] = fare_dict["meta"]["distance_km"]
 
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"
