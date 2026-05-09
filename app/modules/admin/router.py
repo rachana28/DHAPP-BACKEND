@@ -649,7 +649,7 @@ def update_system_config(
     """
     Update or Create a system setting.
     """
-    pricing_keys = ["base_fare", "rate_per_km", "min_charge"]
+    pricing_keys = ["base_fare", "rate_per_km", "min_charge", "driver_acceptance_fee"]
     if any(pk in key for pk in pricing_keys):
         try:
             float(value)  # Try casting to ensure it's a number

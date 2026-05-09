@@ -484,6 +484,24 @@ class TripBase(SQLModel):
     status: str = "searching"
     booking_time: datetime = Field(default_factory=datetime.utcnow)
 
+    # NEW FIELDS FOR TRIP MANAGEMENT
+    trip_duration_hours: Optional[int] = None
+    payment_method: Optional[str] = None  # "trip_day", "advance_20", "full_payment"
+    scheduled_start_time: Optional[datetime] = None
+    scheduled_end_time: Optional[datetime] = None
+    actual_start_time: Optional[datetime] = None
+    actual_end_time: Optional[datetime] = None
+    driver_payment_status: str = "unpaid"  # unpaid, paid, skipped
+    driver_payment_amount: Optional[float] = None
+    driver_payment_due_date: Optional[datetime] = None
+    driver_accepted_at: Optional[datetime] = None  # When driver clicked accept
+    state_version: int = Field(default=1)  # For optimistic locking
+    timezone: Optional[str] = "Asia/Kolkata"  # Default to IST
+
+    # Pause flag: when True, OTP generation for the next shift is blocked until
+    # user clears all outstanding bills (used by trip_day payment method).
+    is_payment_blocked: bool = False
+
 
 class Trip(TripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -866,3 +884,269 @@ class UIBannerBase(SQLModel):
 
 class UIBanner(UIBannerBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True, index=True)
+
+
+# ============= NEW TRIP MANAGEMENT MODELS =============
+
+
+# --- OTP REGISTRY ---
+class OTPRegistry(SQLModel, table=True):
+    """
+    Single OTP per trip-day (Uber-style):
+    - User receives the OTP (push/SMS).
+    - User reads it out to the driver.
+    - Driver enters it in the driver app, which calls /verify-otp.
+    Uniqueness: one row per (trip_id, trip_date).
+    """
+
+    __table_args__ = (UniqueConstraint("trip_id", "trip_date", name="uq_otp_trip_day"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id", index=True)
+    trip_date: date = Field(index=True)
+    otp_hash: str  # SHA-256 hash of the plain OTP (DB fallback when Redis is down)
+    verified_at: Optional[datetime] = None  # Set when driver successfully verifies
+    verified_by_driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+    otp_expiry_at: datetime
+    valid_from: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    verification_attempts: int = 0
+    max_attempts: int = 3
+
+
+# --- PAYMENT TRANSACTIONS ---
+class PaymentTransaction(SQLModel, table=True):
+    """Tracks all payment transactions (user and driver)"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    user_id: Optional[uuid.UUID] = Field(default=None, foreign_key="user.id")
+    driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+
+    payer_type: str  # "user" or "driver"
+    payment_type: str  # "trip_day", "advance_20", "full_payment", "driver_acceptance"
+    amount: float
+    payment_status: str  # "pending", "success", "failed", "refunded"
+    payment_method: str  # "card", "wallet", "upi", etc (dummy for now)
+    gateway_transaction_id: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: Optional[datetime] = None
+    refund_at: Optional[datetime] = None
+    refund_amount: Optional[float] = None
+    refund_reason: Optional[str] = None
+
+
+# --- PRICING COMPONENTS (for detailed billing) ---
+class PricingComponentBreakdown(SQLModel, table=True):
+    """Itemized breakdown of charges for transparency"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    bill_id: Optional[int] = Field(default=None, foreign_key="tripbill.id")
+
+    component_name: str  # "Base Fare", "Vehicle Allowance", "Tax", "Discount", etc.
+    amount: float
+    percentage: Optional[float] = None
+    description: Optional[str] = None
+    trip_date: Optional[date] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# --- TRIP BILL ---
+class TripBill(SQLModel, table=True):
+    """Daily bill and final settlement"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    driver_id: int = Field(foreign_key="driver.id")
+
+    bill_type: str  # "daily_bill", "final_settlement"
+    bill_date: date
+
+    # Amounts
+    total_amount: float
+    amount_paid: float = 0.0
+    amount_due: float
+    discount_amount: Optional[float] = 0.0
+    discount_percentage: Optional[float] = None  # e.g., 5% for full payment
+
+    # State
+    is_generated: bool = False
+    is_paid: bool = False
+    paid_at: Optional[datetime] = None
+    paid_by: Optional[str] = None  # "user_online" | "driver_offline"
+    paid_by_driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+    payment_note: Optional[str] = None
+    due_date: Optional[datetime] = None
+
+    # Components stored as JSON: list of {"name": str, "amount": float, "percentage": float}
+    components: List[Dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+
+    notes: Optional[str] = None
+    generated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# --- TRIP ATTENDANCE ---
+class TripAttendance(SQLModel, table=True):
+    """Tracks daily attendance for trip shifts"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    trip_date: date
+
+    # Attendance status
+    status: str  # "present", "absent", "skipped_by_user", "skipped_by_driver"
+    marked_by: str  # "user", "driver", "system"
+
+    # OTP verification status
+    user_otp_verified: bool = False
+    driver_otp_verified: bool = False
+
+    # Timing
+    scheduled_start: datetime
+    actual_start: Optional[datetime] = None
+    scheduled_end: datetime
+    actual_end: Optional[datetime] = None
+
+    # Notes
+    skip_reason: Optional[str] = None
+    notes: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# --- TRIP SETTLEMENT ---
+class TripSettlement(SQLModel, table=True):
+    """Final settlement record for multi-day trips"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trip_id: int = Field(foreign_key="trip.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    driver_id: int = Field(foreign_key="driver.id")
+
+    # Settlement details
+    settlement_status: str  # "generated", "pending_user_approval", "approved", "paid"
+    total_trips: int
+    completed_trips: int
+    absent_trips: int
+    skipped_trips: int
+
+    # Financial details
+    total_earned: float
+    total_paid_upfront: float
+    remaining_due: float
+    refund_amount: float = 0.0
+
+    # Payment status
+    user_payment_status: str = "pending"  # pending, paid, refunded
+    driver_payment_status: str = "pending"  # pending, paid
+
+    settlement_date: date
+    due_date: Optional[date] = None
+    paid_at: Optional[datetime] = None
+    generated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ============= API REQUEST/RESPONSE MODELS =============
+
+
+class PaymentMethodSelect(SQLModel):
+    """User selects payment method at booking confirmation"""
+
+    payment_method: str  # "trip_day", "advance_20", "full_payment"
+
+
+class DriverAcceptanceRequest(SQLModel):
+    """Driver accepts or rejects trip"""
+
+    trip_id: int
+    action: str  # "accept" or "reject"
+
+
+class DriverPaymentRequest(SQLModel):
+    """Driver initiates payment to finalize trip"""
+
+    trip_id: int
+    amount: float
+    payment_method: Optional[str] = "card"
+
+
+class OTPGenerationRequest(SQLModel):
+    """Request OTP for trip"""
+
+    trip_id: int
+
+
+class OTPVerificationRequest(SQLModel):
+    """Driver verifies the trip-day OTP that the user shared verbally."""
+
+    trip_id: int
+    otp: str
+
+
+class TripSkipRequest(SQLModel):
+    """Skip a day's trip (mark as absent)"""
+
+    trip_id: int
+    trip_date: date
+    reason: Optional[str] = None
+
+
+class TripEndRequest(SQLModel):
+    """Driver ends trip"""
+
+    trip_id: int
+    actual_end_time: Optional[datetime] = None
+
+
+class UserPaymentRequest(SQLModel):
+    """User completes payment"""
+
+    trip_id: int
+    amount: float
+    payment_method: str = "card"
+
+
+class BillPaymentRequest(SQLModel):
+    """User pays a daily bill via the dummy gateway."""
+
+    payment_method: str = "card"  # card | upi | wallet (dummy)
+
+
+class MarkBillPaidRequest(SQLModel):
+    """Driver marks a daily bill as paid offline (cash collected from user)."""
+
+    note: Optional[str] = None
+
+
+class BillResponse(SQLModel):
+    """Response model for bill details"""
+
+    id: int
+    bill_type: str
+    bill_date: date
+    total_amount: float
+    amount_paid: float
+    amount_due: float
+    discount_percentage: Optional[float] = None
+    components: List[Dict[str, Any]]
+    is_paid: bool
+
+
+class SettlementResponse(SQLModel):
+    """Response model for final settlement"""
+
+    id: int
+    total_trips: int
+    completed_trips: int
+    total_earned: float
+    total_paid_upfront: float
+    remaining_due: float
+    settlement_date: date
+    user_payment_status: str
+    driver_payment_status: str
