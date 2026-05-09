@@ -1296,7 +1296,7 @@ def get_trip_summary(
         raise HTTPException(403, "Not authorized")
 
     trip_service = TripService()
-    summary = trip_service.get_trip_summary(session, trip_id)
+    summary = trip_service.get_trip_summary(session, trip_id, is_driver)
 
     if not summary:
         raise HTTPException(500, "Could not generate trip summary")

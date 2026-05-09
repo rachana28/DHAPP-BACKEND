@@ -407,7 +407,7 @@ class TripService:
             return False, f"Marking absent failed: {str(e)}"
 
     def get_trip_summary(
-        self, session: Session, trip_id: int
+        self, session: Session, trip_id: int, is_driver: bool
     ) -> Optional[Dict[str, Any]]:
         """
         Get comprehensive trip summary
@@ -446,7 +446,7 @@ class TripService:
                 )
             ).all()
 
-            return {
+            result = {
                 "trip_id": trip.id,
                 "status": trip.status,
                 "payment_method": trip.payment_method,
@@ -456,12 +456,18 @@ class TripService:
                 "present_days": present_count,
                 "absent_days": absent_count,
                 "total_user_paid": sum(p.amount for p in user_payments),
-                "total_driver_paid": sum(p.amount for p in driver_payments),
                 "scheduled_start": trip.scheduled_start_time,
                 "scheduled_end": trip.scheduled_end_time,
                 "actual_start": trip.actual_start_time,
                 "actual_end": trip.actual_end_time,
+                "fare": trip.fare,
+                "fare_breakdown": trip.fare_breakdown
             }
+            
+            if is_driver:
+                result["total_driver_paid"] = sum(p.amount for p in driver_payments)
+            
+            return result
 
         except Exception as e:
             return None
