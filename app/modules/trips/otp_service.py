@@ -1,11 +1,5 @@
 """
 OTP Service for Trip Management — Uber-style single-OTP flow.
-
-- ONE OTP is generated per (trip_id, trip_date).
-- The user receives it (push/SMS) and reads it out to the driver.
-- The driver enters it in the driver app, which calls /verify-otp.
-- Validity: trip_start - 15 min  ..  trip_start + 1h45min  (e.g. 2:45 PM-4:45 PM for a 3 PM trip).
-- Redis is the hot path; the SHA-256 hash on OTPRegistry is the fallback when Redis is down.
 """
 
 import hashlib
@@ -24,13 +18,12 @@ from app.core.models import OTPRegistry, Trip
 class OTPService:
     MAX_ATTEMPTS = 3
     OTP_LENGTH = 6
-    PRE_START_VALIDITY_MINUTES = 15
+    PRE_START_VALIDITY_MINUTES = 30
     POST_START_VALIDITY = timedelta(hours=1, minutes=45)
 
     def __init__(self, redis_client: Optional[redis.Redis]):
         self.redis = redis_client
 
-    # ---------- helpers ----------
     def _generate_otp(self) -> str:
         return "".join(secrets.choice("0123456789") for _ in range(self.OTP_LENGTH))
 
@@ -64,7 +57,6 @@ class OTPService:
         except redis.RedisError:
             return False
 
-    # ---------- public API ----------
     def generate_otp(
         self,
         session: Session,
@@ -72,13 +64,6 @@ class OTPService:
         trip_start_time: datetime,
         trip_date: Optional[date] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Generate (or fetch existing) OTP for the given trip-day.
-        Returns (plain_otp, error). Idempotent within the validity window.
-
-        The plain OTP is returned ONLY at generation time (so the user-facing
-        endpoint can deliver it). The DB stores only the hash.
-        """
         trip_date = trip_date or trip_start_time.date()
         now = now_ist()
         valid_from = trip_start_time - timedelta(
@@ -91,12 +76,10 @@ class OTPService:
 
         rkey = self._redis_key(trip_id, trip_date)
 
-        # 1. Idempotency via Redis (still inside validity window)
         existing = self._redis_get(rkey)
         if existing:
             return existing, None
 
-        # 2. Idempotency via DB row
         db_row = session.exec(
             select(OTPRegistry).where(
                 OTPRegistry.trip_id == trip_id,
@@ -107,18 +90,14 @@ class OTPService:
         if db_row and db_row.verified_at is not None:
             return None, "OTP already verified for this day"
 
-        # 3. Mint a new OTP
         plain = self._generate_otp()
         ttl = max(1, int((expiry_at - now).total_seconds()))
 
-        # Try to lock in Redis first (NX). If we lost a race, return the winner.
         if not self._redis_set(rkey, plain, ttl):
             existing = self._redis_get(rkey)
             if existing:
                 return existing, None
-            # Redis unavailable — proceed in DB-only mode
 
-        # 4. Persist hash in DB (replace stale row if any, e.g. after Redis flush)
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
@@ -168,9 +147,6 @@ class OTPService:
         otp_input: str,
         trip_date: Optional[date] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Driver enters the OTP the user told them. Hash-compared against the DB row.
-        """
         if trip_date is None:
             trip_date = today_ist()
 
@@ -218,7 +194,6 @@ class OTPService:
             remaining = max(0, self.MAX_ATTEMPTS - attempts - 1)
             return False, f"Invalid OTP. Attempts remaining: {remaining}"
 
-        # Success
         db_row.verified_at = now
         db_row.verified_by_driver_id = driver_id
         session.add(db_row)
