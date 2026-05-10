@@ -503,12 +503,24 @@ class PaymentService:
         return row is not None
 
     def unpause_trip_if_clear(self, session: Session, trip_id: int) -> None:
-        """If a trip's last unpaid bill was just cleared, lift the OTP-generation block."""
+        """If a trip's last unpaid bill was just cleared, lift the OTP-generation block.
+
+        Also re-arms OTP for trip_day multi-day trips: end-trip parks the trip
+        in `paused` while the daily bill is outstanding so the user app shows
+        payment UI instead of tomorrow's OTP screen. Once the bill clears we
+        flip status back to active_pending_otp so the next shift can proceed.
+        """
         if self.trip_has_unpaid_bills(session, trip_id):
             return
         trip = session.get(Trip, trip_id)
-        if trip and trip.is_payment_blocked:
+        if not trip:
+            return
+        if trip.is_payment_blocked:
             trip.is_payment_blocked = False
+            session.add(trip)
+        if trip.status == "paused":
+            trip.status = "active_pending_otp"
+            trip.state_version += 1
             session.add(trip)
 
     def process_refund(
