@@ -64,27 +64,39 @@ class BillingService:
                 # Simple pro-rata: daily_total = total / num_days
                 daily_total = trip.fare / num_days
 
-                # Scale each component proportionally
-                components = {}
-                if isinstance(trip.fare_breakdown, dict):
-                    for comp_name, comp_amount in trip.fare_breakdown.items():
-                        daily_amount = comp_amount / num_days if num_days > 0 else 0
-                        components[comp_name] = daily_amount
-                elif isinstance(trip.fare_breakdown, list):
-                    # If it's a list of dicts like [{name, amount}, ...]
-                    for comp in trip.fare_breakdown:
+                # fare_breakdown is the full dict produced by pricing_calculator
+                # (keys: total, subtotal, tax, currency, components, meta). The
+                # itemised component list lives at fare_breakdown["components"].
+                # Older rows may have stored the bare list directly.
+                breakdown = trip.fare_breakdown
+                comp_list = None
+                if isinstance(breakdown, dict):
+                    raw = breakdown.get("components")
+                    if isinstance(raw, list):
+                        comp_list = raw
+                elif isinstance(breakdown, list):
+                    comp_list = breakdown
+
+                components: Dict[str, float] = {}
+                if comp_list:
+                    for comp in comp_list:
                         if (
                             isinstance(comp, dict)
                             and "name" in comp
                             and "amount" in comp
                         ):
-                            daily_amount = (
-                                comp["amount"] / num_days if num_days > 0 else 0
-                            )
+                            try:
+                                amt = float(comp["amount"])
+                            except (TypeError, ValueError):
+                                continue
+                            daily_amount = amt / num_days if num_days > 0 else 0
                             components[comp["name"]] = daily_amount
 
-                # Ensure total matches (might have rounding)
-                total = sum(components.values())
+                # Fallback if component list was empty/unparseable: keep the
+                # daily total visible as a single line so the bill is never blank.
+                if not components:
+                    components["Base Fare"] = daily_total
+
                 return components, daily_total, None
 
             # Fallback if fare_breakdown is not populated (shouldn't happen with new engine)
