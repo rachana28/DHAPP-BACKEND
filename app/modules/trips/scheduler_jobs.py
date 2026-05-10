@@ -189,7 +189,7 @@ async def auto_end_trip_scheduler():
                     select(TripAttendance)
                     .where(
                         TripAttendance.trip_id == trip.id,
-                        TripAttendance.user_otp_verified == True,
+                        TripAttendance.user_otp_verified,
                         TripAttendance.status.in_(["scheduled", "paused_payment"]),
                     )
                     .order_by(TripAttendance.trip_date.desc())
@@ -241,6 +241,16 @@ async def auto_end_trip_scheduler():
 
                     if not bill_success and bill_id:
                         bill_success = True
+
+                    if not has_future_shifts:
+                        try:
+                            billing_service.generate_final_settlement(
+                                session, trip.id
+                            )
+                        except Exception as settle_err:
+                            logger.warning(
+                                f"Inline settlement generation failed for trip {trip.id}: {settle_err}"
+                            )
 
                     if not bill_success:
                         logger.warning(

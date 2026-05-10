@@ -33,7 +33,14 @@ class TripService:
         "payment_in_progress": ["active_pending_otp", "payment_failed"],
         "payment_failed": ["searching", "cancelled"],
         "rejected": ["searching", "cancelled"],
-        "active_pending_otp": ["active", "otp_expired", "cancelled"],
+        # active_pending_otp → skipped/completed lets a skipped final shift wrap the trip up
+        "active_pending_otp": [
+            "active",
+            "otp_expired",
+            "cancelled",
+            "skipped",
+            "completed",
+        ],
         "active": ["ongoing", "skipped", "cancelled_by_user", "cancelled_by_driver"],
         # ongoing → active_pending_otp lets multi-day trips re-arm OTP for the next shift day
         "ongoing": ["completed", "auto_completed", "paused", "active_pending_otp"],
@@ -305,6 +312,20 @@ class TripService:
 
             if not attendance:
                 return False, f"Attendance record not found for {trip_date}"
+
+            if attendance.status not in ("scheduled", "paused_payment"):
+                return (
+                    False,
+                    f"Cannot skip day with status '{attendance.status}'.",
+                )
+
+            # Block skipping a shift that has already physically started.
+            # End-trip is the correct path once OTP has been verified.
+            if attendance.user_otp_verified or attendance.driver_otp_verified:
+                return (
+                    False,
+                    "Cannot skip a day that has already started. Use end-trip instead.",
+                )
 
             status = f"skipped_by_{marked_by}"
             attendance.status = status

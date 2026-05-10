@@ -880,6 +880,29 @@ def skip_trip_day(
             raise HTTPException(403, "Not authorized")
         marked_by = "driver"
 
+    today = today_ist()
+
+    # Cannot skip a past day.
+    if skip_req.trip_date < today:
+        raise HTTPException(400, "Cannot skip a past trip day.")
+
+    # Skip is a same-day action. To drop a future day, use the cancellation
+    # flow — preventing users/drivers from pre-emptively voiding shifts that
+    # are still days away (e.g. tomorrow's shift right after today's ended).
+    if skip_req.trip_date != today:
+        raise HTTPException(
+            400,
+            "Skip is only allowed for today's shift. To remove a future day, cancel the trip.",
+        )
+
+    # Driver-only restriction: once a shift is in progress (OTP verified, trip
+    # ongoing) the correct action is end-trip, not skip.
+    if not is_user and trip.status == "ongoing":
+        raise HTTPException(
+            400,
+            "Trip is already in progress. End the trip instead of skipping the day.",
+        )
+
     trip_service = TripService()
     success, error = trip_service.mark_trip_day_absent(
         session, trip_id, skip_req.trip_date, skip_req.reason, marked_by
@@ -888,10 +911,27 @@ def skip_trip_day(
     if not success:
         raise HTTPException(400, error)
 
+    # If that was the last unfinished shift, generate the final settlement
+    # immediately so the user has something to pay against without waiting
+    # for the daily settlement scheduler.
+    settlement_id = None
+    pending = session.exec(
+        select(TripAttendance).where(
+            TripAttendance.trip_id == trip_id,
+            TripAttendance.status.in_(["scheduled", "paused_payment"]),
+        )
+    ).first()
+    if not pending:
+        billing_service = BillingService()
+        ok, sid, _ = billing_service.generate_final_settlement(session, trip_id)
+        if ok or sid:
+            settlement_id = sid
+
     return {
         "message": f"Day {skip_req.trip_date} marked as absent by {marked_by}",
         "trip_id": trip_id,
         "trip_date": skip_req.trip_date.isoformat(),
+        "settlement_id": settlement_id,
     }
 
 
@@ -1003,6 +1043,36 @@ def driver_end_trip(
         except Exception:
             pass
 
+    # On the last shift, generate the final settlement inline so the user
+    # has a payable record immediately (advance_20 / full_payment leftover
+    # balance, or a zero-due close-out for trip_day). Without this the
+    # frontend would have to wait for daily_settlement_scheduler to fire.
+    settlement_id = None
+    if not has_future_shifts:
+        ok, sid, _ = billing_service.generate_final_settlement(session, trip_id)
+        if ok or sid:
+            settlement_id = sid
+            try:
+                settlement = session.get(TripSettlement, sid) if sid else None
+                if settlement and settlement.remaining_due > 0:
+                    send_push_notification(
+                        session=session,
+                        user_ids=[trip.user_id],
+                        title="Final settlement ready",
+                        body=(
+                            f"Trip #{trip_id} settlement is ready. "
+                            f"Amount due: ₹{settlement.remaining_due:.2f}."
+                        ),
+                        data={
+                            "type": "settlement_generated",
+                            "trip_id": trip_id,
+                            "settlement_id": sid,
+                            "amount": settlement.remaining_due,
+                        },
+                    )
+            except Exception:
+                pass
+
     return {
         "message": "Trip ended successfully",
         "trip_id": trip_id,
@@ -1013,6 +1083,7 @@ def driver_end_trip(
         "more_days_remaining": has_future_shifts,
         "bill_generated": bill_success,
         "bill_id": bill_id,
+        "settlement_id": settlement_id,
     }
 
 
@@ -1144,7 +1215,7 @@ def list_trip_bills(
         TripBill.bill_type == "daily_bill",
     )
     if only_unpaid:
-        stmt = stmt.where(not TripBill.is_paid)
+        stmt = stmt.where(TripBill.is_paid == False)  # noqa: E712 (SQL boolean cmp)
     return session.exec(stmt.order_by(TripBill.bill_date)).all()
 
 
@@ -1335,7 +1406,8 @@ def pay_trip_settlement(
     # Optional backend cleanup: mark all associated unpaid daily bills as paid
     unpaid_bills = session.exec(
         select(TripBill).where(
-            TripBill.trip_id == settlement.trip_id, not TripBill.is_paid
+            TripBill.trip_id == settlement.trip_id,
+            TripBill.is_paid == False,  # noqa: E712 (SQL boolean cmp)
         )
     ).all()
     for bill in unpaid_bills:
