@@ -597,31 +597,35 @@ def driver_process_payment(
 
     # Generate schedules upon successful driver payment and fast track to active_pending_otp
     if trip.start_date:
-        duration_hours = trip_service.get_trip_duration_hours(trip.shift_details)
-        trip_start_time = trip_service.get_trip_start_time(
+        duration_hours = (
+            trip_service.get_trip_duration_hours(trip.shift_details)
+            or trip.trip_duration_hours
+            or 8
+        )
+
+        parsed_time = trip_service.get_trip_start_time(
             trip.shift_details, trip.start_date
         )
 
-        if trip_start_time:
-            trip.scheduled_start_time = trip_start_time
-            trip.scheduled_end_time = (
-                trip_start_time + timedelta(hours=duration_hours)
-                if duration_hours
-                else None
-            )
+        effective_start_dt = (
+            parsed_time
+            or trip.scheduled_start_time
+            or datetime.combine(trip.start_date, datetime.min.time())
+        )
+
+        if parsed_time and not trip.scheduled_start_time:
+            trip.scheduled_start_time = parsed_time
+            trip.scheduled_end_time = parsed_time + timedelta(hours=duration_hours)
             trip.trip_duration_hours = duration_hours
 
         end_date_for_attendance = trip.end_date or trip.start_date
-        effective_start_dt = trip_start_time or datetime.combine(
-            trip.start_date, datetime.min.time()
-        )
         att_ok, att_err = trip_service.create_trip_attendance_records(
             session,
             trip_id,
             trip.start_date,
             end_date_for_attendance,
             effective_start_dt,
-            duration_hours or 8,
+            duration_hours,
             selected_days=trip.selected_days,
         )
         if not att_ok:
@@ -677,15 +681,16 @@ def request_otp_for_trip(
             "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
         )
 
-    attendances = session.exec(
+    attendances_raw = session.exec(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
-            not TripAttendance.user_otp_verified,
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date)
     ).all()
+
+    attendances = [att for att in attendances_raw if not att.user_otp_verified]
 
     valid_attendance = None
     now = now_ist()
@@ -779,15 +784,16 @@ def verify_otp_for_trip(
             400, f"Trip status is {trip.status}, OTP verification not allowed"
         )
 
-    attendances = session.exec(
+    attendances_raw = session.exec(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
-            not TripAttendance.user_otp_verified,
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date)
     ).all()
+
+    attendances = [att for att in attendances_raw if not att.user_otp_verified]
 
     valid_attendance = None
     now = now_ist()
@@ -913,22 +919,25 @@ def driver_end_trip(
     if trip.status != "ongoing":
         raise HTTPException(400, f"Trip status is {trip.status}, cannot end now")
 
-    active_attendance = session.exec(
+    active_attendances_raw = session.exec(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
-            TripAttendance.user_otp_verified,
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date.desc())
-    ).first()
+    ).all()
+
+    active_attendance = next(
+        (att for att in active_attendances_raw if att.user_otp_verified), None
+    )
 
     if not active_attendance:
         raise HTTPException(400, "Could not find the active shift to end.")
 
     shift_date = active_attendance.trip_date
 
-    next_attendance = session.exec(
+    next_attendances_raw = session.exec(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
@@ -936,8 +945,11 @@ def driver_end_trip(
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date)
-    ).first()
+    ).all()
 
+    next_attendance = next(
+        (att for att in next_attendances_raw if not att.user_otp_verified), None
+    )
     has_future_shifts = next_attendance is not None
 
     trip_service = TripService()

@@ -5,6 +5,7 @@ Trip Service for managing trip lifecycle and state machine
 from datetime import datetime, timedelta, date
 from typing import Optional, Tuple, Dict, Any
 from sqlmodel import Session, select
+import re
 
 from app.core.models import (
     Trip,
@@ -97,12 +98,11 @@ class TripService:
             return None
 
         try:
-            parts = shift_details.split()
-            for i, part in enumerate(parts):
-                if part.lower() == "hours":
-                    return int(parts[i - 1])
-        except (ValueError, IndexError):
-            return None
+            match = re.search(r"(\d+)\s*Hour", shift_details, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        except Exception:
+            pass
 
         return None
 
@@ -113,16 +113,25 @@ class TripService:
             return None
 
         try:
-            start_idx = shift_details.find("(") + 1
-            end_idx = shift_details.find(")")
-            time_str = shift_details[start_idx:end_idx]  # "15:00"
+            match = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?", shift_details)
+            if match:
+                hour = int(match.group(1))
+                minute = int(match.group(2))
+                meridiem = match.group(3)
 
-            hour, minute = map(int, time_str.split(":"))
-            return datetime.combine(
-                trip_date, datetime.min.time().replace(hour=hour, minute=minute)
-            )
-        except (ValueError, AttributeError):
-            return None
+                if meridiem:
+                    if meridiem.lower() == "pm" and hour < 12:
+                        hour += 12
+                    elif meridiem.lower() == "am" and hour == 12:
+                        hour = 0
+
+                return datetime.combine(
+                    trip_date, datetime.min.time().replace(hour=hour, minute=minute)
+                )
+        except Exception:
+            pass
+
+        return None
 
     _DAY_TOKEN_MAP = {
         "mon": 0,
