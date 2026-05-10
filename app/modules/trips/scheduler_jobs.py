@@ -325,35 +325,46 @@ async def driver_payment_timeout_scheduler():
             ).all()
 
             for trip in trips:
+                # Re-fetch with a row lock and re-check status: the driver
+                # may have just paid in /process-payment, or the user may
+                # have just cancelled, between the bulk select above and now.
+                locked_trip = session.exec(
+                    select(Trip).where(Trip.id == trip.id).with_for_update()
+                ).first()
+                if not locked_trip or locked_trip.status != "accepted_pending_payment":
+                    continue
+
                 payment_check = session.exec(
                     select(PaymentTransaction).where(
-                        PaymentTransaction.trip_id == trip.id,
-                        PaymentTransaction.driver_id == trip.driver_id,
+                        PaymentTransaction.trip_id == locked_trip.id,
+                        PaymentTransaction.driver_id == locked_trip.driver_id,
                         PaymentTransaction.payment_status == "success",
                     )
                 ).first()
 
                 if payment_check:
                     logger.info(
-                        f"Driver payment found for trip {trip.id}, skipping auto-reject"
+                        f"Driver payment found for trip {locked_trip.id}, skipping auto-reject"
                     )
+                    session.commit()  # release the row lock
                     continue
 
                 success, error = trip_service.transition_trip_state(
-                    session, trip.id, "searching", validate=True
+                    session, locked_trip.id, "searching", validate=True
                 )
 
                 if success:
-                    trip.driver_id = None
-                    trip.driver_payment_status = "unpaid"
-                    session.add(trip)
+                    locked_trip.driver_id = None
+                    locked_trip.driver_payment_status = "unpaid"
+                    session.add(locked_trip)
                     session.commit()
 
                     logger.info(
-                        f"Trip {trip.id} auto-rejected due to driver payment timeout; back to searching"
+                        f"Trip {locked_trip.id} auto-rejected due to driver payment timeout; back to searching"
                     )
                 else:
-                    logger.error(f"Failed to auto-reject trip {trip.id}: {error}")
+                    session.commit()  # release the row lock
+                    logger.error(f"Failed to auto-reject trip {locked_trip.id}: {error}")
 
     except Exception as e:
         logger.error(f"Driver payment timeout scheduler failed: {str(e)}")
