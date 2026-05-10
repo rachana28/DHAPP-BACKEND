@@ -75,16 +75,6 @@ async def generate_otp_for_trip_scheduler():
                         att.marked_by = "system"
                         session.add(att)
                     session.commit()
-                    try:
-                        send_push_notification(
-                            session=session,
-                            user_ids=[trip.user_id],
-                            title="Today's trip paused",
-                            body="Settle your unpaid bills to resume your trips.",
-                            data={"type": "trip_paused_payment", "trip_id": trip.id},
-                        )
-                    except Exception:
-                        pass
                     continue
 
                 existing = session.exec(
@@ -241,6 +231,20 @@ async def auto_end_trip_scheduler():
 
                     if not bill_success and bill_id:
                         bill_success = True
+
+                    # trip_day + future shifts with an unpaid bill: hold the
+                    # trip in `paused` so the user app surfaces the payment
+                    # screen instead of jumping to tomorrow's OTP screen.
+                    # Cleared by PaymentService.unpause_trip_if_clear once
+                    # the bill is paid.
+                    if has_future_shifts and trip.payment_method == "trip_day":
+                        payment_service = PaymentService(get_redis())
+                        if payment_service.trip_has_unpaid_bills(session, trip.id):
+                            trip.status = "paused"
+                            trip.is_payment_blocked = True
+                            trip.state_version += 1
+                            session.add(trip)
+                            session.commit()
 
                     if not has_future_shifts:
                         try:

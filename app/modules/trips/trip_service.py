@@ -44,7 +44,9 @@ class TripService:
         "active": ["ongoing", "skipped", "cancelled_by_user", "cancelled_by_driver"],
         # ongoing → active_pending_otp lets multi-day trips re-arm OTP for the next shift day
         "ongoing": ["completed", "auto_completed", "paused", "active_pending_otp"],
-        "paused": ["ongoing", "completed"],
+        # paused → active_pending_otp re-arms the next shift's OTP after a
+        # trip_day user clears the outstanding daily bill that held the trip.
+        "paused": ["ongoing", "completed", "active_pending_otp"],
         "completed": ["billed", "active_pending_otp"],
         "auto_completed": ["billed", "active_pending_otp"],
         "billed": ["settled"],

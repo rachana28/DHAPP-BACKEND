@@ -1043,6 +1043,20 @@ def driver_end_trip(
         except Exception:
             pass
 
+    # trip_day + future shifts: do NOT leave the trip in active_pending_otp
+    # while today's daily bill is unpaid. Otherwise the user app loads
+    # tomorrow's OTP screen and the bill-payment UI disappears. Hold the
+    # trip in `paused` until /bill/{id}/pay clears the unpaid bill, at which
+    # point unpause_trip_if_clear flips it back to active_pending_otp.
+    if has_future_shifts and trip.payment_method == "trip_day":
+        payment_service = PaymentService(redis_client)
+        if payment_service.trip_has_unpaid_bills(session, trip_id):
+            trip.status = "paused"
+            trip.is_payment_blocked = True
+            trip.state_version += 1
+            session.add(trip)
+            session.commit()
+
     # On the last shift, generate the final settlement inline so the user
     # has a payable record immediately (advance_20 / full_payment leftover
     # balance, or a zero-due close-out for trip_day). Without this the
