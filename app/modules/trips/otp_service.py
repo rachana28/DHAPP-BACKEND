@@ -11,6 +11,8 @@ OTP Service for Trip Management — Uber-style single-OTP flow.
 import hashlib
 import secrets
 from datetime import date, datetime, timedelta
+
+from app.utils.time_utils import now_ist, today_ist
 from typing import Optional, Tuple
 
 import redis
@@ -78,7 +80,7 @@ class OTPService:
         endpoint can deliver it). The DB stores only the hash.
         """
         trip_date = trip_date or trip_start_time.date()
-        now = datetime.utcnow()
+        now = now_ist()
         valid_from = trip_start_time - timedelta(
             minutes=self.PRE_START_VALIDITY_MINUTES
         )
@@ -170,7 +172,7 @@ class OTPService:
         Driver enters the OTP the user told them. Hash-compared against the DB row.
         """
         if trip_date is None:
-            trip_date = date.today()
+            trip_date = today_ist()
 
         attempts_key = self._attempts_key(trip_id, trip_date, str(driver_id))
         if self.redis:
@@ -194,7 +196,7 @@ class OTPService:
         if not db_row:
             return False, "OTP not generated yet"
 
-        now = datetime.utcnow()
+        now = now_ist()
         if db_row.valid_from and now < db_row.valid_from:
             return False, "OTP not yet valid"
         if now > db_row.otp_expiry_at:
@@ -235,7 +237,7 @@ class OTPService:
         self, session: Session, trip_id: int, trip_date: Optional[date] = None
     ) -> bool:
         if trip_date is None:
-            trip_date = date.today()
+            trip_date = today_ist()
         row = session.exec(
             select(OTPRegistry).where(
                 OTPRegistry.trip_id == trip_id,
@@ -256,7 +258,7 @@ class OTPService:
         self, session: Session, trip_id: int, trip_date: Optional[date] = None
     ) -> Optional[datetime]:
         if trip_date is None:
-            trip_date = date.today()
+            trip_date = today_ist()
         row = session.exec(
             select(OTPRegistry).where(
                 OTPRegistry.trip_id == trip_id,

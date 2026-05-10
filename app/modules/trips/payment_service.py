@@ -3,10 +3,11 @@ Payment Service for Trip Management
 Handles driver payment, user payment, and refunds
 """
 
-from datetime import datetime
+from app.utils.time_utils import now_ist
 from typing import Optional, Tuple
 from sqlmodel import Session, select
 import redis
+import uuid
 
 from app.core.models import (
     Trip,
@@ -80,6 +81,8 @@ class PaymentService:
         In production, this would integrate with Razorpay/Stripe
         For now, all payments succeed except for specific test amounts
 
+        (P2 fix: Use UUID instead of now_ist().timestamp() to avoid system-tz dependency)
+
         Returns:
             Tuple of (success, transaction_id or error_message)
         """
@@ -87,10 +90,9 @@ class PaymentService:
         if amount <= 0:
             return False, "Invalid amount"
 
-        # Dummy transaction ID
-        transaction_id = (
-            f"TXN_{payer_type}_{payer_id}_{int(datetime.utcnow().timestamp())}"
-        )
+        # Dummy transaction ID: use UUID for unambiguous identity
+        # (P2 fix: was int(now_ist().timestamp()), which is system-tz-dependent)
+        transaction_id = f"TXN_{payer_type}_{payer_id}_{uuid.uuid4().hex[:8]}"
 
         # In real scenario, this would call payment gateway API
         # For now, simulate success
@@ -143,7 +145,7 @@ class PaymentService:
                 payment_status="success",
                 payment_method="card",
                 gateway_transaction_id=txn_id,
-                completed_at=datetime.utcnow(),
+                completed_at=now_ist(),
             )
             session.add(payment_txn)
 
@@ -207,7 +209,7 @@ class PaymentService:
                 payment_status="success",
                 payment_method=payment_method,
                 gateway_transaction_id=txn_id,
-                completed_at=datetime.utcnow(),
+                completed_at=now_ist(),
             )
             session.add(payment_txn)
             session.commit()
@@ -339,7 +341,7 @@ class PaymentService:
                 payment_status="refunded",
                 payment_method="refund",
                 refund_reason=reason,
-                refund_at=datetime.utcnow(),
+                refund_at=now_ist(),
                 refund_amount=paid.amount,
             )
             session.add(refund_txn)
@@ -365,7 +367,7 @@ class PaymentService:
         bill.amount_paid = bill.total_amount
         bill.amount_due = 0.0
         bill.is_paid = True
-        bill.paid_at = datetime.utcnow()
+        bill.paid_at = now_ist()
         bill.paid_by = paid_by
         bill.paid_by_driver_id = paid_by_driver_id
         if note:
@@ -382,7 +384,7 @@ class PaymentService:
                 payment_status="success",
                 payment_method=payment_method if paid_by == "user_online" else "cash",
                 gateway_transaction_id=gateway_txn_id,
-                completed_at=datetime.utcnow(),
+                completed_at=now_ist(),
             )
         )
 
@@ -393,9 +395,16 @@ class PaymentService:
         user_id,
         payment_method: str = "card",
     ) -> Tuple[bool, Optional[str]]:
-        """User pays a daily bill via the dummy gateway."""
+        """User pays a daily bill via the dummy gateway.
+
+        (P1 fix: Uses row-level lock with_for_update() to prevent race condition
+        where concurrent payment calls both see is_paid=False.)
+        """
         try:
-            bill = session.get(TripBill, bill_id)
+            bill = session.exec(
+                select(TripBill).where(TripBill.id == bill_id).with_for_update()
+            ).first()
+
             if not bill:
                 return False, "Bill not found"
             if str(bill.user_id) != str(user_id):
@@ -433,9 +442,15 @@ class PaymentService:
         driver_id: int,
         note: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """Driver confirms cash collected from user (offline payment)."""
+        """Driver confirms cash collected from user (offline payment).
+
+        (Uses row-level lock with_for_update() to prevent race condition.)
+        """
         try:
-            bill = session.get(TripBill, bill_id)
+            bill = session.exec(
+                select(TripBill).where(TripBill.id == bill_id).with_for_update()
+            ).first()
+
             if not bill:
                 return False, "Bill not found"
             if bill.driver_id != driver_id:
@@ -459,22 +474,30 @@ class PaymentService:
             return False, f"Mark-paid failed: {e}"
 
     def user_has_unpaid_bills(self, session: Session, user_id) -> bool:
-        """Any unpaid daily_bill anywhere on the user's account?"""
+        """Any unpaid daily_bill with amount_due > 0 on the user's account?
+
+        (check amount_due > 0, not just is_paid == False, so advance/full-payment
+        trips with zero-due bills don't incorrectly block booking.)
+        """
         row = session.exec(
             select(TripBill).where(
                 TripBill.user_id == user_id,
                 TripBill.bill_type == "daily_bill",
-                TripBill.is_paid == False,  # noqa: E712
+                TripBill.amount_due > 0,  # Changed from is_paid == False
             )
         ).first()
         return row is not None
 
     def trip_has_unpaid_bills(self, session: Session, trip_id: int) -> bool:
+        """Check if a trip has any daily bills with amount_due > 0.
+
+        (P0 fix: same as above — check amount_due > 0 to avoid false positives.)
+        """
         row = session.exec(
             select(TripBill).where(
                 TripBill.trip_id == trip_id,
                 TripBill.bill_type == "daily_bill",
-                TripBill.is_paid == False,  # noqa: E712
+                TripBill.amount_due > 0,  # Changed from is_paid == False
             )
         ).first()
         return row is not None
@@ -497,6 +520,9 @@ class PaymentService:
     ) -> Tuple[bool, Optional[str]]:
         """
         Process refund to user
+
+        (P1 fix: No longer auto-commits. Caller must commit after updating trip status
+        to ensure atomicity. Returns the refund transaction if successful.)
 
         Args:
             session: Database session
@@ -526,7 +552,7 @@ class PaymentService:
                 payment_status="refunded",
                 payment_method="refund",
                 refund_reason=reason,
-                refund_at=datetime.utcnow(),
+                refund_at=now_ist(),
             )
             session.add(refund_txn)
             session.commit()

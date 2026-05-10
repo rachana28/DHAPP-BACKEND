@@ -2,6 +2,7 @@ from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
 from app.core.models import Driver, Trip, TripOffer
+from app.utils.time_utils import now_ist
 
 
 def get_driver_score(
@@ -21,7 +22,7 @@ def get_driver_score(
 
     # 2. Recency Bonus (Up to 40 points)
     if last_trip_time:
-        hours_since_last = (datetime.utcnow() - last_trip_time).total_seconds() / 3600
+        hours_since_last = (now_ist() - last_trip_time).total_seconds() / 3600
 
         if hours_since_last > 168:  # > 1 week
             score += 40
@@ -118,7 +119,7 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
 
     # 2. Check Conditions
     # Condition A: Time Threshold (10 mins)
-    if (datetime.utcnow() - latest_offer.created_at) > timedelta(minutes=10):
+    if (now_ist() - latest_offer.created_at) > timedelta(minutes=10):
         should_escalate = True
 
     # Condition B: All rejected/processed in current tier

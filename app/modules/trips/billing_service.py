@@ -3,6 +3,8 @@ Billing and Settlement Service for Trip Management
 """
 
 from datetime import date
+
+from app.utils.time_utils import today_ist, now_ist
 from typing import Optional, Tuple, Dict, Any
 from sqlmodel import Session, select
 
@@ -26,13 +28,19 @@ class BillingService:
         self, session: Session, trip_id: int, trip_date: date
     ) -> Tuple[Dict[str, float], float, Optional[str]]:
         """
-        Calculate billing components for a specific day
+        Calculate billing components for a specific day.
+
+        (Derives from trip.fare_breakdown instead of hardcoded assumptions)
+
+        For multi-day trips:
+          - trip.fare is the TOTAL for all days
+          - trip.fare_breakdown contains the per-component split (e.g., Driver Allowance (N days), ...)
+          - daily_total = trip.fare / num_days (from attendance count)
 
         Components:
-        - Base fare
-        - Vehicle allowance
-        - Taxes
-        - Discounts
+        - Base fare (prorated daily)
+        - Vehicle allowance (prorated daily)
+        - Taxes (prorated daily)
 
         Returns:
             Tuple of (components_dict, total_amount, error_message)
@@ -42,38 +50,50 @@ class BillingService:
             if not trip:
                 return {}, 0.0, "Trip not found"
 
-            # Get trip details
-            driver = session.get(Driver, trip.driver_id)
-            if not driver:
-                return {}, 0.0, "Driver not found"
+            # Get all attendance records for this trip to calculate per-day amount
+            attendances = session.exec(
+                select(TripAttendance).where(TripAttendance.trip_id == trip_id)
+            ).all()
 
-            components = {}
-            total = 0.0
+            num_days = len(attendances)
+            if num_days == 0:
+                return {}, 0.0, "No attendance records found for trip"
 
-            # Base fare calculation
+            # If trip.fare and fare_breakdown exist, derive daily components
+            if trip.fare and trip.fare_breakdown:
+                # Simple pro-rata: daily_total = total / num_days
+                daily_total = trip.fare / num_days
+
+                # Scale each component proportionally
+                components = {}
+                if isinstance(trip.fare_breakdown, dict):
+                    for comp_name, comp_amount in trip.fare_breakdown.items():
+                        daily_amount = comp_amount / num_days if num_days > 0 else 0
+                        components[comp_name] = daily_amount
+                elif isinstance(trip.fare_breakdown, list):
+                    # If it's a list of dicts like [{name, amount}, ...]
+                    for comp in trip.fare_breakdown:
+                        if (
+                            isinstance(comp, dict)
+                            and "name" in comp
+                            and "amount" in comp
+                        ):
+                            daily_amount = (
+                                comp["amount"] / num_days if num_days > 0 else 0
+                            )
+                            components[comp["name"]] = daily_amount
+
+                # Ensure total matches (might have rounding)
+                total = sum(components.values())
+                return components, daily_total, None
+
+            # Fallback if fare_breakdown is not populated (shouldn't happen with new engine)
             if trip.fare:
-                daily_fare = trip.fare
-                components["Base Fare"] = daily_fare
-                total += daily_fare
+                daily_fare = trip.fare / num_days
+                components = {"Base Fare": daily_fare}
+                return components, daily_fare, None
 
-            # Vehicle allowance
-            if driver.driver_allowance:
-                components["Vehicle Allowance"] = driver.driver_allowance
-                total += driver.driver_allowance
-
-            # Fare per KM (if applicable)
-            if driver.fare_per_km:
-                # Assuming 50 KM per day (dummy)
-                km_charge = driver.fare_per_km * 50
-                components["Distance Charges"] = km_charge
-                total += km_charge
-
-            # Taxes (assume 5% GST)
-            tax = total * 0.05
-            components["Tax (5%)"] = tax
-            total += tax
-
-            return components, total, None
+            return {}, 0.0, "Trip fare not calculated"
 
         except Exception as e:
             return {}, 0.0, f"Bill calculation failed: {str(e)}"
@@ -83,6 +103,9 @@ class BillingService:
     ) -> Tuple[bool, Optional[int], Optional[str]]:
         """
         Generate a daily bill for a trip day
+
+        (auto-mark bill is_paid=True when amount_due == 0 at generation time,
+        so advance_20 and full_payment upfront payments don't create unpaid bills.)
 
         Returns:
             Tuple of (success, bill_id, error_message)
@@ -124,6 +147,8 @@ class BillingService:
             amount_paid = sum(p.amount for p in existing_payments)
             amount_due = max(0, total_amount - amount_paid)
 
+            is_paid = amount_due == 0
+
             # Build the JSON-friendly components list (uniform schema across the system)
             components_list = [
                 {
@@ -146,6 +171,8 @@ class BillingService:
                 total_amount=total_amount,
                 amount_paid=amount_paid,
                 amount_due=amount_due,
+                is_paid=is_paid,
+                paid_at=now_ist() if is_paid else None,  # Also set paid_at if auto-paid
                 is_generated=True,
                 components=components_list,
             )
@@ -262,7 +289,7 @@ class BillingService:
                 remaining_due=remaining_due,
                 user_payment_status="pending" if remaining_due > 0 else "paid",
                 driver_payment_status="paid",
-                settlement_date=date.today(),
+                settlement_date=today_ist(),
             )
             session.add(settlement)
             session.commit()

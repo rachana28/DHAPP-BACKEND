@@ -45,6 +45,7 @@ from app.modules.trips.pricing_calculator import (
     calculate_fare,
     validate_pricing_inputs,
 )
+from app.utils.time_utils import now_ist, today_ist, to_ist_naive
 from app.utils.notifications import send_push_notification
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
@@ -105,7 +106,7 @@ def estimate_fare_for_booking(
         end_lat=fare_req.end_lat,
         end_lng=fare_req.end_lng,
         distance_km=fare_req.distance_km,
-        booking_time=fare_req.booking_time or datetime.utcnow(),
+        booking_time=to_ist_naive(fare_req.booking_time) or now_ist(),
     )
 
 
@@ -160,7 +161,7 @@ def create_booking_request(
     # --- Calculate Dates for Monthly Bookings ---
     if trip_data.get("hiring_type") == "Monthly":
         if not trip_data.get("start_date") or not trip_data.get("end_date"):
-            today = date.today()
+            today = today_ist()
             # Start date is the 1st of the current month
             start_date = today.replace(day=1)
             months_count = trip_data.get("months") or 1
@@ -214,7 +215,7 @@ def create_booking_request(
         end_lat=trip_data.get("end_lat"),
         end_lng=trip_data.get("end_lng"),
         distance_km=trip_data.get("distance_km"),
-        booking_time=datetime.utcnow(),
+        booking_time=now_ist(),
     )
     trip_data["fare"] = fare_dict["total"]
     trip_data["fare_breakdown"] = fare_dict
@@ -641,7 +642,7 @@ def driver_accept_and_initiate_payment(
         trip.driver_id = driver.id
         trip.status = "accepted_pending_payment"
         trip.driver_accepted_at = (
-            datetime.utcnow()
+            now_ist()
         )  # Use dedicated field; preserve booking_time
 
         # Store timer in Redis (30 min to pay)
@@ -656,7 +657,7 @@ def driver_accept_and_initiate_payment(
             "trip_id": trip_id,
             "payment_required": get_driver_acceptance_fee(session, redis_client),
             "timer_seconds": 1800,
-            "payment_deadline": (datetime.utcnow() + timedelta(minutes=30)).isoformat(),
+            "payment_deadline": (now_ist() + timedelta(minutes=30)).isoformat(),
         }
 
     else:
@@ -877,7 +878,7 @@ def request_otp_for_trip(
         )
 
     # Build today's start datetime (carry over time-of-day from scheduled_start_time)
-    trip_day = date.today()
+    trip_day = today_ist()
     trip_start_for_day = trip.scheduled_start_time.replace(
         year=trip_day.year, month=trip_day.month, day=trip_day.day
     )
@@ -890,13 +891,14 @@ def request_otp_for_trip(
         raise HTTPException(400, error)
 
     # Push OTP to user (so the driver-side gets it via the user, not by polling).
+    # P3 fix: Don't expose OTP in notification body/data (lock-screen privacy)
     try:
         send_push_notification(
             session=session,
             user_ids=[trip.user_id],
-            title="Trip OTP",
-            body=f"OTP {otp} — share with your driver to start trip #{trip_id}.",
-            data={"type": "trip_otp", "trip_id": trip_id, "otp": otp},
+            title="Trip OTP Ready",
+            body=f"Your trip OTP is ready. Open the app to view it and share with your driver to start trip #{trip_id}.",
+            data={"type": "trip_otp", "trip_id": trip_id},  # Removed "otp" field
         )
     except Exception:
         pass
@@ -910,7 +912,7 @@ def request_otp_for_trip(
         "trip_date": trip_day.isoformat(),
         "validity_start": validity_start.isoformat(),
         "validity_end": expiry_time.isoformat() if expiry_time else None,
-        "expires_in_seconds": int((expiry_time - datetime.utcnow()).total_seconds())
+        "expires_in_seconds": int((expiry_time - now_ist()).total_seconds())
         if expiry_time
         else 0,
     }
@@ -946,7 +948,7 @@ def verify_otp_for_trip(
             400, f"Trip status is {trip.status}, OTP verification not allowed"
         )
 
-    trip_day = date.today()
+    trip_day = today_ist()
 
     otp_service = OTPService(redis_client)
     is_valid, error = otp_service.verify_otp(
@@ -968,7 +970,7 @@ def verify_otp_for_trip(
     if not ok:
         raise HTTPException(400, f"Status update failed: {err}")
 
-    trip.actual_start_time = datetime.utcnow()
+    trip.actual_start_time = now_ist()
 
     # Mark today's attendance OTP-verified (final 'present' is set on trip end)
     attendance = session.exec(
@@ -1090,7 +1092,7 @@ def driver_end_trip(
         raise HTTPException(400, f"Trip status is {trip.status}, cannot end now")
 
     # Determine if more shift days remain (multi-day booking).
-    today = date.today()
+    today = today_ist()
     has_future_shifts = (trip.end_date is not None) and (today < trip.end_date)
 
     trip_service = TripService()
@@ -1102,8 +1104,25 @@ def driver_end_trip(
         raise HTTPException(400, error)
 
     # Set actual end time only when this was the final shift day
+    # P0 fix: When transitioning to active_pending_otp, also advance scheduled times to next day
     if not has_future_shifts:
-        trip.actual_end_time = end_req.actual_end_time or datetime.utcnow()
+        # Normalize any inbound datetime to IST naive (accepts both naive and tz-aware).
+        trip.actual_end_time = to_ist_naive(end_req.actual_end_time) or now_ist()
+    else:
+        # Multi-day trip: find next attendance day and update scheduled times
+        next_attendance = session.exec(
+            select(TripAttendance)
+            .where(
+                TripAttendance.trip_id == trip_id,
+                TripAttendance.trip_date > today,
+            )
+            .order_by(TripAttendance.trip_date)
+        ).first()
+
+        if next_attendance:
+            trip.scheduled_start_time = next_attendance.scheduled_start
+            trip.scheduled_end_time = next_attendance.scheduled_end
+
     session.add(trip)
     session.commit()
 
@@ -1113,7 +1132,7 @@ def driver_end_trip(
     # Generate daily bill
     billing_service = BillingService()
     bill_success, bill_id, bill_error = billing_service.generate_daily_bill(
-        session, trip_id, date.today()
+        session, trip_id, today_ist()
     )
 
     # Push notification: bill ready, payment due
