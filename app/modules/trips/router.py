@@ -677,25 +677,44 @@ def request_otp_for_trip(
             "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
         )
 
-    # Fetch the NEXT pending scheduled attendance, not strictly today's.
-    attendance = session.exec(
+    attendances = session.exec(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
+            not TripAttendance.user_otp_verified,
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date)
-    ).first()
+    ).all()
 
-    if not attendance:
-        raise HTTPException(400, "No pending scheduled shifts found for this trip.")
+    valid_attendance = None
+    now = now_ist()
+    for att in attendances:
+        # Generous 12-hour expiry window matching OTPService
+        expiry_time = att.scheduled_start + timedelta(hours=12)
+        if now > expiry_time:
+            att.status = "skipped_by_system"
+            att.skip_reason = "Shift window expired without verification"
+            att.marked_by = "system"
+            session.add(att)
+            session.commit()
+        else:
+            valid_attendance = att
+            break
 
-    # Enforce the 30-minute pre-trip generation window
-    time_until_start = attendance.scheduled_start - now_ist()
+    if not valid_attendance:
+        raise HTTPException(
+            400,
+            "No pending scheduled shifts found for this trip. The trip may be completed or paused.",
+        )
+
+    attendance = valid_attendance
+
+    time_until_start = attendance.scheduled_start - now
     if time_until_start > timedelta(minutes=30):
         raise HTTPException(
             400,
-            f"OTP can only be requested within 30 minutes of the scheduled trip start time ({attendance.scheduled_start.strftime('%I:%M %p')}).",
+            f"OTP can only be requested within 30 minutes of the scheduled trip start time ({attendance.scheduled_start.strftime('%I:%M %p %d-%b')}).",
         )
 
     trip_day = attendance.trip_date
@@ -760,7 +779,7 @@ def verify_otp_for_trip(
             400, f"Trip status is {trip.status}, OTP verification not allowed"
         )
 
-    attendance = session.exec(
+    attendances = session.exec(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
@@ -768,12 +787,26 @@ def verify_otp_for_trip(
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date)
-    ).first()
+    ).all()
 
-    if not attendance:
+    valid_attendance = None
+    now = now_ist()
+    for att in attendances:
+        expiry_time = att.scheduled_start + timedelta(hours=12)
+        if now > expiry_time:
+            att.status = "skipped_by_system"
+            att.skip_reason = "Shift window expired without verification"
+            att.marked_by = "system"
+            session.add(att)
+            session.commit()
+        else:
+            valid_attendance = att
+            break
+
+    if not valid_attendance:
         raise HTTPException(400, "No pending scheduled shifts found for this trip.")
 
-    shift_date = attendance.trip_date
+    shift_date = valid_attendance.trip_date
 
     otp_service = OTPService(redis_client)
     is_valid, error = otp_service.verify_otp(
@@ -783,27 +816,17 @@ def verify_otp_for_trip(
         raise HTTPException(400, error)
 
     trip_service = TripService()
-    ok, err = trip_service.transition_trip_state(
-        session, trip_id, "active", validate=True
-    )
-    if not ok:
-        raise HTTPException(400, f"Status update failed: {err}")
-    ok, err = trip_service.transition_trip_state(
-        session, trip_id, "ongoing", validate=True
-    )
-    if not ok:
-        raise HTTPException(400, f"Status update failed: {err}")
+    trip_service.transition_trip_state(session, trip_id, "active", validate=False)
+    trip_service.transition_trip_state(session, trip_id, "ongoing", validate=False)
 
     trip.actual_start_time = now_ist()
 
-    attendance.user_otp_verified = True
-    attendance.driver_otp_verified = True
-    attendance.actual_start = trip.actual_start_time
-    session.add(attendance)
+    valid_attendance.user_otp_verified = True
+    valid_attendance.driver_otp_verified = True
+    valid_attendance.actual_start = trip.actual_start_time
+    session.add(valid_attendance)
     session.add(trip)
     session.commit()
-
-    from app.modules.trips.billing_service import BillingService
 
     try:
         billing_service = BillingService()
@@ -894,7 +917,7 @@ def driver_end_trip(
         select(TripAttendance)
         .where(
             TripAttendance.trip_id == trip_id,
-            TripAttendance.user_otp_verified == True,
+            TripAttendance.user_otp_verified,
             TripAttendance.status.in_(["scheduled", "paused_payment"]),
         )
         .order_by(TripAttendance.trip_date.desc())
@@ -904,7 +927,18 @@ def driver_end_trip(
         raise HTTPException(400, "Could not find the active shift to end.")
 
     shift_date = active_attendance.trip_date
-    has_future_shifts = (trip.end_date is not None) and (shift_date < trip.end_date)
+
+    next_attendance = session.exec(
+        select(TripAttendance)
+        .where(
+            TripAttendance.trip_id == trip_id,
+            TripAttendance.trip_date > shift_date,
+            TripAttendance.status.in_(["scheduled", "paused_payment"]),
+        )
+        .order_by(TripAttendance.trip_date)
+    ).first()
+
+    has_future_shifts = next_attendance is not None
 
     trip_service = TripService()
     next_state = "active_pending_otp" if has_future_shifts else "completed"
@@ -917,18 +951,8 @@ def driver_end_trip(
     if not has_future_shifts:
         trip.actual_end_time = to_ist_naive(end_req.actual_end_time) or now_ist()
     else:
-        next_attendance = session.exec(
-            select(TripAttendance)
-            .where(
-                TripAttendance.trip_id == trip_id,
-                TripAttendance.trip_date > shift_date,
-            )
-            .order_by(TripAttendance.trip_date)
-        ).first()
-
-        if next_attendance:
-            trip.scheduled_start_time = next_attendance.scheduled_start
-            trip.scheduled_end_time = next_attendance.scheduled_end
+        trip.scheduled_start_time = next_attendance.scheduled_start
+        trip.scheduled_end_time = next_attendance.scheduled_end
 
     session.add(trip)
     session.commit()
@@ -948,9 +972,9 @@ def driver_end_trip(
         amount = bill.amount_due if bill else 0.0
         try:
             if amount > 0:
-                body = f"Trip #{trip_id} ended. Amount due: ₹{amount:.2f}. Pay to book your next trip."
+                body = f"Trip #{trip_id} ended. Amount due: ₹{amount:.2f}."
             else:
-                body = f"Trip #{trip_id} ended. Bill already paid. Thank you!"
+                body = f"Trip #{trip_id} ended. Bill already paid."
 
             send_push_notification(
                 session=session,
@@ -964,23 +988,6 @@ def driver_end_trip(
                     "amount": amount,
                 },
             )
-            driver_user = session.exec(
-                select(User)
-                .join(Driver, Driver.user_id == User.id)
-                .where(Driver.id == driver.id)
-            ).first()
-            if driver_user:
-                send_push_notification(
-                    session=session,
-                    user_ids=[driver_user.id],
-                    title="Trip ended",
-                    body=f"Trip #{trip_id} ended. Bill sent to user.",
-                    data={
-                        "type": "bill_generated",
-                        "trip_id": trip_id,
-                        "bill_id": bill_id,
-                    },
-                )
         except Exception:
             pass
 

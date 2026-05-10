@@ -19,7 +19,7 @@ class OTPService:
     MAX_ATTEMPTS = 3
     OTP_LENGTH = 6
     PRE_START_VALIDITY_MINUTES = 30
-    POST_START_VALIDITY = timedelta(hours=1, minutes=45)
+    POST_START_VALIDITY = timedelta(hours=12)
 
     def __init__(self, redis_client: Optional[redis.Redis]):
         self.redis = redis_client
