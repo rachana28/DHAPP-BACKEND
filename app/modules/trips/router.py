@@ -266,7 +266,11 @@ def cancel_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    trip = session.get(Trip, trip_id)
+    # Row-lock the trip to serialize against a concurrent driver
+    # /accept-and-pay or /process-payment grabbing the same row.
+    trip = session.exec(
+        select(Trip).where(Trip.id == trip_id).with_for_update()
+    ).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
@@ -364,55 +368,6 @@ def get_driver_offers(
     return offers
 
 
-@router.post("/driver/accept-offer/{offer_id}", deprecated=True)
-def accept_trip_offer(
-    offer_id: int,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-    redis_client: redis.Redis = Depends(get_redis),
-):
-    driver = session.exec(
-        select(Driver).where(Driver.user_id == current_user.id)
-    ).first()
-    if not driver:
-        raise HTTPException(403, "Only drivers can accept trips")
-
-    offer = session.get(TripOffer, offer_id)
-    if not offer or offer.driver_id != driver.id:
-        raise HTTPException(404, "Offer not found or not authorized")
-
-    if offer.status != "pending":
-        raise HTTPException(400, "Offer is no longer valid")
-
-    trip = session.get(Trip, offer.trip_id)
-    if trip.status != "searching":
-        raise HTTPException(400, "Trip has already been taken by another driver")
-
-    trip.driver_id = driver.id
-    trip.status = "accepted"
-
-    offer.status = "accepted"
-    session.add(trip)
-    session.add(offer)
-
-    other_offers = session.exec(
-        select(TripOffer).where(TripOffer.trip_id == trip.id)
-    ).all()
-    for o in other_offers:
-        if o.id != offer.id:
-            session.delete(o)
-
-    session.commit()
-
-    if redis_client:
-        redis_client.delete(f"driver_{driver.id}")
-
-    return {
-        "message": "Trip accepted. Other offers have been removed.",
-        "trip_id": trip.id,
-    }
-
-
 @router.post("/driver/reject-offer/{offer_id}")
 def reject_trip_offer(
     offer_id: int,
@@ -425,15 +380,26 @@ def reject_trip_offer(
     if not driver:
         raise HTTPException(403, "Not authorized")
 
-    offer = session.get(TripOffer, offer_id)
+    # Lock the offer row so a concurrent escalation pass can't delete it
+    # mid-update.
+    offer = session.exec(
+        select(TripOffer).where(TripOffer.id == offer_id).with_for_update()
+    ).first()
     if not offer or offer.driver_id != driver.id:
         raise HTTPException(404, "Offer not found")
+
+    if offer.status != "pending":
+        raise HTTPException(400, f"Offer is already {offer.status}")
 
     offer.status = "rejected"
     session.add(offer)
     session.commit()
 
-    trip = session.get(Trip, offer.trip_id)
+    # Re-fetch the trip with a row lock before escalating so two parallel
+    # rejects can't both trigger escalation for the same trip.
+    trip = session.exec(
+        select(Trip).where(Trip.id == offer.trip_id).with_for_update()
+    ).first()
     if trip and trip.status == "searching":
         escalated = attempt_trip_escalation(session, trip)
         if escalated:
@@ -489,19 +455,27 @@ def driver_accept_and_initiate_payment(
     if not driver:
         raise HTTPException(403, "Only drivers can perform this action")
 
-    trip = session.get(Trip, trip_id)
+    # Row-lock the trip so two drivers in the same tier can't both win the
+    # accept race. Without this, both calls observe trip.driver_id is None,
+    # both write themselves as winner, and last-write-wins corrupts the
+    # offer state. The lock is released on session.commit() / rollback.
+    trip = session.exec(
+        select(Trip).where(Trip.id == trip_id).with_for_update()
+    ).first()
     if not trip:
         raise HTTPException(404, "Trip not found")
 
     if trip.driver_id and trip.driver_id != driver.id:
-        raise HTTPException(400, "Driver not matched to this trip")
+        raise HTTPException(400, "Trip already accepted by another driver")
 
     if accept_req.action == "reject":
         offer = session.exec(
-            select(TripOffer).where(
+            select(TripOffer)
+            .where(
                 TripOffer.trip_id == trip_id,
                 TripOffer.driver_id == driver.id,
             )
+            .with_for_update()
         ).first()
 
         if offer:
@@ -539,15 +513,55 @@ def driver_accept_and_initiate_payment(
         }
 
     elif accept_req.action == "accept":
+        # Status guard under the row lock — another writer may have just
+        # transitioned the trip out from under us before we got the lock.
+        if trip.status not in ("searching", "accepted_pending_payment"):
+            raise HTTPException(
+                400,
+                f"Trip cannot be accepted in status '{trip.status}'.",
+            )
+
         trip.driver_id = driver.id
         trip.status = "accepted_pending_payment"
         trip.driver_accepted_at = now_ist()
+
+        # Lock in this driver's offer and clear the rest so other drivers in
+        # the tier can no longer act on a stale pending offer. Lock the row
+        # to avoid a parallel reject_trip_offer toggling status under us.
+        accepted_offer = session.exec(
+            select(TripOffer)
+            .where(
+                TripOffer.trip_id == trip_id,
+                TripOffer.driver_id == driver.id,
+                TripOffer.status == "pending",
+            )
+            .with_for_update()
+        ).first()
+        if accepted_offer:
+            accepted_offer.status = "accepted"
+            session.add(accepted_offer)
+
+        sibling_offers = session.exec(
+            select(TripOffer)
+            .where(
+                TripOffer.trip_id == trip_id,
+                TripOffer.driver_id != driver.id,
+                TripOffer.status == "pending",
+            )
+            .with_for_update()
+        ).all()
+        for o in sibling_offers:
+            session.delete(o)
 
         redis_key = f"driver_payment_timer:{trip_id}:{driver.id}"
         redis_client.setex(redis_key, 1800, "pending")
 
         session.add(trip)
         session.commit()
+
+        # Bust the driver-availability cache so this driver is no longer
+        # eligible for ranking on other in-flight trips while they hold this one.
+        redis_client.delete(f"driver_{driver.id}")
 
         return {
             "message": "Trip accepted. Payment required.",
@@ -575,7 +589,12 @@ def driver_process_payment(
     if not driver:
         raise HTTPException(403, "Only drivers can perform this action")
 
-    trip = session.get(Trip, trip_id)
+    # Row-lock the trip so this finalize-payment path can't interleave with
+    # driver_payment_timeout_scheduler auto-rejecting the trip back to
+    # `searching` between our status check and our state mutation.
+    trip = session.exec(
+        select(Trip).where(Trip.id == trip_id).with_for_update()
+    ).first()
     if not trip:
         raise HTTPException(404, "Trip not found")
 
