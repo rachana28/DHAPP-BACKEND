@@ -4,8 +4,20 @@ from enum import Enum
 from pydantic import EmailStr, field_validator
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List, Dict, Any
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from sqlalchemy import UniqueConstraint, JSON, Column
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _now_ist_naive() -> datetime:
+    """Current wall-clock time in IST as a naive datetime.
+
+    Used as default_factory for trip-related models (Trip.booking_time,
+    OTPRegistry, PaymentTransaction, TripBill, TripAttendance, TripSettlement,
+    PricingComponentBreakdown, TripOffer). Other models are unaffected.
+    """
+    return datetime.now(_IST).replace(tzinfo=None)
 
 
 # --- Base Models (Shared fields) ---
@@ -498,7 +510,7 @@ class TripBase(SQLModel):
     )
 
     status: str = "searching"
-    booking_time: datetime = Field(default_factory=datetime.utcnow)
+    booking_time: datetime = Field(default_factory=_now_ist_naive)
 
     # NEW FIELDS FOR TRIP MANAGEMENT
     trip_duration_hours: Optional[int] = None
@@ -512,7 +524,6 @@ class TripBase(SQLModel):
     driver_payment_due_date: Optional[datetime] = None
     driver_accepted_at: Optional[datetime] = None  # When driver clicked accept
     state_version: int = Field(default=1)  # For optimistic locking
-    timezone: Optional[str] = "Asia/Kolkata"  # Default to IST
 
     # Pause flag: when True, OTP generation for the next shift is blocked until
     # user clears all outstanding bills (used by trip_day payment method).
@@ -539,7 +550,7 @@ class TripOffer(SQLModel, table=True):
     driver_id: int = Field(foreign_key="driver.id")
     status: str = "pending"
     tier: int = 1
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now_ist_naive)
 
     trip: Trip = Relationship(back_populates="offers")
     driver: "Driver" = Relationship(back_populates="offers")
@@ -931,7 +942,7 @@ class OTPRegistry(SQLModel, table=True):
     verified_by_driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
     otp_expiry_at: datetime
     valid_from: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now_ist_naive)
     verification_attempts: int = 0
     max_attempts: int = 3
 
@@ -952,7 +963,7 @@ class PaymentTransaction(SQLModel, table=True):
     payment_method: str  # "card", "wallet", "upi", etc (dummy for now)
     gateway_transaction_id: Optional[str] = None
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now_ist_naive)
     completed_at: Optional[datetime] = None
     refund_at: Optional[datetime] = None
     refund_amount: Optional[float] = None
@@ -972,7 +983,7 @@ class PricingComponentBreakdown(SQLModel, table=True):
     percentage: Optional[float] = None
     description: Optional[str] = None
     trip_date: Optional[date] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now_ist_naive)
 
 
 # --- TRIP BILL ---
@@ -1009,7 +1020,7 @@ class TripBill(SQLModel, table=True):
     )
 
     notes: Optional[str] = None
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    generated_at: datetime = Field(default_factory=_now_ist_naive)
 
 
 # --- TRIP ATTENDANCE ---
@@ -1038,8 +1049,8 @@ class TripAttendance(SQLModel, table=True):
     skip_reason: Optional[str] = None
     notes: Optional[str] = None
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
 
 
 # --- TRIP SETTLEMENT ---
@@ -1071,7 +1082,7 @@ class TripSettlement(SQLModel, table=True):
     settlement_date: date
     due_date: Optional[date] = None
     paid_at: Optional[datetime] = None
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    generated_at: datetime = Field(default_factory=_now_ist_naive)
 
 
 # ============= API REQUEST/RESPONSE MODELS =============
@@ -1096,12 +1107,6 @@ class DriverPaymentRequest(SQLModel):
     trip_id: int
     amount: float
     payment_method: Optional[str] = "card"
-
-
-class OTPGenerationRequest(SQLModel):
-    """Request OTP for trip"""
-
-    trip_id: int
 
 
 class OTPVerificationRequest(SQLModel):
@@ -1147,7 +1152,7 @@ class FareEstimateRequest(SQLModel):
         Haversine from start/end coords; otherwise treated as 0.
     """
 
-    hiring_type: str                     # "Daily" | "Monthly" | "Outstation"
+    hiring_type: str  # "Daily" | "Monthly" | "Outstation"
     vehicle_type: str
     shift_details: Optional[str] = None  # e.g. "8 Hours (15:00)"
     start_date: Optional[date] = None
@@ -1161,7 +1166,9 @@ class FareEstimateRequest(SQLModel):
     end_lat: Optional[float] = None
     end_lng: Optional[float] = None
     distance_km: Optional[float] = None
-    booking_time: Optional[datetime] = None  # used for night-surcharge check; defaults to now
+    booking_time: Optional[datetime] = (
+        None  # used for night-surcharge check; defaults to now
+    )
 
 
 class BillPaymentRequest(SQLModel):

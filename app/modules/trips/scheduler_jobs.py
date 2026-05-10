@@ -6,7 +6,7 @@ Scheduled Jobs for Trip Management
 - Daily settlement
 """
 
-from datetime import datetime, timedelta, date
+from datetime import timedelta
 import logging
 
 from sqlmodel import Session, select
@@ -26,6 +26,7 @@ from app.modules.trips.otp_service import OTPService
 from app.modules.trips.trip_service import TripService
 from app.modules.trips.billing_service import BillingService
 from app.modules.trips.payment_service import PaymentService
+from app.utils.time_utils import now_ist, today_ist
 from app.utils.notifications import send_push_notification
 
 logger = logging.getLogger(__name__)
@@ -42,9 +43,9 @@ async def generate_otp_for_trip_scheduler():
             redis_client = get_redis()
             otp_service = OTPService(redis_client)
 
-            now = datetime.utcnow()
+            now = now_ist()
             window_end = now + timedelta(minutes=20)
-            today = date.today()
+            today = today_ist()
 
             attendances = session.exec(
                 select(TripAttendance).where(
@@ -115,13 +116,17 @@ async def generate_otp_for_trip_scheduler():
                 else:
                     logger.info(f"OTP generated for trip {trip.id} on {today}")
                     # Push the OTP to the USER (driver receives it verbally)
+                    # P3 fix: Don't expose OTP in notification body/data (lock-screen privacy)
                     try:
                         send_push_notification(
                             session=session,
                             user_ids=[trip.user_id],
-                            title="Trip OTP",
-                            body=f"OTP {otp} — share with your driver to start trip #{trip.id}.",
-                            data={"type": "trip_otp", "trip_id": trip.id, "otp": otp},
+                            title="Trip OTP Ready",
+                            body=f"Your trip OTP is ready. Open the app to view it and share with your driver to start trip #{trip.id}.",
+                            data={
+                                "type": "trip_otp",
+                                "trip_id": trip.id,
+                            },  # Removed "otp" field
                         )
                     except Exception:
                         pass
@@ -139,7 +144,7 @@ async def expire_otp_for_trip_scheduler():
             redis_client = get_redis()
             otp_service = OTPService(redis_client)
 
-            now = datetime.utcnow()
+            now = now_ist()
 
             expired_rows = session.exec(
                 select(OTPRegistry).where(
@@ -190,7 +195,7 @@ async def auto_end_trip_scheduler():
             trip_service = TripService()
             billing_service = BillingService()
 
-            now = datetime.utcnow()
+            now = now_ist()
 
             # Find trips that should auto-end
             trips = session.exec(
@@ -201,12 +206,10 @@ async def auto_end_trip_scheduler():
                 )
             ).all()
 
-            today = date.today()
+            today = today_ist()
             for trip in trips:
                 # If more shift days remain, re-arm OTP for the next day instead of terminating
-                has_future_shifts = (
-                    trip.end_date is not None and today < trip.end_date
-                )
+                has_future_shifts = trip.end_date is not None and today < trip.end_date
                 next_state = (
                     "active_pending_otp" if has_future_shifts else "auto_completed"
                 )
@@ -215,9 +218,24 @@ async def auto_end_trip_scheduler():
                 )
 
                 if success:
-                    # Don't overwrite the end-of-trip timestamp on intermediate days
-                    if not has_future_shifts:
+                    if has_future_shifts:
+                        # Find the next TripAttendance after today
+                        next_attendance = session.exec(
+                            select(TripAttendance)
+                            .where(
+                                TripAttendance.trip_id == trip.id,
+                                TripAttendance.trip_date > today,
+                            )
+                            .order_by(TripAttendance.trip_date)
+                        ).first()
+
+                        if next_attendance:
+                            trip.scheduled_start_time = next_attendance.scheduled_start
+                            trip.scheduled_end_time = next_attendance.scheduled_end
+                    else:
+                        # Last day: don't overwrite the end-of-trip timestamp
                         trip.actual_end_time = now
+
                     session.add(trip)
                     session.commit()
 
@@ -287,7 +305,7 @@ async def driver_payment_timeout_scheduler():
         with Session(engine) as session:
             trip_service = TripService()
 
-            now = datetime.utcnow()
+            now = now_ist()
             timeout_window = now - timedelta(minutes=30)
 
             # Find trips awaiting driver payment (use acceptance time, not booking time)
@@ -348,7 +366,7 @@ async def daily_settlement_scheduler():
         with Session(engine) as session:
             billing_service = BillingService()
 
-            today = date.today()
+            today = today_ist()
 
             completed_trips = session.exec(
                 select(Trip).where(

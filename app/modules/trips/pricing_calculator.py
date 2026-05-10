@@ -21,6 +21,7 @@ Pricing factors:
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +29,7 @@ import redis
 from sqlmodel import Session
 
 from app.core.models import SystemConfig
+from app.utils.time_utils import now_ist
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SystemConfig keys (admin can override any of these via /admin/system-config)
@@ -102,16 +104,43 @@ DEFAULT_PERMIT = 500.0
 INDIAN_STATE_DISPLAY_NAMES: List[str] = sorted(
     [
         # 28 States
-        "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
-        "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand",
-        "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur",
-        "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab",
-        "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
-        "Uttar Pradesh", "Uttarakhand", "West Bengal",
+        "Andhra Pradesh",
+        "Arunachal Pradesh",
+        "Assam",
+        "Bihar",
+        "Chhattisgarh",
+        "Goa",
+        "Gujarat",
+        "Haryana",
+        "Himachal Pradesh",
+        "Jharkhand",
+        "Karnataka",
+        "Kerala",
+        "Madhya Pradesh",
+        "Maharashtra",
+        "Manipur",
+        "Meghalaya",
+        "Mizoram",
+        "Nagaland",
+        "Odisha",
+        "Punjab",
+        "Rajasthan",
+        "Sikkim",
+        "Tamil Nadu",
+        "Telangana",
+        "Tripura",
+        "Uttar Pradesh",
+        "Uttarakhand",
+        "West Bengal",
         # 8 Union Territories
-        "Andaman and Nicobar Islands", "Chandigarh",
-        "Dadra and Nagar Haveli and Daman and Diu", "Delhi",
-        "Jammu and Kashmir", "Ladakh", "Lakshadweep", "Puducherry",
+        "Andaman and Nicobar Islands",
+        "Chandigarh",
+        "Dadra and Nagar Haveli and Daman and Diu",
+        "Delhi",
+        "Jammu and Kashmir",
+        "Ladakh",
+        "Lakshadweep",
+        "Puducherry",
     ],
     key=len,
     reverse=True,
@@ -124,6 +153,8 @@ def extract_state_from_location(location: Optional[str]) -> Optional[str]:
     The user app already sends start_location / end_location, so a separate
     state payload field is unnecessary.
 
+    (P3 fix: Use word-boundary matching to avoid substring collisions like "Goa" → "Goalkeeper".)
+
     Accepts:
       - "Chennai, Tamil Nadu"               → "tamil_nadu"
       - "Bangalore, Karnataka, India"       → "karnataka"
@@ -132,10 +163,16 @@ def extract_state_from_location(location: Optional[str]) -> Optional[str]:
     """
     if not location:
         return None
+
     haystack = location.lower()
+
+    # Word-boundary regex: match state names surrounded by word boundaries or punctuation/spaces
     for display in INDIAN_STATE_DISPLAY_NAMES:
-        if display.lower() in haystack:
+        # Escape the state name and use word boundaries
+        pattern = r"\b" + re.escape(display.lower()) + r"\b"
+        if re.search(pattern, haystack):
             return _state_key(display)
+
     return None
 
 
@@ -204,9 +241,7 @@ def _state_display_name(key: Optional[str]) -> Optional[str]:
     return None
 
 
-def _haversine_km(
-    lat1: float, lng1: float, lat2: float, lng2: float
-) -> float:
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Great-circle distance in kilometres between two lat/lng points."""
     r = 6371.0
     p1 = math.radians(lat1)
@@ -371,7 +406,7 @@ def calculate_fare(
       }
     """
     htype = (hiring_type or "").strip().lower()
-    booking_time = booking_time or datetime.utcnow()
+    booking_time = booking_time or now_ist()
 
     def cfg(k):
         return _get_config_value(session, redis_client, k, DEFAULTS[k])
@@ -441,11 +476,7 @@ def calculate_fare(
         subtotal += base_fee + duration_charge + distance_charge
 
         # State permit when crossing state lines (resolved from end_location)
-        if (
-            start_state_key
-            and end_state_key
-            and start_state_key != end_state_key
-        ):
+        if start_state_key and end_state_key and start_state_key != end_state_key:
             end_state_display = _state_display_name(end_state_key) or end_state_key
             permit = round(_state_permit(session, redis_client, end_state_key), 2)
             components.append(
@@ -550,9 +581,7 @@ def validate_pricing_inputs(
     if htype != "outstation":
         return True, None
 
-    has_coords = all(
-        v is not None for v in (start_lat, start_lng, end_lat, end_lng)
-    )
+    has_coords = all(v is not None for v in (start_lat, start_lng, end_lat, end_lng))
     has_distance = distance_km is not None and distance_km > 0
     if not has_distance and not has_coords:
         return (
