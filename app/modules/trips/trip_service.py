@@ -18,13 +18,17 @@ class TripService:
     Manages trip state machine and lifecycle
 
     State Flow:
-    searching → accepted_pending_payment → payment_in_progress →
-    active_pending_otp → active → ongoing → completed → billed
+    searching → accepted_pending_payment → active_pending_otp → active → ongoing → completed → billed
     """
 
     VALID_STATES = {
         "searching": ["accepted_pending_payment", "no_drivers_found", "cancelled"],
-        "accepted_pending_payment": ["payment_in_progress", "rejected", "searching"],
+        "accepted_pending_payment": [
+            "payment_in_progress",
+            "active_pending_otp",
+            "rejected",
+            "searching",
+        ],
         "payment_in_progress": ["active_pending_otp", "payment_failed"],
         "payment_failed": ["searching", "cancelled"],
         "rejected": ["searching", "cancelled"],
@@ -48,12 +52,6 @@ class TripService:
     def validate_state_transition(
         self, current_state: str, new_state: str
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Validate if state transition is allowed
-
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
         if current_state not in self.VALID_STATES:
             return False, f"Unknown current state: {current_state}"
 
@@ -70,18 +68,6 @@ class TripService:
     def transition_trip_state(
         self, session: Session, trip_id: int, new_state: str, validate: bool = True
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Safely transition trip to new state with optimistic locking
-
-        Args:
-            session: Database session
-            trip_id: Trip ID
-            new_state: Target state
-            validate: Whether to validate state transition
-
-        Returns:
-            Tuple of (success, error_message)
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
@@ -89,7 +75,6 @@ class TripService:
 
             current_state = trip.status
 
-            # Validate transition
             if validate:
                 is_valid, error = self.validate_state_transition(
                     current_state, new_state
@@ -97,7 +82,6 @@ class TripService:
                 if not is_valid:
                     return False, error
 
-            # Update with optimistic locking (version field)
             trip.status = new_state
             trip.state_version += 1
             session.add(trip)
@@ -109,22 +93,10 @@ class TripService:
             return False, f"State transition failed: {str(e)}"
 
     def get_trip_duration_hours(self, shift_details: Optional[str]) -> Optional[int]:
-        """
-        Parse shift_details to extract duration
-
-        Format: "8 Hours (15:00)" → 8
-
-        Args:
-            shift_details: Shift details string
-
-        Returns:
-            Duration in hours or None
-        """
         if not shift_details:
             return None
 
         try:
-            # Extract number before "Hours"
             parts = shift_details.split()
             for i, part in enumerate(parts):
                 if part.lower() == "hours":
@@ -137,23 +109,10 @@ class TripService:
     def get_trip_start_time(
         self, shift_details: Optional[str], trip_date: date
     ) -> Optional[datetime]:
-        """
-        Parse shift_details to extract start time
-
-        Format: "8 Hours (15:00)" → 15:00
-
-        Args:
-            shift_details: Shift details string
-            trip_date: Date of trip
-
-        Returns:
-            Datetime of trip start or None
-        """
         if not shift_details:
             return None
 
         try:
-            # Extract time in format (HH:MM)
             start_idx = shift_details.find("(") + 1
             end_idx = shift_details.find(")")
             time_str = shift_details[start_idx:end_idx]  # "15:00"
@@ -165,7 +124,6 @@ class TripService:
         except (ValueError, AttributeError):
             return None
 
-    # Map "selected_days" tokens to weekday() index (Mon=0 .. Sun=6)
     _DAY_TOKEN_MAP = {
         "mon": 0,
         "monday": 0,
@@ -187,10 +145,6 @@ class TripService:
     }
 
     def parse_selected_days(self, selected_days: Optional[str]) -> Optional[set]:
-        """
-        Parse 'selected_days' field (e.g. 'Mon,Wed,Fri') into a set of weekday() ints.
-        Returns None if not specified (= all days included).
-        """
         if not selected_days:
             return None
         result = set()
@@ -210,12 +164,6 @@ class TripService:
         trip_duration_hours: int,
         selected_days: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Create one TripAttendance row per included day (honoring selected_days when provided).
-
-        Args:
-            trip_start_dt: A datetime whose .hour and .minute define the daily start time.
-        """
         try:
             day_filter = self.parse_selected_days(selected_days)
             current_date = start_date
@@ -269,41 +217,21 @@ class TripService:
         user_id: Optional[str] = None,
         driver_id: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if trip can be cancelled by user or driver
-
-        Rules:
-        - Trip day payment: Can cancel anytime before start
-        - 20% advance: Cannot cancel once payment made
-        - Full payment: Cannot cancel
-
-        Args:
-            session: Database session
-            trip_id: Trip ID
-            user_id: User cancelling (if user)
-            driver_id: Driver cancelling (if driver)
-
-        Returns:
-            Tuple of (can_cancel, reason)
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
                 return False, "Trip not found"
 
-            # Check authorization
             if user_id and str(trip.user_id) != user_id:
                 return False, "Not authorized to cancel this trip"
 
             if driver_id and trip.driver_id != driver_id:
                 return False, "Not authorized to cancel this trip"
 
-            # Check payment method rules
             if (
                 trip.payment_method == "advance_20"
                 or trip.payment_method == "full_payment"
             ):
-                # Cannot cancel after payment
                 payments = session.exec(
                     select(PaymentTransaction).where(
                         PaymentTransaction.trip_id == trip_id,
@@ -317,7 +245,6 @@ class TripService:
                         f"Cannot cancel trip with {trip.payment_method} payment method",
                     )
 
-            # Check if trip already started
             if trip.actual_start_time is not None:
                 return False, "Cannot cancel trip that has already started"
 
@@ -329,17 +256,6 @@ class TripService:
     def mark_trip_day_present(
         self, session: Session, trip_id: int, trip_date: date
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Mark a trip day as present (when both OTP verified)
-
-        Args:
-            session: Database session
-            trip_id: Trip ID
-            trip_date: Date to mark present
-
-        Returns:
-            Tuple of (success, error_message)
-        """
         try:
             attendance = session.exec(
                 select(TripAttendance).where(
@@ -370,19 +286,6 @@ class TripService:
         skip_reason: Optional[str] = None,
         marked_by: str = "user",
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Mark a trip day as absent/skipped
-
-        Args:
-            session: Database session
-            trip_id: Trip ID
-            trip_date: Date to mark absent
-            skip_reason: Reason for skip
-            marked_by: "user" or "driver"
-
-        Returns:
-            Tuple of (success, error_message)
-        """
         try:
             attendance = session.exec(
                 select(TripAttendance).where(
@@ -409,27 +312,18 @@ class TripService:
     def get_trip_summary(
         self, session: Session, trip_id: int, is_driver: bool
     ) -> Optional[Dict[str, Any]]:
-        """
-        Get comprehensive trip summary
-
-        Returns:
-            Dict with trip details or None
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
                 return None
 
-            # Get attendance records
             attendances = session.exec(
                 select(TripAttendance).where(TripAttendance.trip_id == trip_id)
             ).all()
 
-            # Count statuses
             present_count = len([a for a in attendances if a.status == "present"])
             absent_count = len([a for a in attendances if "skipped" in a.status])
 
-            # Get payments
             user_payments = session.exec(
                 select(PaymentTransaction).where(
                     PaymentTransaction.trip_id == trip_id,
@@ -461,12 +355,12 @@ class TripService:
                 "actual_start": trip.actual_start_time,
                 "actual_end": trip.actual_end_time,
                 "fare": trip.fare,
-                "fare_breakdown": trip.fare_breakdown
+                "fare_breakdown": trip.fare_breakdown,
             }
-            
+
             if is_driver:
                 result["total_driver_paid"] = sum(p.amount for p in driver_payments)
-            
+
             return result
 
         except Exception as e:

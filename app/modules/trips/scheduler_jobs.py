@@ -1,9 +1,5 @@
 """
 Scheduled Jobs for Trip Management
-- OTP generation
-- Trip auto-end
-- Driver payment auto-reject
-- Daily settlement
 """
 
 from datetime import timedelta
@@ -33,23 +29,17 @@ logger = logging.getLogger(__name__)
 
 
 async def generate_otp_for_trip_scheduler():
-    """
-    Background job: Generate the single trip-day OTP ~15 min before each shift.
-    The user-app is expected to surface the OTP (via push or by polling /request-otp).
-    The driver enters the OTP that the user shares verbally.
-    """
     try:
         with Session(engine) as session:
             redis_client = get_redis()
             otp_service = OTPService(redis_client)
 
             now = now_ist()
-            window_end = now + timedelta(minutes=20)
+            window_end = now + timedelta(minutes=30)
             today = today_ist()
 
             attendances = session.exec(
                 select(TripAttendance).where(
-                    TripAttendance.trip_date == today,
                     TripAttendance.scheduled_start >= now,
                     TripAttendance.scheduled_start <= window_end,
                     TripAttendance.status.notin_(
@@ -69,8 +59,9 @@ async def generate_otp_for_trip_scheduler():
                 ):
                     continue
 
-                # Pause check (trip_day method): if any prior daily bill is unpaid, skip
-                # generating today's OTP, mark attendance as paused_payment, and remind the user.
+                if not trip.payment_method:
+                    continue
+
                 if (
                     trip.payment_method == "trip_day"
                     and payment_service.trip_has_unpaid_bills(session, trip.id)
@@ -96,7 +87,6 @@ async def generate_otp_for_trip_scheduler():
                         pass
                     continue
 
-                # Skip if OTP for this day already exists
                 existing = session.exec(
                     select(OTPRegistry).where(
                         OTPRegistry.trip_id == trip.id,
@@ -115,8 +105,6 @@ async def generate_otp_for_trip_scheduler():
                     )
                 else:
                     logger.info(f"OTP generated for trip {trip.id} on {today}")
-                    # Push the OTP to the USER (driver receives it verbally)
-                    # P3 fix: Don't expose OTP in notification body/data (lock-screen privacy)
                     try:
                         send_push_notification(
                             session=session,
@@ -126,7 +114,7 @@ async def generate_otp_for_trip_scheduler():
                             data={
                                 "type": "trip_otp",
                                 "trip_id": trip.id,
-                            },  # Removed "otp" field
+                            },
                         )
                     except Exception:
                         pass
@@ -135,10 +123,6 @@ async def generate_otp_for_trip_scheduler():
 
 
 async def expire_otp_for_trip_scheduler():
-    """
-    Background job: For each (trip, day) where the OTP window closed without verification,
-    mark that day's attendance as missed.
-    """
     try:
         with Session(engine) as session:
             redis_client = get_redis()
@@ -185,11 +169,6 @@ async def expire_otp_for_trip_scheduler():
 
 
 async def auto_end_trip_scheduler():
-    """
-    Background job: Automatically end trip after scheduled duration
-
-    Called by APScheduler at trip_scheduled_end_time
-    """
     try:
         with Session(engine) as session:
             trip_service = TripService()
@@ -197,7 +176,6 @@ async def auto_end_trip_scheduler():
 
             now = now_ist()
 
-            # Find trips that should auto-end
             trips = session.exec(
                 select(Trip).where(
                     Trip.status == "ongoing",
@@ -206,10 +184,24 @@ async def auto_end_trip_scheduler():
                 )
             ).all()
 
-            today = today_ist()
             for trip in trips:
-                # If more shift days remain, re-arm OTP for the next day instead of terminating
-                has_future_shifts = trip.end_date is not None and today < trip.end_date
+                active_attendance = session.exec(
+                    select(TripAttendance)
+                    .where(
+                        TripAttendance.trip_id == trip.id,
+                        TripAttendance.user_otp_verified == True,
+                        TripAttendance.status.in_(["scheduled", "paused_payment"]),
+                    )
+                    .order_by(TripAttendance.trip_date.desc())
+                ).first()
+
+                shift_date = (
+                    active_attendance.trip_date if active_attendance else today_ist()
+                )
+                has_future_shifts = (
+                    trip.end_date is not None and shift_date < trip.end_date
+                )
+
                 next_state = (
                     "active_pending_otp" if has_future_shifts else "auto_completed"
                 )
@@ -219,12 +211,11 @@ async def auto_end_trip_scheduler():
 
                 if success:
                     if has_future_shifts:
-                        # Find the next TripAttendance after today
                         next_attendance = session.exec(
                             select(TripAttendance)
                             .where(
                                 TripAttendance.trip_id == trip.id,
-                                TripAttendance.trip_date > today,
+                                TripAttendance.trip_date > shift_date,
                             )
                             .order_by(TripAttendance.trip_date)
                         ).first()
@@ -233,21 +224,23 @@ async def auto_end_trip_scheduler():
                             trip.scheduled_start_time = next_attendance.scheduled_start
                             trip.scheduled_end_time = next_attendance.scheduled_end
                     else:
-                        # Last day: don't overwrite the end-of-trip timestamp
                         trip.actual_end_time = now
 
                     session.add(trip)
                     session.commit()
 
-                    # Mark today's attendance present (driver fulfilled the shift)
-                    trip_service.mark_trip_day_present(session, trip.id, today)
+                    trip_service.mark_trip_day_present(session, trip.id, shift_date)
 
                     logger.info(f"Trip {trip.id} auto-ended")
 
-                    # Generate daily bill
                     bill_success, bill_id, bill_error = (
-                        billing_service.generate_daily_bill(session, trip.id, today)
+                        billing_service.generate_daily_bill(
+                            session, trip.id, shift_date
+                        )
                     )
+
+                    if not bill_success and bill_id:
+                        bill_success = True
 
                     if not bill_success:
                         logger.warning(
@@ -255,13 +248,18 @@ async def auto_end_trip_scheduler():
                         )
                     elif bill_id:
                         bill = session.get(TripBill, bill_id)
-                        amount = bill.total_amount if bill else 0.0
+                        amount = bill.amount_due if bill else 0.0
                         try:
+                            if amount > 0:
+                                body = f"Driver didn't end trip; auto-ended. Bill due: ₹{amount:.2f}. Pay to book your next trip."
+                            else:
+                                body = "Driver didn't end trip; auto-ended. Bill was already paid."
+
                             send_push_notification(
                                 session=session,
                                 user_ids=[trip.user_id],
                                 title="Trip auto-ended — bill ready",
-                                body=f"Driver didn't end trip; auto-ended. Bill ₹{amount:.2f}. Pay to book your next trip.",
+                                body=body,
                                 data={
                                     "type": "bill_generated",
                                     "trip_id": trip.id,
@@ -279,7 +277,7 @@ async def auto_end_trip_scheduler():
                                     session=session,
                                     user_ids=[driver_user.id],
                                     title="Trip auto-ended",
-                                    body=f"Trip #{trip.id} auto-ended. Bill ₹{amount:.2f} sent to user.",
+                                    body=f"Trip #{trip.id} auto-ended. Bill sent to user.",
                                     data={
                                         "type": "bill_generated",
                                         "trip_id": trip.id,
@@ -296,11 +294,6 @@ async def auto_end_trip_scheduler():
 
 
 async def driver_payment_timeout_scheduler():
-    """
-    Background job: Auto-reject driver if payment not made in time
-
-    Called by APScheduler at (trip_accepted_time + 30 minutes)
-    """
     try:
         with Session(engine) as session:
             trip_service = TripService()
@@ -308,7 +301,6 @@ async def driver_payment_timeout_scheduler():
             now = now_ist()
             timeout_window = now - timedelta(minutes=30)
 
-            # Find trips awaiting driver payment (use acceptance time, not booking time)
             trips = session.exec(
                 select(Trip).where(
                     Trip.status == "accepted_pending_payment",
@@ -319,7 +311,6 @@ async def driver_payment_timeout_scheduler():
             ).all()
 
             for trip in trips:
-                # Check if driver has paid in the meantime
                 payment_check = session.exec(
                     select(PaymentTransaction).where(
                         PaymentTransaction.trip_id == trip.id,
@@ -334,7 +325,6 @@ async def driver_payment_timeout_scheduler():
                     )
                     continue
 
-                # Auto-reject: bounce trip back to "searching" so allocation can re-tier
                 success, error = trip_service.transition_trip_state(
                     session, trip.id, "searching", validate=True
                 )
@@ -348,7 +338,6 @@ async def driver_payment_timeout_scheduler():
                     logger.info(
                         f"Trip {trip.id} auto-rejected due to driver payment timeout; back to searching"
                     )
-                    # TODO: Re-offer to next tier of drivers
                 else:
                     logger.error(f"Failed to auto-reject trip {trip.id}: {error}")
 
@@ -357,11 +346,6 @@ async def driver_payment_timeout_scheduler():
 
 
 async def daily_settlement_scheduler():
-    """
-    Background job: Generate final settlements at end of business day.
-    Only runs for trips that are truly finished — terminal status AND all shift days processed
-    (no more attendance rows in 'scheduled' or 'paused_payment').
-    """
     try:
         with Session(engine) as session:
             billing_service = BillingService()
@@ -376,11 +360,9 @@ async def daily_settlement_scheduler():
             ).all()
 
             for trip in completed_trips:
-                # Skip multi-day trips that haven't reached their end_date
                 if trip.end_date and today < trip.end_date:
                     continue
 
-                # Skip if any attendance row still pending
                 pending_attendance = session.exec(
                     select(TripAttendance).where(
                         TripAttendance.trip_id == trip.id,
@@ -390,14 +372,12 @@ async def daily_settlement_scheduler():
                 if pending_attendance:
                     continue
 
-                # Check if settlement already generated
                 existing_settlement = session.exec(
                     select(TripSettlement).where(TripSettlement.trip_id == trip.id)
                 ).first()
                 if existing_settlement:
                     continue
 
-                # Generate final settlement
                 success, settlement_id, error = (
                     billing_service.generate_final_settlement(session, trip.id)
                 )

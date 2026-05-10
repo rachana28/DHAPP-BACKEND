@@ -22,13 +22,13 @@ from app.core.models import (
     OTPVerificationRequest,
     TripSkipRequest,
     TripEndRequest,
-    UserPaymentRequest,
     BillPaymentRequest,
     MarkBillPaidRequest,
     FareEstimateRequest,
     TripAttendance,
     TripBill,
     TripSettlement,
+    PaymentTransaction,
 )
 from app.core.security import get_current_user
 from app.modules.trips.allocation import (
@@ -50,7 +50,7 @@ from app.utils.notifications import send_push_notification
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
 
-TIER_SIZE = 3  # Configurable: How many drivers per batch
+TIER_SIZE = 3
 
 
 @router.post("/estimate-fare")
@@ -60,20 +60,6 @@ def estimate_fare_for_booking(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Compute the bill BEFORE creating a trip. Same calculator runs on /book-request,
-    so the user always sees the exact amount they will be charged.
-
-    Returns:
-      {
-        "total": 3622.5,
-        "subtotal": 3450.0,
-        "tax": 172.5,
-        "currency": "INR",
-        "components": [{name, amount}, ...],
-        "meta": {hiring_type, num_days, hours_per_day, distance_km, is_night_booking, ...}
-      }
-    """
     if not fare_req.vehicle_type:
         raise HTTPException(400, "vehicle_type is required")
 
@@ -118,13 +104,9 @@ def create_booking_request(
     redis_client: redis.Redis = Depends(get_redis),
     trip_in: TripCreate,
 ):
-    """
-    Step 1: User creates booking. System Segregates & Offers to Tier 1.
-    """
     if not trip_in.vehicle_type:
         raise HTTPException(400, "Vehicle type is required.")
 
-    # Block parallel bookings while another trip is mid-flow
     BLOCKING_STATES = (
         "searching",
         "accepted_pending_payment",
@@ -147,7 +129,6 @@ def create_booking_request(
             "Complete or cancel it before booking another.",
         )
 
-    # Block new bookings if any prior trip has an unpaid daily bill
     payment_service = PaymentService(None)
     if payment_service.user_has_unpaid_bills(session, current_user.id):
         raise HTTPException(
@@ -155,37 +136,29 @@ def create_booking_request(
             "You have unpaid bills from previous trips. Please settle them before booking a new trip.",
         )
 
-    # 1. Save Trip
     trip_data = trip_in.model_dump()
 
-    # --- Calculate Dates for Monthly Bookings ---
     if trip_data.get("hiring_type") == "Monthly":
         if not trip_data.get("start_date") or not trip_data.get("end_date"):
             today = today_ist()
-            # Start date is the 1st of the current month
             start_date = today.replace(day=1)
             months_count = trip_data.get("months") or 1
 
-            # Calculate end date based on no. of months
             end_month = start_date.month + months_count - 1
             end_year = start_date.year + (end_month // 12)
             end_month = (end_month % 12) + 1
 
-            # Get the last day of the target month
             _, last_day = calendar.monthrange(end_year, end_month)
             end_date = date(end_year, end_month, last_day)
 
             trip_data["start_date"] = start_date
             trip_data["end_date"] = end_date
     else:
-        # Enforce date requirements for other hiring types
         if not trip_data.get("start_date") or not trip_data.get("end_date"):
             raise HTTPException(
                 400, "start_date and end_date are required for this hiring type."
             )
-    # --------------------------------------------------------
 
-    # ── Server-side fare calculation (authoritative — ignore any client-supplied fare) ──
     ok, err = validate_pricing_inputs(
         hiring_type=trip_data.get("hiring_type"),
         distance_km=trip_data.get("distance_km"),
@@ -219,7 +192,7 @@ def create_booking_request(
     )
     trip_data["fare"] = fare_dict["total"]
     trip_data["fare_breakdown"] = fare_dict
-    # Backfill resolved distance onto the Trip row so reports/refund logic see it.
+
     if trip_data.get("distance_km") is None and fare_dict["meta"].get("distance_km"):
         trip_data["distance_km"] = fare_dict["meta"]["distance_km"]
 
@@ -232,7 +205,6 @@ def create_booking_request(
     session.commit()
     session.refresh(db_trip)
 
-    # 2. Rank Drivers (Intelligent Algorithm)
     ranked_drivers = rank_drivers(session, trip_in.vehicle_type)
 
     if not ranked_drivers:
@@ -241,7 +213,6 @@ def create_booking_request(
         session.commit()
         return db_trip
 
-    # 3. Offer to Tier 1
     tier_1_drivers = ranked_drivers[:TIER_SIZE]
     create_offers_for_tier(session, db_trip.id, tier_1_drivers, tier=1)
 
@@ -254,13 +225,7 @@ def get_my_bookings(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get bookings for the current user.
-    - If User: Returns their trip history (Active & Past) with Driver details.
-    - If Driver: Returns trips they are assigned to.
-    """
     if current_user.role == "driver":
-        # Existing Driver Logic
         driver = session.exec(
             select(Driver).where(Driver.user_id == current_user.id)
         ).first()
@@ -269,7 +234,6 @@ def get_my_bookings(
         return session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
 
     elif current_user.role == "user":
-        # Driver details must NOT be exposed until the trip is finalized (both payments done).
         DRIVER_HIDDEN_STATES = {
             "searching",
             "no_drivers_found",
@@ -286,12 +250,10 @@ def get_my_bookings(
         )
         trips = session.exec(statement).all()
 
-        # Strip driver field for trips not yet finalized (mutates the loaded ORM object,
-        # but only within this read session — never committed).
         for t in trips:
             if t.status in DRIVER_HIDDEN_STATES:
                 t.driver = None
-                t.driver_id = None  # also hide id so frontend can't fetch separately
+                t.driver_id = None
         return trips
     else:
         return []
@@ -304,20 +266,10 @@ def cancel_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    User cancels a trip.
-
-    Honors payment-method rules:
-    - trip_day: cancel allowed any time before actual start; full refund
-    - advance_20: not cancelable once any successful payment recorded
-    - full_payment: not cancelable once any successful payment recorded
-    Also refunds any user payment per PaymentService.calculate_refund_amount.
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    # Determine whether user or driver is calling
     is_user = trip.user_id == current_user.id
     is_driver = False
     driver = None
@@ -349,7 +301,6 @@ def cancel_trip(
     if not can_cancel:
         raise HTTPException(400, reason or "Trip cannot be cancelled")
 
-    # Block cancellation while any daily bill is outstanding
     payment_service = PaymentService(redis_client)
     if payment_service.trip_has_unpaid_bills(session, trip_id):
         raise HTTPException(
@@ -373,12 +324,10 @@ def cancel_trip(
         if not ok:
             raise HTTPException(400, err or "Refund failed")
 
-    # State transition (skip strict validation: allow from many states)
     new_state = "cancelled_by_user" if is_user else "cancelled_by_driver"
     trip.status = new_state
     session.add(trip)
 
-    # Remove any open driver offers
     offers = session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all()
     for offer in offers:
         if offer.status == "pending":
@@ -398,17 +347,12 @@ def get_driver_offers(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get all pending offers for the logged-in driver.
-    Uses 'TripOfferPublic' to ensure NO sensitive credentials (user_id/driver_id) are exposed.
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    # Eager load the trip details
     statement = (
         select(TripOffer)
         .where(TripOffer.driver_id == driver.id)
@@ -427,11 +371,6 @@ def accept_trip_offer(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    DEPRECATED: legacy single-step accept. Use POST /trips/driver/{trip_id}/accept-and-pay
-    followed by POST /trips/driver/{trip_id}/process-payment so the driver acceptance fee
-    flow runs. Kept temporarily for client backward-compat.
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -449,16 +388,13 @@ def accept_trip_offer(
     if trip.status != "searching":
         raise HTTPException(400, "Trip has already been taken by another driver")
 
-    # 1. Assign Trip
     trip.driver_id = driver.id
     trip.status = "accepted"
 
-    # 2. Update Accepted Offer
     offer.status = "accepted"
     session.add(trip)
     session.add(offer)
 
-    # 3. DELETE all other offers for this trip (Requirement: automatically deleted)
     other_offers = session.exec(
         select(TripOffer).where(TripOffer.trip_id == trip.id)
     ).all()
@@ -468,7 +404,6 @@ def accept_trip_offer(
 
     session.commit()
 
-    # Invalidate cache if needed
     if redis_client:
         redis_client.delete(f"driver_{driver.id}")
 
@@ -484,9 +419,6 @@ def reject_trip_offer(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Driver rejects an offer.
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -497,32 +429,23 @@ def reject_trip_offer(
     if not offer or offer.driver_id != driver.id:
         raise HTTPException(404, "Offer not found")
 
-    # 1. Mark as Rejected
     offer.status = "rejected"
     session.add(offer)
-    session.commit()  # Commit the rejection first
+    session.commit()
 
-    # 2. Update: Instant Check
-    # Check if this rejection triggers next tier or cancellation
     trip = session.get(Trip, offer.trip_id)
     if trip and trip.status == "searching":
         escalated = attempt_trip_escalation(session, trip)
         if escalated:
-            session.commit()  # Commit the escalation/cancellation change
+            session.commit()
 
     return {"message": "Offer rejected"}
 
 
 @router.post("/check-escalation")
 def check_and_escalate_tiers(session: Session = Depends(get_session)):
-    """
-    Manual trigger endpoint (useful for testing/debugging).
-    """
     count = process_tier_escalation(session)
     return {"message": f"Escalated {count} trips."}
-
-
-# ============= NEW PAYMENT & TRIP MANAGEMENT APIS =============
 
 
 @router.post("/{trip_id}/select-payment-method")
@@ -532,14 +455,6 @@ def select_payment_method(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    User selects payment method after driver is assigned but before payment
-
-    Payment Methods:
-    - trip_day: Pay for each day
-    - advance_20: Pay 20% upfront, 80% at end
-    - full_payment: Pay full amount upfront with 5% discount
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
@@ -568,17 +483,6 @@ def driver_accept_and_initiate_payment(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Driver accepts trip offer and initiates payment
-    - Driver sees trip offer
-    - Driver clicks "Accept"
-    - Driver must pay fixed amount to finalize
-    - Sets timer for payment (30 min default)
-
-    Returns:
-    - If accept: Payment required amount and timer
-    - If reject: Trip re-offered to next driver
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -593,8 +497,6 @@ def driver_accept_and_initiate_payment(
         raise HTTPException(400, "Driver not matched to this trip")
 
     if accept_req.action == "reject":
-        # Driver rejects trip - mark offer as rejected and escalate.
-        # Also: if driver had already paid the acceptance fee, refund it and reset trip.
         offer = session.exec(
             select(TripOffer).where(
                 TripOffer.trip_id == trip_id,
@@ -620,7 +522,6 @@ def driver_accept_and_initiate_payment(
             trip.driver_payment_status = "unpaid"
             trip.driver_payment_amount = None
 
-        # Reset assignment so allocation can re-tier
         trip.driver_id = None
         trip.driver_accepted_at = None
         if trip.status in ("accepted_pending_payment", "payment_in_progress"):
@@ -638,16 +539,12 @@ def driver_accept_and_initiate_payment(
         }
 
     elif accept_req.action == "accept":
-        # Driver accepts trip
         trip.driver_id = driver.id
         trip.status = "accepted_pending_payment"
-        trip.driver_accepted_at = (
-            now_ist()
-        )  # Use dedicated field; preserve booking_time
+        trip.driver_accepted_at = now_ist()
 
-        # Store timer in Redis (30 min to pay)
         redis_key = f"driver_payment_timer:{trip_id}:{driver.id}"
-        redis_client.setex(redis_key, 1800, "pending")  # 30 min
+        redis_client.setex(redis_key, 1800, "pending")
 
         session.add(trip)
         session.commit()
@@ -672,14 +569,6 @@ def driver_process_payment(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Driver processes payment to finalize trip acceptance
-
-    After successful payment:
-    - Driver payment is locked
-    - Trip transitions to "payment_in_progress"
-    - Wait for user payment
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -698,101 +587,15 @@ def driver_process_payment(
             400, f"Trip status is {trip.status}, cannot process payment now"
         )
 
-    # Process payment
     payment_service = PaymentService(redis_client)
     success, error = payment_service.driver_accept_payment(session, trip_id, driver.id)
 
     if not success:
         raise HTTPException(400, f"Payment failed: {error}")
 
-    # Update trip status
-    trip_service = TripService()
-    success, error = trip_service.transition_trip_state(
-        session, trip_id, "payment_in_progress", validate=True
-    )
-
-    if not success:
-        raise HTTPException(400, f"Status update failed: {error}")
-
-    # Clear timer
-    redis_key = f"driver_payment_timer:{trip_id}:{driver.id}"
-    redis_client.delete(redis_key)
-
-    return {
-        "message": "Driver payment successful. Waiting for user payment.",
-        "trip_id": trip_id,
-        "trip_status": trip.status,
-    }
-
-
-@router.post("/{trip_id}/user-payment")
-def user_process_payment(
-    trip_id: int,
-    payment_req: UserPaymentRequest,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-    redis_client: redis.Redis = Depends(get_redis),
-):
-    """
-    User makes payment for trip based on selected payment method
-
-    Payment Method Effects:
-    - trip_day: Pays for 1 day only
-    - advance_20: Pays 20% of total fare
-    - full_payment: Pays full amount (5% discount applied)
-
-    After payment: Trip moves to active_pending_otp
-    """
-    trip = session.get(Trip, trip_id)
-    if not trip:
-        raise HTTPException(404, "Trip not found")
-
-    if trip.user_id != current_user.id:
-        raise HTTPException(403, "Not authorized")
-
-    if trip.status != "payment_in_progress":
-        raise HTTPException(400, f"Trip status is {trip.status}, cannot pay now")
-
-    if not trip.payment_method:
-        raise HTTPException(400, "Payment method not selected")
-
-    # Validate payment amount based on method
-    if not trip.fare:
-        raise HTTPException(400, "Trip fare not set")
-
-    if trip.payment_method == "trip_day":
-        # For trip_day, amount should be calculated per day (1 day's fare)
-        expected_amount = trip.fare
-    elif trip.payment_method == "advance_20":
-        expected_amount = trip.fare * 0.20
-    elif trip.payment_method == "full_payment":
-        # Full payment has 5% discount
-        expected_amount = trip.fare * 0.95
-    else:
-        raise HTTPException(400, "Invalid payment method on trip")
-
-    if abs(payment_req.amount - expected_amount) > 0.01:
-        raise HTTPException(
-            400,
-            f"Payment amount mismatch. Expected {expected_amount:.2f}, got {payment_req.amount:.2f}",
-        )
-
-    # Process payment
-    payment_service = PaymentService(redis_client)
-    success, error = payment_service.user_make_payment(
-        session,
-        trip_id,
-        str(current_user.id),
-        payment_req.amount,
-        payment_req.payment_method,
-    )
-
-    if not success:
-        raise HTTPException(400, f"Payment failed: {error}")
-
-    # After successful payment, generate scheduled times
     trip_service = TripService()
 
+    # Generate schedules upon successful driver payment and fast track to active_pending_otp
     if trip.start_date:
         duration_hours = trip_service.get_trip_duration_hours(trip.shift_details)
         trip_start_time = trip_service.get_trip_start_time(
@@ -808,7 +611,6 @@ def user_process_payment(
             )
             trip.trip_duration_hours = duration_hours
 
-        # Create attendance records (single-day if no end_date), honoring selected_days
         end_date_for_attendance = trip.end_date or trip.start_date
         effective_start_dt = trip_start_time or datetime.combine(
             trip.start_date, datetime.min.time()
@@ -825,7 +627,6 @@ def user_process_payment(
         if not att_ok:
             raise HTTPException(400, att_err)
 
-    # Transition to active_pending_otp (waiting for OTP)
     success, error = trip_service.transition_trip_state(
         session, trip_id, "active_pending_otp", validate=True
     )
@@ -833,12 +634,13 @@ def user_process_payment(
     if not success:
         raise HTTPException(400, f"Status update failed: {error}")
 
+    redis_key = f"driver_payment_timer:{trip_id}:{driver.id}"
+    redis_client.delete(redis_key)
+
     return {
-        "message": "User payment successful. OTP will be sent before trip start.",
+        "message": "Driver payment successful. Trip is ready for OTP verification.",
         "trip_id": trip_id,
-        "scheduled_start": trip.scheduled_start_time.isoformat()
-        if trip.scheduled_start_time
-        else None,
+        "trip_status": trip.status,
     }
 
 
@@ -849,13 +651,6 @@ def request_otp_for_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    USER-only. Returns the trip-day OTP that the user should read out to the driver.
-    Auto-generated by the scheduler 15 min before trip_start; this endpoint also
-    works as resend (idempotent within validity window).
-
-    Driver app MUST NOT call this endpoint — it 403s.
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
@@ -868,6 +663,11 @@ def request_otp_for_trip(
             400, f"Trip status is {trip.status}, OTP cannot be generated"
         )
 
+    if not trip.payment_method:
+        raise HTTPException(
+            400, "Please select a payment method before requesting OTP."
+        )
+
     if not trip.scheduled_start_time:
         raise HTTPException(400, "Trip schedule not set")
 
@@ -877,11 +677,29 @@ def request_otp_for_trip(
             "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
         )
 
-    # Build today's start datetime (carry over time-of-day from scheduled_start_time)
-    trip_day = today_ist()
-    trip_start_for_day = trip.scheduled_start_time.replace(
-        year=trip_day.year, month=trip_day.month, day=trip_day.day
-    )
+    # Fetch the NEXT pending scheduled attendance, not strictly today's.
+    attendance = session.exec(
+        select(TripAttendance)
+        .where(
+            TripAttendance.trip_id == trip_id,
+            TripAttendance.status.in_(["scheduled", "paused_payment"]),
+        )
+        .order_by(TripAttendance.trip_date)
+    ).first()
+
+    if not attendance:
+        raise HTTPException(400, "No pending scheduled shifts found for this trip.")
+
+    # Enforce the 30-minute pre-trip generation window
+    time_until_start = attendance.scheduled_start - now_ist()
+    if time_until_start > timedelta(minutes=30):
+        raise HTTPException(
+            400,
+            f"OTP can only be requested within 30 minutes of the scheduled trip start time ({attendance.scheduled_start.strftime('%I:%M %p')}).",
+        )
+
+    trip_day = attendance.trip_date
+    trip_start_for_day = attendance.scheduled_start
 
     otp_service = OTPService(redis_client)
     otp, error = otp_service.generate_otp(
@@ -890,25 +708,23 @@ def request_otp_for_trip(
     if error:
         raise HTTPException(400, error)
 
-    # Push OTP to user (so the driver-side gets it via the user, not by polling).
-    # P3 fix: Don't expose OTP in notification body/data (lock-screen privacy)
     try:
         send_push_notification(
             session=session,
             user_ids=[trip.user_id],
             title="Trip OTP Ready",
             body=f"Your trip OTP is ready. Open the app to view it and share with your driver to start trip #{trip_id}.",
-            data={"type": "trip_otp", "trip_id": trip_id},  # Removed "otp" field
+            data={"type": "trip_otp", "trip_id": trip_id},
         )
     except Exception:
         pass
 
     expiry_time = otp_service.get_otp_expiry_time(session, trip_id, trip_day)
-    validity_start = trip_start_for_day - timedelta(minutes=15)
+    validity_start = trip_start_for_day - timedelta(minutes=30)
 
     return {
         "message": "OTP generated. Share this with your driver to start the trip.",
-        "otp": otp,  # delivered to user only — driver never sees this endpoint's response
+        "otp": otp,
         "trip_date": trip_day.isoformat(),
         "validity_start": validity_start.isoformat(),
         "validity_end": expiry_time.isoformat() if expiry_time else None,
@@ -926,10 +742,6 @@ def verify_otp_for_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    DRIVER-only. The driver enters the OTP that the user shared verbally.
-    On success, today's shift moves the trip to "ongoing" and stamps actual_start_time.
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -948,16 +760,28 @@ def verify_otp_for_trip(
             400, f"Trip status is {trip.status}, OTP verification not allowed"
         )
 
-    trip_day = today_ist()
+    attendance = session.exec(
+        select(TripAttendance)
+        .where(
+            TripAttendance.trip_id == trip_id,
+            not TripAttendance.user_otp_verified,
+            TripAttendance.status.in_(["scheduled", "paused_payment"]),
+        )
+        .order_by(TripAttendance.trip_date)
+    ).first()
+
+    if not attendance:
+        raise HTTPException(400, "No pending scheduled shifts found for this trip.")
+
+    shift_date = attendance.trip_date
 
     otp_service = OTPService(redis_client)
     is_valid, error = otp_service.verify_otp(
-        session, trip_id, driver.id, otp_req.otp, trip_date=trip_day
+        session, trip_id, driver.id, otp_req.otp, trip_date=shift_date
     )
     if not is_valid:
         raise HTTPException(400, error)
 
-    # Transition trip to "active" then immediately to "ongoing"
     trip_service = TripService()
     ok, err = trip_service.transition_trip_state(
         session, trip_id, "active", validate=True
@@ -972,22 +796,21 @@ def verify_otp_for_trip(
 
     trip.actual_start_time = now_ist()
 
-    # Mark today's attendance OTP-verified (final 'present' is set on trip end)
-    attendance = session.exec(
-        select(TripAttendance).where(
-            TripAttendance.trip_id == trip_id,
-            TripAttendance.trip_date == trip_day,
-        )
-    ).first()
-    if attendance:
-        attendance.user_otp_verified = True
-        attendance.driver_otp_verified = True
-        attendance.actual_start = trip.actual_start_time
-        session.add(attendance)
+    attendance.user_otp_verified = True
+    attendance.driver_otp_verified = True
+    attendance.actual_start = trip.actual_start_time
+    session.add(attendance)
     session.add(trip)
     session.commit()
 
-    # Push notification to user: trip started
+    from app.modules.trips.billing_service import BillingService
+
+    try:
+        billing_service = BillingService()
+        billing_service.generate_daily_bill(session, trip_id, shift_date)
+    except Exception:
+        pass
+
     try:
         send_push_notification(
             session=session,
@@ -997,7 +820,7 @@ def verify_otp_for_trip(
             data={"type": "trip_started", "trip_id": trip_id},
         )
     except Exception:
-        pass  # Notifications must never block the API
+        pass
 
     return {
         "message": "OTP verified. Trip is now ongoing!",
@@ -1013,25 +836,10 @@ def skip_trip_day(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    User or Driver marks a day as skip/absent
-
-    Skip Reasons:
-    - user_emergency
-    - driver_emergency
-    - weather
-    - vehicle_issue
-
-    Result:
-    - Day marked as absent
-    - No charges for that day
-    - If enough days skipped, may impact settlement
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    # Determine if user or driver
     is_user = trip.user_id == current_user.id
     marked_by = "user"
 
@@ -1043,7 +851,6 @@ def skip_trip_day(
             raise HTTPException(403, "Not authorized")
         marked_by = "driver"
 
-    # Mark as absent
     trip_service = TripService()
     success, error = trip_service.mark_trip_day_absent(
         session, trip_id, skip_req.trip_date, skip_req.reason, marked_by
@@ -1067,14 +874,6 @@ def driver_end_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Driver manually ends trip after completed hours
-
-    After ending:
-    - Trip marked as "completed"
-    - Billing starts
-    - Settlement can be generated
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -1091,9 +890,21 @@ def driver_end_trip(
     if trip.status != "ongoing":
         raise HTTPException(400, f"Trip status is {trip.status}, cannot end now")
 
-    # Determine if more shift days remain (multi-day booking).
-    today = today_ist()
-    has_future_shifts = (trip.end_date is not None) and (today < trip.end_date)
+    active_attendance = session.exec(
+        select(TripAttendance)
+        .where(
+            TripAttendance.trip_id == trip_id,
+            TripAttendance.user_otp_verified == True,
+            TripAttendance.status.in_(["scheduled", "paused_payment"]),
+        )
+        .order_by(TripAttendance.trip_date.desc())
+    ).first()
+
+    if not active_attendance:
+        raise HTTPException(400, "Could not find the active shift to end.")
+
+    shift_date = active_attendance.trip_date
+    has_future_shifts = (trip.end_date is not None) and (shift_date < trip.end_date)
 
     trip_service = TripService()
     next_state = "active_pending_otp" if has_future_shifts else "completed"
@@ -1103,18 +914,14 @@ def driver_end_trip(
     if not success:
         raise HTTPException(400, error)
 
-    # Set actual end time only when this was the final shift day
-    # P0 fix: When transitioning to active_pending_otp, also advance scheduled times to next day
     if not has_future_shifts:
-        # Normalize any inbound datetime to IST naive (accepts both naive and tz-aware).
         trip.actual_end_time = to_ist_naive(end_req.actual_end_time) or now_ist()
     else:
-        # Multi-day trip: find next attendance day and update scheduled times
         next_attendance = session.exec(
             select(TripAttendance)
             .where(
                 TripAttendance.trip_id == trip_id,
-                TripAttendance.trip_date > today,
+                TripAttendance.trip_date > shift_date,
             )
             .order_by(TripAttendance.trip_date)
         ).first()
@@ -1126,25 +933,30 @@ def driver_end_trip(
     session.add(trip)
     session.commit()
 
-    # Mark today's attendance as PRESENT (success after trip end, per requirement)
-    trip_service.mark_trip_day_present(session, trip_id, today)
+    trip_service.mark_trip_day_present(session, trip_id, shift_date)
 
-    # Generate daily bill
     billing_service = BillingService()
     bill_success, bill_id, bill_error = billing_service.generate_daily_bill(
-        session, trip_id, today_ist()
+        session, trip_id, shift_date
     )
 
-    # Push notification: bill ready, payment due
+    if not bill_success and bill_id:
+        bill_success = True
+
     if bill_success and bill_id:
         bill = session.get(TripBill, bill_id)
-        amount = bill.total_amount if bill else 0.0
+        amount = bill.amount_due if bill else 0.0
         try:
+            if amount > 0:
+                body = f"Trip #{trip_id} ended. Amount due: ₹{amount:.2f}. Pay to book your next trip."
+            else:
+                body = f"Trip #{trip_id} ended. Bill already paid. Thank you!"
+
             send_push_notification(
                 session=session,
                 user_ids=[trip.user_id],
                 title="Trip ended — bill ready",
-                body=f"Trip #{trip_id} ended. Amount due: ₹{amount:.2f}. Pay to book your next trip.",
+                body=body,
                 data={
                     "type": "bill_generated",
                     "trip_id": trip_id,
@@ -1152,7 +964,6 @@ def driver_end_trip(
                     "amount": amount,
                 },
             )
-            # Notify driver too so they can collect cash if needed
             driver_user = session.exec(
                 select(User)
                 .join(Driver, Driver.user_id == User.id)
@@ -1162,8 +973,8 @@ def driver_end_trip(
                 send_push_notification(
                     session=session,
                     user_ids=[driver_user.id],
-                    title="Trip ended — bill generated",
-                    body=f"Trip #{trip_id} bill ₹{amount:.2f} sent to user.",
+                    title="Trip ended",
+                    body=f"Trip #{trip_id} ended. Bill sent to user.",
                     data={
                         "type": "bill_generated",
                         "trip_id": trip_id,
@@ -1179,7 +990,7 @@ def driver_end_trip(
         "actual_end_time": trip.actual_end_time.isoformat()
         if trip.actual_end_time
         else None,
-        "trip_status": trip.status,  # active_pending_otp (more days) or completed (final)
+        "trip_status": trip.status,
         "more_days_remaining": has_future_shifts,
         "bill_generated": bill_success,
         "bill_id": bill_id,
@@ -1193,21 +1004,10 @@ def get_trip_bill(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get detailed bill for a specific day
-
-    Returns itemized breakdown with:
-    - Base fare
-    - Allowances
-    - Taxes
-    - Discounts
-    - Total amount
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    # Check authorization
     is_user = trip.user_id == current_user.id
     is_driver = False
 
@@ -1220,7 +1020,6 @@ def get_trip_bill(
     if not is_user and not is_driver:
         raise HTTPException(403, "Not authorized")
 
-    # Validate the bill actually belongs to this trip (prevents cross-trip read)
     bill_row = session.get(TripBill, bill_id)
     if not bill_row or bill_row.trip_id != trip_id:
         raise HTTPException(404, "Bill not found")
@@ -1240,21 +1039,10 @@ def get_trip_settlement(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get final settlement after all trips completed
-
-    Shows:
-    - Total days worked
-    - Total earned
-    - Total paid upfront
-    - Balance due/refund
-    - Payment status
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    # Check authorization
     is_user = trip.user_id == current_user.id
     is_driver = False
 
@@ -1267,7 +1055,6 @@ def get_trip_settlement(
     if not is_user and not is_driver:
         raise HTTPException(403, "Not authorized")
 
-    # Get settlement
     settlement = session.exec(
         select(TripSettlement).where(TripSettlement.trip_id == trip_id)
     ).first()
@@ -1287,21 +1074,10 @@ def get_trip_summary(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get comprehensive trip summary
-
-    Shows:
-    - Trip status
-    - Days present/absent
-    - Payment status
-    - Billing information
-    - Trip timeline
-    """
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    # Check authorization
     is_user = trip.user_id == current_user.id
     is_driver = False
 
@@ -1323,9 +1099,6 @@ def get_trip_summary(
     return summary
 
 
-# ============= DAILY-BILL SETTLEMENT APIS =============
-
-
 @router.get("/{trip_id}/bills")
 def list_trip_bills(
     trip_id: int,
@@ -1333,7 +1106,6 @@ def list_trip_bills(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """List all daily bills for a trip (user or assigned driver)."""
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
@@ -1353,7 +1125,7 @@ def list_trip_bills(
         TripBill.bill_type == "daily_bill",
     )
     if only_unpaid:
-        stmt = stmt.where(TripBill.is_paid == False)  # noqa: E712
+        stmt = stmt.where(not TripBill.is_paid)
     return session.exec(stmt.order_by(TripBill.bill_date)).all()
 
 
@@ -1365,12 +1137,18 @@ def user_pay_bill(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """USER pays a daily bill via the (dummy) payment gateway."""
     bill = session.get(TripBill, bill_id)
     if not bill:
         raise HTTPException(404, "Bill not found")
     if bill.user_id != current_user.id:
         raise HTTPException(403, "Not authorized for this bill")
+
+    trip = session.get(Trip, bill.trip_id)
+    if trip and trip.payment_method != "trip_day":
+        raise HTTPException(
+            400,
+            f"Daily bills cannot be paid individually for the '{trip.payment_method}' payment method. Please pay the final settlement at the end of the trip.",
+        )
 
     payment_service = PaymentService(redis_client)
     ok, err = payment_service.pay_bill_online(
@@ -1379,7 +1157,6 @@ def user_pay_bill(
     if not ok:
         raise HTTPException(400, err or "Payment failed")
 
-    # Notify both parties
     try:
         send_push_notification(
             session=session,
@@ -1420,10 +1197,6 @@ def driver_mark_bill_paid(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    DRIVER marks a daily bill as paid (user paid in cash directly).
-    Equivalent to user_pay_bill in effect — unpauses the trip and unblocks future bookings.
-    """
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -1436,6 +1209,13 @@ def driver_mark_bill_paid(
     if bill.driver_id != driver.id:
         raise HTTPException(403, "Not authorized for this bill")
 
+    trip = session.get(Trip, bill.trip_id)
+    if trip and trip.payment_method != "trip_day":
+        raise HTTPException(
+            400,
+            f"Daily bills cannot be paid individually for the '{trip.payment_method}' payment method.",
+        )
+
     payment_service = PaymentService(redis_client)
     ok, err = payment_service.mark_bill_paid_offline(
         session, bill_id, driver.id, mark_req.note
@@ -1443,7 +1223,6 @@ def driver_mark_bill_paid(
     if not ok:
         raise HTTPException(400, err or "Mark-paid failed")
 
-    # Notify both parties
     try:
         send_push_notification(
             session=session,
@@ -1480,4 +1259,90 @@ def driver_mark_bill_paid(
         "trip_id": bill.trip_id,
         "amount": bill.total_amount,
         "paid_by": "driver_offline",
+    }
+
+
+@router.post("/settlement/{settlement_id}/pay")
+def pay_trip_settlement(
+    settlement_id: int,
+    pay_req: BillPaymentRequest,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """User pays the final trip settlement for advance_20 or full_payment methods."""
+    settlement = session.get(TripSettlement, settlement_id)
+    if not settlement:
+        raise HTTPException(404, "Settlement not found")
+
+    if settlement.user_id != current_user.id:
+        raise HTTPException(403, "Not authorized for this settlement")
+
+    if settlement.user_payment_status == "paid":
+        raise HTTPException(400, "Settlement is already paid")
+
+    if settlement.remaining_due <= 0:
+        raise HTTPException(400, "No remaining amount due")
+
+    payment_service = PaymentService(redis_client)
+    success, txn_id = payment_service.process_dummy_payment(
+        amount=settlement.remaining_due,
+        payer_id=str(current_user.id),
+        payer_type="user",
+        payment_method=pay_req.payment_method,
+    )
+
+    if not success:
+        raise HTTPException(400, f"Payment failed: {txn_id}")
+
+    # Record payment transaction
+    payment_txn = PaymentTransaction(
+        trip_id=settlement.trip_id,
+        user_id=settlement.user_id,
+        payer_type="user",
+        payment_type="settlement",
+        amount=settlement.remaining_due,
+        payment_status="success",
+        payment_method=pay_req.payment_method,
+        gateway_transaction_id=txn_id,
+        completed_at=now_ist(),
+    )
+    session.add(payment_txn)
+
+    settlement.user_payment_status = "paid"
+    settlement.paid_at = now_ist()
+    session.add(settlement)
+
+    # Optional backend cleanup: mark all associated unpaid daily bills as paid
+    unpaid_bills = session.exec(
+        select(TripBill).where(
+            TripBill.trip_id == settlement.trip_id, not TripBill.is_paid
+        )
+    ).all()
+    for bill in unpaid_bills:
+        bill.is_paid = True
+        bill.amount_paid = bill.total_amount
+        bill.amount_due = 0.0
+        bill.paid_at = now_ist()
+        bill.paid_by = "user_online"
+        session.add(bill)
+
+    session.commit()
+
+    try:
+        send_push_notification(
+            session=session,
+            user_ids=[settlement.user_id],
+            title="Settlement Paid",
+            body=f"Your final settlement of ₹{settlement.remaining_due:.2f} has been paid successfully.",
+            data={"type": "settlement_paid", "trip_id": settlement.trip_id},
+        )
+    except Exception:
+        pass
+
+    return {
+        "message": "Settlement paid successfully",
+        "settlement_id": settlement.id,
+        "trip_id": settlement.trip_id,
+        "amount_paid": settlement.remaining_due,
     }

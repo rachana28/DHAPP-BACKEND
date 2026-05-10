@@ -1131,14 +1131,6 @@ class TripEndRequest(SQLModel):
     actual_end_time: Optional[datetime] = None
 
 
-class UserPaymentRequest(SQLModel):
-    """User completes payment"""
-
-    trip_id: int
-    amount: float
-    payment_method: str = "card"
-
-
 class FareEstimateRequest(SQLModel):
     """
     Booking inputs needed to compute the fare BEFORE the trip is created.
