@@ -1,9 +1,9 @@
 import redis
 import calendar
 from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlmodel import Session, select, desc
-from typing import List, Union
+from typing import List, Optional
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_session, get_redis
@@ -13,17 +13,11 @@ from app.core.models import (
     TripOffer,
     TripOfferPublic,
     TripReadUser,
+    TripReadDriver,
     TripSafe,
+    TripBillRead,
     Driver,
     User,
-    PaymentMethodSelect,
-    DriverAcceptanceRequest,
-    DriverPaymentRequest,
-    OTPVerificationRequest,
-    TripSkipRequest,
-    TripEndRequest,
-    BillPaymentRequest,
-    MarkBillPaidRequest,
     FareEstimateRequest,
     TripAttendance,
     TripBill,
@@ -159,6 +153,16 @@ def create_booking_request(
                 400, "start_date and end_date are required for this hiring type."
             )
 
+    today = today_ist()
+    if trip_data.get("start_date") and trip_data["start_date"] < today:
+        raise HTTPException(400, "start_date cannot be in the past.")
+    if (
+        trip_data.get("end_date")
+        and trip_data.get("start_date")
+        and trip_data["end_date"] < trip_data["start_date"]
+    ):
+        raise HTTPException(400, "end_date cannot be before start_date.")
+
     ok, err = validate_pricing_inputs(
         hiring_type=trip_data.get("hiring_type"),
         distance_km=trip_data.get("distance_km"),
@@ -219,7 +223,7 @@ def create_booking_request(
     return db_trip
 
 
-@router.get("/my-bookings", response_model=List[Union[TripReadUser, TripSafe]])
+@router.get("/my-bookings")
 def get_my_bookings(
     *,
     session: Session = Depends(get_session),
@@ -231,7 +235,30 @@ def get_my_bookings(
         ).first()
         if not driver:
             return []
-        return session.exec(select(Trip).where(Trip.driver_id == driver.id)).all()
+        trips = session.exec(
+            select(Trip)
+            .where(Trip.driver_id == driver.id)
+            .order_by(desc(Trip.booking_time))
+            .options(selectinload(Trip.user))
+        ).all()
+        # Hand-marshal so we never leak the user UUID or internal flags.
+        return [
+            TripReadDriver(
+                **{
+                    k: getattr(t, k)
+                    for k in TripReadDriver.model_fields.keys()
+                    if k != "user"
+                },
+                user={
+                    "full_name": t.user.full_name if t.user else None,
+                    "phone_number": t.user.phone_number if t.user else None,
+                    "avatar_url": getattr(t.user, "avatar_url", None) if t.user else None,
+                }
+                if t.user
+                else None,
+            )
+            for t in trips
+        ]
 
     elif current_user.role == "user":
         DRIVER_HIDDEN_STATES = {
@@ -250,11 +277,15 @@ def get_my_bookings(
         )
         trips = session.exec(statement).all()
 
+        # Build a Pydantic view per trip so mutating `driver`/`driver_id`
+        # on the in-memory ORM row can never accidentally persist.
+        result = []
         for t in trips:
+            view = TripReadUser.model_validate(t, from_attributes=True)
             if t.status in DRIVER_HIDDEN_STATES:
-                t.driver = None
-                t.driver_id = None
-        return trips
+                view.driver = None
+            result.append(view)
+        return result
     else:
         return []
 
@@ -311,25 +342,51 @@ def cancel_trip(
             400,
             "Cannot cancel trip with unpaid daily bills. Settle outstanding bills first.",
         )
-    refund_amount, refund_err = payment_service.calculate_refund_amount(
-        session,
-        trip_id,
-        cancellation_reason=("user_cancel" if is_user else "driver_cancel"),
-    )
+
+    # User refund
+    user_refund, refund_err = payment_service.calculate_refund_amount(session, trip_id)
     if refund_err:
         raise HTTPException(400, refund_err)
-    if refund_amount and refund_amount > 0:
+    if user_refund and user_refund > 0:
         ok, err = payment_service.process_refund(
             session,
             trip_id,
-            refund_amount,
+            user_refund,
             reason=("Cancelled by user" if is_user else "Cancelled by driver"),
         )
         if not ok:
             raise HTTPException(400, err or "Refund failed")
 
+    # Driver acceptance-fee refund. Without this the driver loses the ₹100
+    # whenever a trip is cancelled before any shift starts — regardless of who
+    # cancelled.
+    driver_refund = 0.0
+    if trip.driver_id and trip.actual_start_time is None:
+        driver_refund = payment_service.calculate_driver_fee_refund(
+            session, trip_id, trip.driver_id
+        )
+        if driver_refund > 0:
+            ok, err = payment_service.refund_driver_acceptance_fee(
+                session,
+                trip_id,
+                trip.driver_id,
+                reason=(
+                    "Trip cancelled by user"
+                    if is_user
+                    else "Trip cancelled by driver"
+                ),
+            )
+            if not ok:
+                raise HTTPException(400, err or "Driver fee refund failed")
+            trip.driver_payment_status = "unpaid"
+            trip.driver_payment_amount = None
+
     new_state = "cancelled_by_user" if is_user else "cancelled_by_driver"
     trip.status = new_state
+    # Unbind the driver so they're free to accept other trips.
+    cancelled_driver_id = trip.driver_id
+    trip.driver_id = None
+    trip.driver_accepted_at = None
     session.add(trip)
 
     offers = session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all()
@@ -339,9 +396,17 @@ def cancel_trip(
 
     session.commit()
 
+    # Bust driver-availability cache so the freed driver can be re-ranked.
+    if cancelled_driver_id and redis_client:
+        try:
+            redis_client.delete(f"driver_{cancelled_driver_id}")
+        except Exception:
+            pass
+
     return {
         "message": "Trip cancelled successfully",
-        "refund_amount": refund_amount or 0.0,
+        "refund_amount": user_refund or 0.0,
+        "driver_refund_amount": driver_refund,
         "trip_status": new_state,
     }
 
@@ -417,7 +482,7 @@ def check_and_escalate_tiers(session: Session = Depends(get_session)):
 @router.post("/{trip_id}/select-payment-method")
 def select_payment_method(
     trip_id: int,
-    payment_req: PaymentMethodSelect,
+    payment_method: str = Body(..., embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
@@ -431,20 +496,20 @@ def select_payment_method(
     if trip.payment_method:
         raise HTTPException(400, "Payment method already selected")
 
-    if payment_req.payment_method not in ["trip_day", "advance_20", "full_payment"]:
+    if payment_method not in ["trip_day", "advance_20", "full_payment"]:
         raise HTTPException(400, "Invalid payment method")
 
-    trip.payment_method = payment_req.payment_method
+    trip.payment_method = payment_method
     session.add(trip)
     session.commit()
 
-    return {"message": f"Payment method {payment_req.payment_method} selected"}
+    return {"message": f"Payment method {payment_method} selected"}
 
 
 @router.post("/driver/{trip_id}/accept-and-pay")
 def driver_accept_and_initiate_payment(
     trip_id: int,
-    accept_req: DriverAcceptanceRequest,
+    action: str = Body(..., embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
@@ -468,7 +533,7 @@ def driver_accept_and_initiate_payment(
     if trip.driver_id and trip.driver_id != driver.id:
         raise HTTPException(400, "Trip already accepted by another driver")
 
-    if accept_req.action == "reject":
+    if action == "reject":
         offer = session.exec(
             select(TripOffer)
             .where(
@@ -512,7 +577,7 @@ def driver_accept_and_initiate_payment(
             "refund_amount": refund_amount,
         }
 
-    elif accept_req.action == "accept":
+    elif action == "accept":
         # Status guard under the row lock — another writer may have just
         # transitioned the trip out from under us before we got the lock.
         if trip.status not in ("searching", "accepted_pending_payment"):
@@ -578,11 +643,14 @@ def driver_accept_and_initiate_payment(
 @router.post("/driver/{trip_id}/process-payment")
 def driver_process_payment(
     trip_id: int,
-    payment_req: DriverPaymentRequest,
+    payment_method: str = Body("card", embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
+    # payment_method accepted for forward-compat with future gateways; the
+    # acceptance fee charge is server-controlled via driver_accept_payment.
+    _ = payment_method
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -681,7 +749,7 @@ def request_otp_for_trip(
     if trip.user_id != current_user.id:
         raise HTTPException(403, "Only the trip's user can fetch the OTP")
 
-    if trip.status not in ("active_pending_otp", "ongoing"):
+    if trip.status != "active_pending_otp":
         raise HTTPException(
             400, f"Trip status is {trip.status}, OTP cannot be generated"
         )
@@ -740,6 +808,13 @@ def request_otp_for_trip(
             400,
             f"OTP can only be requested within 30 minutes of the scheduled trip start time ({attendance.scheduled_start.strftime('%I:%M %p %d-%b')}).",
         )
+    # Upper bound: don't hand out an OTP for a shift whose 12-hour window has
+    # already lapsed. The expiry sweeper will mark it skipped_by_system shortly.
+    if now > attendance.scheduled_start + timedelta(hours=12):
+        raise HTTPException(
+            400,
+            "OTP window for this shift has already expired.",
+        )
 
     trip_day = attendance.trip_date
     trip_start_for_day = attendance.scheduled_start
@@ -780,7 +855,7 @@ def request_otp_for_trip(
 @router.post("/{trip_id}/verify-otp")
 def verify_otp_for_trip(
     trip_id: int,
-    otp_req: OTPVerificationRequest,
+    otp: str = Body(..., embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
@@ -835,7 +910,7 @@ def verify_otp_for_trip(
 
     otp_service = OTPService(redis_client)
     is_valid, error = otp_service.verify_otp(
-        session, trip_id, driver.id, otp_req.otp, trip_date=shift_date
+        session, trip_id, driver.id, otp, trip_date=shift_date
     )
     if not is_valid:
         raise HTTPException(400, error)
@@ -844,11 +919,16 @@ def verify_otp_for_trip(
     trip_service.transition_trip_state(session, trip_id, "active", validate=False)
     trip_service.transition_trip_state(session, trip_id, "ongoing", validate=False)
 
-    trip.actual_start_time = now_ist()
+    verify_now = now_ist()
+    # Set trip-level actual_start_time only the FIRST time a shift is verified.
+    # Per-day starts are tracked on TripAttendance.actual_start; the trip-level
+    # field should reflect when the booking actually began.
+    if trip.actual_start_time is None:
+        trip.actual_start_time = verify_now
 
     valid_attendance.user_otp_verified = True
     valid_attendance.driver_otp_verified = True
-    valid_attendance.actual_start = trip.actual_start_time
+    valid_attendance.actual_start = verify_now
     session.add(valid_attendance)
     session.add(trip)
     session.commit()
@@ -880,7 +960,8 @@ def verify_otp_for_trip(
 @router.post("/{trip_id}/skip-day")
 def skip_trip_day(
     trip_id: int,
-    skip_req: TripSkipRequest,
+    trip_date: date = Body(...),
+    reason: Optional[str] = Body(None),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
@@ -902,13 +983,13 @@ def skip_trip_day(
     today = today_ist()
 
     # Cannot skip a past day.
-    if skip_req.trip_date < today:
+    if trip_date < today:
         raise HTTPException(400, "Cannot skip a past trip day.")
 
     # Skip is a same-day action. To drop a future day, use the cancellation
     # flow — preventing users/drivers from pre-emptively voiding shifts that
     # are still days away (e.g. tomorrow's shift right after today's ended).
-    if skip_req.trip_date != today:
+    if trip_date != today:
         raise HTTPException(
             400,
             "Skip is only allowed for today's shift. To remove a future day, cancel the trip.",
@@ -924,7 +1005,7 @@ def skip_trip_day(
 
     trip_service = TripService()
     success, error = trip_service.mark_trip_day_absent(
-        session, trip_id, skip_req.trip_date, skip_req.reason, marked_by
+        session, trip_id, trip_date, reason, marked_by
     )
 
     if not success:
@@ -947,9 +1028,9 @@ def skip_trip_day(
             settlement_id = sid
 
     return {
-        "message": f"Day {skip_req.trip_date} marked as absent by {marked_by}",
+        "message": f"Day {trip_date} marked as absent by {marked_by}",
         "trip_id": trip_id,
-        "trip_date": skip_req.trip_date.isoformat(),
+        "trip_date": trip_date.isoformat(),
         "settlement_id": settlement_id,
     }
 
@@ -957,11 +1038,12 @@ def skip_trip_day(
 @router.post("/{trip_id}/end-trip")
 def driver_end_trip(
     trip_id: int,
-    end_req: TripEndRequest,
+    notes: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
+    _ = notes  # currently unused; retained as accepted body field for the driver app
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -1019,8 +1101,9 @@ def driver_end_trip(
     if not success:
         raise HTTPException(400, error)
 
+    end_now = now_ist()
     if not has_future_shifts:
-        trip.actual_end_time = to_ist_naive(end_req.actual_end_time) or now_ist()
+        trip.actual_end_time = end_now
     else:
         trip.scheduled_start_time = next_attendance.scheduled_start
         trip.scheduled_end_time = next_attendance.scheduled_end
@@ -1028,7 +1111,11 @@ def driver_end_trip(
     session.add(trip)
     session.commit()
 
-    trip_service.mark_trip_day_present(session, trip_id, shift_date)
+    # Stamp per-day actual_end on the closing attendance row so summaries
+    # and analytics see when each shift actually ended.
+    trip_service.mark_trip_day_present(
+        session, trip_id, shift_date, actual_end=end_now
+    )
 
     billing_service = BillingService()
     bill_success, bill_id, bill_error = billing_service.generate_daily_bill(
@@ -1138,7 +1225,7 @@ def get_trip_bill(
         driver = session.exec(
             select(Driver).where(Driver.user_id == current_user.id)
         ).first()
-        is_driver = driver and trip.driver_id == driver.id
+        is_driver = bool(driver and trip.driver_id == driver.id)
 
     if not is_user and not is_driver:
         raise HTTPException(403, "Not authorized")
@@ -1173,7 +1260,7 @@ def get_trip_settlement(
         driver = session.exec(
             select(Driver).where(Driver.user_id == current_user.id)
         ).first()
-        is_driver = driver and trip.driver_id == driver.id
+        is_driver = bool(driver and trip.driver_id == driver.id)
 
     if not is_user and not is_driver:
         raise HTTPException(403, "Not authorized")
@@ -1208,7 +1295,7 @@ def get_trip_summary(
         driver = session.exec(
             select(Driver).where(Driver.user_id == current_user.id)
         ).first()
-        is_driver = driver and trip.driver_id == driver.id
+        is_driver = bool(driver and trip.driver_id == driver.id)
 
     if not is_user and not is_driver:
         raise HTTPException(403, "Not authorized")
@@ -1222,7 +1309,7 @@ def get_trip_summary(
     return summary
 
 
-@router.get("/{trip_id}/bills")
+@router.get("/{trip_id}/bills", response_model=List[TripBillRead])
 def list_trip_bills(
     trip_id: int,
     only_unpaid: bool = False,
@@ -1255,7 +1342,7 @@ def list_trip_bills(
 @router.post("/bill/{bill_id}/pay")
 def user_pay_bill(
     bill_id: int,
-    pay_req: BillPaymentRequest,
+    payment_method: str = Body("card", embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
@@ -1275,7 +1362,7 @@ def user_pay_bill(
 
     payment_service = PaymentService(redis_client)
     ok, err = payment_service.pay_bill_online(
-        session, bill_id, current_user.id, pay_req.payment_method
+        session, bill_id, current_user.id, payment_method
     )
     if not ok:
         raise HTTPException(400, err or "Payment failed")
@@ -1315,7 +1402,7 @@ def user_pay_bill(
 @router.post("/bill/{bill_id}/mark-paid-by-driver")
 def driver_mark_bill_paid(
     bill_id: int,
-    mark_req: MarkBillPaidRequest,
+    note: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
@@ -1341,7 +1428,7 @@ def driver_mark_bill_paid(
 
     payment_service = PaymentService(redis_client)
     ok, err = payment_service.mark_bill_paid_offline(
-        session, bill_id, driver.id, mark_req.note
+        session, bill_id, driver.id, note
     )
     if not ok:
         raise HTTPException(400, err or "Mark-paid failed")
@@ -1388,7 +1475,7 @@ def driver_mark_bill_paid(
 @router.post("/settlement/{settlement_id}/pay")
 def pay_trip_settlement(
     settlement_id: int,
-    pay_req: BillPaymentRequest,
+    payment_method: str = Body("card", embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
@@ -1412,7 +1499,7 @@ def pay_trip_settlement(
         amount=settlement.remaining_due,
         payer_id=str(current_user.id),
         payer_type="user",
-        payment_method=pay_req.payment_method,
+        payment_method=payment_method,
     )
 
     if not success:
@@ -1426,7 +1513,7 @@ def pay_trip_settlement(
         payment_type="settlement",
         amount=settlement.remaining_due,
         payment_status="success",
-        payment_method=pay_req.payment_method,
+        payment_method=payment_method,
         gateway_transaction_id=txn_id,
         completed_at=now_ist(),
     )
@@ -1443,13 +1530,19 @@ def pay_trip_settlement(
             TripBill.is_paid == False,  # noqa: E712 (SQL boolean cmp)
         )
     ).all()
+    paid_at_now = now_ist()
     for bill in unpaid_bills:
         bill.is_paid = True
         bill.amount_paid = bill.total_amount
         bill.amount_due = 0.0
-        bill.paid_at = now_ist()
+        bill.paid_at = paid_at_now
         bill.paid_by = "user_online"
         session.add(bill)
+
+    # Lift any payment-block state that was tied to the cleared bills, so a
+    # paused trip can resume. Without this, a paused trip remains paused
+    # even after the user pays the final settlement.
+    payment_service.unpause_trip_if_clear(session, settlement.trip_id)
 
     session.commit()
 

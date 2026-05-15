@@ -224,7 +224,14 @@ class BillingService:
             if not trip:
                 return False, None, "Trip not found"
 
-            # Check if settlement already exists (idempotency)
+            # Idempotency under concurrency: lock the trip row so two parallel
+            # settle paths (driver end-trip vs auto-end vs daily-settlement
+            # scheduler) cannot both pass the existence check and create
+            # duplicate settlements. The lock is released on commit/rollback.
+            session.exec(
+                select(Trip).where(Trip.id == trip_id).with_for_update()
+            ).first()
+
             existing_settlement = session.exec(
                 select(TripSettlement).where(TripSettlement.trip_id == trip_id)
             ).first()
