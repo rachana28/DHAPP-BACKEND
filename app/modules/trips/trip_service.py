@@ -252,48 +252,116 @@ class TripService:
             session.rollback()
             return False, f"Attendance record creation failed: {str(e)}"
 
+    # Trip states from which a user-initiated cancel is structurally impossible.
+    _NON_CANCELLABLE_STATES = (
+        "completed",
+        "auto_completed",
+        "cancelled",
+        "cancelled_by_user",
+        "cancelled_by_driver",
+        "billed",
+        "settled",
+        "skipped",
+        "refund_processing",
+        "no_drivers_found",
+        "rejected",
+        "payment_failed",
+    )
+
     def can_cancel_trip(
         self,
         session: Session,
         trip_id: int,
         user_id: Optional[str] = None,
         driver_id: Optional[int] = None,
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> Tuple[bool, Optional[str], bool]:
+        """User-initiated cancellation gate.
+
+        Rules (real-time scenarios):
+          * Driver-initiated cancellations are NOT supported here — drivers must
+            reject offers via /accept-and-pay action="reject" instead.
+          * Terminal / non-cancellable states are blocked.
+          * status == "ongoing" or "active": a shift is physically running, the
+            driver is engaged — block until it ends.
+          * payment_method == "trip_day": cancel allowed in any non-terminal
+            state PROVIDED there is no outstanding daily bill and the trip is
+            not paused for payment. Completed shifts are already paid for, so
+            no refund is owed and no driver is at a loss for those days.
+          * payment_method in ("advance_20", "full_payment"): cancel allowed
+            ONLY if no shift has ever been started (actual_start_time is None
+            and no attendance is marked present). Once any shift is done, the
+            trip must run to completion so the deferred / upfront balance is
+            settled normally.
+
+        Returns:
+            (allowed, reason, has_completed_shift)
+        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
-                return False, "Trip not found"
+                return False, "Trip not found", False
+
+            # Driver flow is no longer supported.
+            if driver_id is not None:
+                return False, "Drivers cannot cancel trips. Reject the offer instead.", False
 
             if user_id and str(trip.user_id) != user_id:
-                return False, "Not authorized to cancel this trip"
+                return False, "Not authorized to cancel this trip", False
 
-            if driver_id and trip.driver_id != driver_id:
-                return False, "Not authorized to cancel this trip"
-
-            if (
-                trip.payment_method == "advance_20"
-                or trip.payment_method == "full_payment"
-            ):
-                payments = session.exec(
-                    select(PaymentTransaction).where(
-                        PaymentTransaction.trip_id == trip_id,
-                        PaymentTransaction.payment_status == "success",
+            has_completed_shift = bool(trip.actual_start_time) or (
+                session.exec(
+                    select(TripAttendance).where(
+                        TripAttendance.trip_id == trip_id,
+                        TripAttendance.status == "present",
                     )
-                ).all()
+                ).first()
+                is not None
+            )
 
-                if len(payments) > 0:
+            if trip.status in self._NON_CANCELLABLE_STATES:
+                return (
+                    False,
+                    "Trip cannot be cancelled in its current state.",
+                    has_completed_shift,
+                )
+
+            # A shift is currently in progress — driver is engaged.
+            if trip.status in ("ongoing", "active"):
+                return (
+                    False,
+                    "Trip is currently in progress. Wait for the shift to end before cancelling.",
+                    has_completed_shift,
+                )
+
+            if trip.payment_method == "trip_day":
+                # Pause due to outstanding daily bill: user must clear the bill first.
+                if trip.is_payment_blocked or trip.status == "paused":
                     return (
                         False,
-                        f"Cannot cancel trip with {trip.payment_method} payment method",
+                        "Trip is paused due to an unpaid bill. Pay the outstanding amount before cancelling.",
+                        has_completed_shift,
                     )
+                # Caller (router) does the unpaid-bill check via PaymentService
+                # so the gate here stays free of payment lookups beyond the
+                # trip's own flags.
+                return True, None, has_completed_shift
 
-            if trip.actual_start_time is not None:
-                return False, "Cannot cancel trip that has already started"
+            if trip.payment_method in ("advance_20", "full_payment"):
+                if has_completed_shift:
+                    return (
+                        False,
+                        "Cancellation not allowed after a shift has started for this payment method. "
+                        "The trip will close automatically after the final shift.",
+                        has_completed_shift,
+                    )
+                return True, None, has_completed_shift
 
-            return True, None
+            # Payment method not yet selected (early states like "searching").
+            # No payment exists, so cancel is safe.
+            return True, None, has_completed_shift
 
         except Exception as e:
-            return False, f"Cancellation validation failed: {str(e)}"
+            return False, f"Cancellation validation failed: {str(e)}", False
 
     def mark_trip_day_present(
         self,
@@ -426,8 +494,20 @@ class TripService:
                 first_att = attendances[0]
                 last_att = attendances[-1]
 
-                scheduled_start = first_att.scheduled_start
-                scheduled_end = last_att.scheduled_end
+                next_pending = next(
+                    (
+                        a
+                        for a in attendances
+                        if a.status in ("scheduled", "paused_payment")
+                    ),
+                    None,
+                )
+                if next_pending is not None:
+                    scheduled_start = next_pending.scheduled_start
+                    scheduled_end = next_pending.scheduled_end
+                else:
+                    scheduled_start = first_att.scheduled_start
+                    scheduled_end = last_att.scheduled_end
 
                 actual_starts = [a.actual_start for a in attendances if a.actual_start]
                 actual_ends = [a.actual_end for a in attendances if a.actual_end]
@@ -440,6 +520,8 @@ class TripService:
                 total_days = self._expected_total_days(
                     trip.start_date, trip.end_date, trip.selected_days
                 )
+                # No attendance rows yet => every planned day is pending.
+                pending_count = total_days
                 scheduled_start = trip.scheduled_start_time or self.get_trip_start_time(
                     trip.shift_details, trip.start_date
                 )

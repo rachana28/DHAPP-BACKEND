@@ -297,71 +297,88 @@ def cancel_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    # Row-lock the trip to serialize against a concurrent driver
-    # /accept-and-pay or /process-payment grabbing the same row.
+    """User-initiated cancellation.
+
+    Drivers may NOT cancel — they reject offers via /accept-and-pay action="reject".
+
+    Payment-method-aware rules (also encoded in TripService.can_cancel_trip):
+
+      * trip_day:
+          - allowed in any non-terminal, non-ongoing state with no unpaid bill
+          - completed shifts are already paid for → NO user refund
+          - future scheduled shifts are voided
+          - if any shift was completed: trip closes as `completed` and a final
+            settlement is generated to wrap up; bills already paid stay paid
+          - if no shift was completed: trip closes as `cancelled_by_user` and
+            the driver acceptance fee is refunded
+
+      * advance_20 / full_payment:
+          - allowed only BEFORE any shift has started
+          - any pre-trip user payment is fully refunded
+          - the driver acceptance fee is refunded
+          - trip closes as `cancelled_by_user`
+
+      * ongoing / active: blocked — wait for the shift to end
+      * paused / unpaid bill: blocked — pay the outstanding bill first
+    """
+    # Row-lock the trip so this can't interleave with driver-side OTP/end-trip.
     trip = session.exec(
         select(Trip).where(Trip.id == trip_id).with_for_update()
     ).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    is_user = trip.user_id == current_user.id
-    is_driver = False
-    driver = None
-    if not is_user:
-        driver = session.exec(
-            select(Driver).where(Driver.user_id == current_user.id)
-        ).first()
-        is_driver = bool(driver and trip.driver_id == driver.id)
-    if not (is_user or is_driver):
-        raise HTTPException(403, "Not authorized to cancel this trip")
-
-    if trip.status in (
-        "completed",
-        "cancelled",
-        "cancelled_by_user",
-        "cancelled_by_driver",
-        "billed",
-        "settled",
-    ):
-        raise HTTPException(400, "Trip cannot be cancelled in its current state")
+    # User-only flow.
+    if trip.user_id != current_user.id:
+        raise HTTPException(403, "Only the trip's user can cancel this booking")
 
     trip_service = TripService()
-    can_cancel, reason = trip_service.can_cancel_trip(
+    can_cancel, reason, has_completed_shift = trip_service.can_cancel_trip(
         session,
         trip_id,
-        user_id=str(current_user.id) if is_user else None,
-        driver_id=driver.id if is_driver else None,
+        user_id=str(current_user.id),
     )
     if not can_cancel:
         raise HTTPException(400, reason or "Trip cannot be cancelled")
 
     payment_service = PaymentService(redis_client)
-    if payment_service.trip_has_unpaid_bills(session, trip_id):
+
+    # trip_day: any outstanding daily bill must be settled before cancel.
+    if (
+        trip.payment_method == "trip_day"
+        and payment_service.trip_has_unpaid_bills(session, trip_id)
+    ):
         raise HTTPException(
             400,
-            "Cannot cancel trip with unpaid daily bills. Settle outstanding bills first.",
+            "Pay the outstanding daily bill before cancelling the remaining shifts.",
         )
 
-    # User refund
-    user_refund, refund_err = payment_service.calculate_refund_amount(session, trip_id)
-    if refund_err:
-        raise HTTPException(400, refund_err)
-    if user_refund and user_refund > 0:
-        ok, err = payment_service.process_refund(
-            session,
-            trip_id,
-            user_refund,
-            reason=("Cancelled by user" if is_user else "Cancelled by driver"),
-        )
-        if not ok:
-            raise HTTPException(400, err or "Refund failed")
+    # ---- User refund maths ----
+    # No refund is issued for a trip_day cancellation: the user paid only for
+    # the days they actually used, and remaining days had no charge yet.
+    # advance_20 / full_payment can only be cancelled pre-start, so any
+    # upfront amount is fully refunded.
+    user_refund = 0.0
+    if trip.payment_method in ("advance_20", "full_payment") and not has_completed_shift:
+        amt, refund_err = payment_service.calculate_refund_amount(session, trip_id)
+        if refund_err:
+            raise HTTPException(400, refund_err)
+        user_refund = amt or 0.0
+        if user_refund > 0:
+            ok, err = payment_service.process_refund(
+                session,
+                trip_id,
+                user_refund,
+                reason="Trip cancelled by user",
+            )
+            if not ok:
+                raise HTTPException(400, err or "Refund failed")
 
-    # Driver acceptance-fee refund. Without this the driver loses the ₹100
-    # whenever a trip is cancelled before any shift starts — regardless of who
-    # cancelled.
+    # ---- Driver acceptance-fee refund ----
+    # Refund only when no shift was ever started — once a shift completes, the
+    # driver has earned the fee for that engagement.
     driver_refund = 0.0
-    if trip.driver_id and trip.actual_start_time is None:
+    if trip.driver_id and not has_completed_shift:
         driver_refund = payment_service.calculate_driver_fee_refund(
             session, trip_id, trip.driver_id
         )
@@ -370,31 +387,61 @@ def cancel_trip(
                 session,
                 trip_id,
                 trip.driver_id,
-                reason=(
-                    "Trip cancelled by user"
-                    if is_user
-                    else "Trip cancelled by driver"
-                ),
+                reason="Trip cancelled by user",
             )
             if not ok:
                 raise HTTPException(400, err or "Driver fee refund failed")
             trip.driver_payment_status = "unpaid"
             trip.driver_payment_amount = None
 
-    new_state = "cancelled_by_user" if is_user else "cancelled_by_driver"
-    trip.status = new_state
-    # Unbind the driver so they're free to accept other trips.
+    # ---- Void all pending future shifts ----
+    pending_atts = session.exec(
+        select(TripAttendance).where(
+            TripAttendance.trip_id == trip_id,
+            TripAttendance.status.in_(["scheduled", "paused_payment"]),
+        )
+    ).all()
+    for att in pending_atts:
+        att.status = "skipped_by_user"
+        att.skip_reason = "Trip cancelled by user"
+        att.marked_by = "user"
+        session.add(att)
+
+    # ---- Trip status close-out ----
+    # Mid-trip cancel (some shifts done): close as `completed` so the
+    # downstream daily-settlement/billing flow treats it like a normal
+    # finished trip. Pre-start cancel: `cancelled_by_user` so the booking
+    # appears in the user's history as a cancellation.
+    if has_completed_shift:
+        trip.status = "completed"
+        if trip.actual_end_time is None:
+            trip.actual_end_time = now_ist()
+    else:
+        trip.status = "cancelled_by_user"
+    trip.state_version += 1
+
+    # Free the driver so they can be re-ranked for other trips.
     cancelled_driver_id = trip.driver_id
     trip.driver_id = None
     trip.driver_accepted_at = None
     session.add(trip)
 
+    # Tear down any pending offers.
     offers = session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all()
     for offer in offers:
         if offer.status == "pending":
             session.delete(offer)
 
     session.commit()
+
+    # ---- Final settlement (mid-trip cancel only) ----
+    # Closes out bills/payments so the trip lands in a fully-settled state.
+    settlement_id = None
+    if has_completed_shift:
+        billing_service = BillingService()
+        ok, sid, _ = billing_service.generate_final_settlement(session, trip_id)
+        if ok or sid:
+            settlement_id = sid
 
     # Bust driver-availability cache so the freed driver can be re-ranked.
     if cancelled_driver_id and redis_client:
@@ -403,11 +450,31 @@ def cancel_trip(
         except Exception:
             pass
 
+    # Notify the driver that the user cancelled (if a driver was assigned).
+    if cancelled_driver_id:
+        try:
+            driver_user = session.exec(
+                select(User)
+                .join(Driver, Driver.user_id == User.id)
+                .where(Driver.id == cancelled_driver_id)
+            ).first()
+            if driver_user:
+                send_push_notification(
+                    session=session,
+                    user_ids=[driver_user.id],
+                    title="Trip cancelled",
+                    body=f"Trip #{trip_id} was cancelled by the user.",
+                    data={"type": "trip_cancelled", "trip_id": trip_id},
+                )
+        except Exception:
+            pass
+
     return {
         "message": "Trip cancelled successfully",
-        "refund_amount": user_refund or 0.0,
+        "refund_amount": user_refund,
         "driver_refund_amount": driver_refund,
-        "trip_status": new_state,
+        "trip_status": trip.status,
+        "settlement_id": settlement_id,
     }
 
 
