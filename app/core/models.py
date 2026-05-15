@@ -1088,49 +1088,6 @@ class TripSettlement(SQLModel, table=True):
 # ============= API REQUEST/RESPONSE MODELS =============
 
 
-class PaymentMethodSelect(SQLModel):
-    """User selects payment method at booking confirmation"""
-
-    payment_method: str  # "trip_day", "advance_20", "full_payment"
-
-
-class DriverAcceptanceRequest(SQLModel):
-    """Driver accepts or rejects trip"""
-
-    trip_id: int
-    action: str  # "accept" or "reject"
-
-
-class DriverPaymentRequest(SQLModel):
-    """Driver initiates payment to finalize trip"""
-
-    trip_id: int
-    amount: float
-    payment_method: Optional[str] = "card"
-
-
-class OTPVerificationRequest(SQLModel):
-    """Driver verifies the trip-day OTP that the user shared verbally."""
-
-    trip_id: int
-    otp: str
-
-
-class TripSkipRequest(SQLModel):
-    """Skip a day's trip (mark as absent)"""
-
-    trip_id: int
-    trip_date: date
-    reason: Optional[str] = None
-
-
-class TripEndRequest(SQLModel):
-    """Driver ends trip"""
-
-    trip_id: int
-    actual_end_time: Optional[datetime] = None
-
-
 class FareEstimateRequest(SQLModel):
     """
     Booking inputs needed to compute the fare BEFORE the trip is created.
@@ -1163,16 +1120,67 @@ class FareEstimateRequest(SQLModel):
     )
 
 
-class BillPaymentRequest(SQLModel):
-    """User pays a daily bill via the dummy gateway."""
+class UserPublicForDriver(SQLModel):
+    """Trip-rider info exposed to the assigned driver. No UUID leak."""
 
-    payment_method: str = "card"  # card | upi | wallet (dummy)
+    full_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 
-class MarkBillPaidRequest(SQLModel):
-    """Driver marks a daily bill as paid offline (cash collected from user)."""
+class TripReadDriver(SQLModel):
+    """Trip rows exposed to the driver app. Excludes user UUID and internal flags."""
 
-    note: Optional[str] = None
+    id: int
+    hiring_type: str
+    vehicle_type: str
+    shift_details: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    months: Optional[int] = None
+    selected_days: Optional[str] = None
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+    reason: Optional[str] = None
+    status: str
+    payment_method: Optional[str] = None
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = None
+    booking_time: datetime
+    scheduled_start_time: Optional[datetime] = None
+    scheduled_end_time: Optional[datetime] = None
+    actual_start_time: Optional[datetime] = None
+    actual_end_time: Optional[datetime] = None
+    trip_duration_hours: Optional[int] = None
+    user: Optional[UserPublicForDriver] = None
+
+
+class TripBillRead(SQLModel):
+    """Bill row exposed via the API. Hides user_id/driver_id internals."""
+
+    id: int
+    trip_id: int
+    bill_type: str
+    bill_date: date
+    total_amount: float
+    amount_paid: float
+    amount_due: float
+    discount_amount: Optional[float] = 0.0
+    discount_percentage: Optional[float] = None
+    is_generated: bool
+    is_paid: bool
+    paid_at: Optional[datetime] = None
+    paid_by: Optional[str] = None
+    payment_note: Optional[str] = None
+    due_date: Optional[datetime] = None
+    components: List[Dict[str, Any]] = []
+    notes: Optional[str] = None
+    generated_at: datetime
 
 
 class BillResponse(SQLModel):

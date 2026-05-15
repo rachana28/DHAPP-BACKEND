@@ -76,12 +76,26 @@ class TripService:
         return True, None
 
     def transition_trip_state(
-        self, session: Session, trip_id: int, new_state: str, validate: bool = True
+        self,
+        session: Session,
+        trip_id: int,
+        new_state: str,
+        validate: bool = True,
+        expected_version: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
         try:
-            trip = session.get(Trip, trip_id)
+            # Row-lock the trip to serialize against parallel transitions
+            # (driver end-trip vs auto-end scheduler, etc.). Without this
+            # state_version is incremented in lockstep but two transitions
+            # can still both succeed and race on side effects.
+            trip = session.exec(
+                select(Trip).where(Trip.id == trip_id).with_for_update()
+            ).first()
             if not trip:
                 return False, "Trip not found"
+
+            if expected_version is not None and trip.state_version != expected_version:
+                return False, "Trip state changed concurrently; please retry"
 
             current_state = trip.status
 
@@ -101,6 +115,16 @@ class TripService:
 
         except Exception as e:
             return False, f"State transition failed: {str(e)}"
+
+    def has_pending_shifts(self, session: Session, trip_id: int) -> bool:
+        """True iff at least one attendance row is still scheduled / paused_payment."""
+        row = session.exec(
+            select(TripAttendance).where(
+                TripAttendance.trip_id == trip_id,
+                TripAttendance.status.in_(["scheduled", "paused_payment"]),
+            )
+        ).first()
+        return row is not None
 
     def get_trip_duration_hours(self, shift_details: Optional[str]) -> Optional[int]:
         if not shift_details:
@@ -272,14 +296,20 @@ class TripService:
             return False, f"Cancellation validation failed: {str(e)}"
 
     def mark_trip_day_present(
-        self, session: Session, trip_id: int, trip_date: date
+        self,
+        session: Session,
+        trip_id: int,
+        trip_date: date,
+        actual_end: Optional[datetime] = None,
     ) -> Tuple[bool, Optional[str]]:
         try:
             attendance = session.exec(
-                select(TripAttendance).where(
+                select(TripAttendance)
+                .where(
                     TripAttendance.trip_id == trip_id,
                     TripAttendance.trip_date == trip_date,
                 )
+                .with_for_update()
             ).first()
 
             if not attendance:
@@ -288,6 +318,8 @@ class TripService:
             attendance.status = "present"
             attendance.user_otp_verified = True
             attendance.driver_otp_verified = True
+            if actual_end is not None and attendance.actual_end is None:
+                attendance.actual_end = actual_end
             session.add(attendance)
             session.commit()
 
@@ -306,10 +338,12 @@ class TripService:
     ) -> Tuple[bool, Optional[str]]:
         try:
             attendance = session.exec(
-                select(TripAttendance).where(
+                select(TripAttendance)
+                .where(
                     TripAttendance.trip_id == trip_id,
                     TripAttendance.trip_date == trip_date,
                 )
+                .with_for_update()
             ).first()
 
             if not attendance:
@@ -336,6 +370,29 @@ class TripService:
             session.add(attendance)
             session.commit()
 
+            # If this was the last pending shift, push the trip to a terminal
+            # state so it doesn't sit forever in active_pending_otp / paused.
+            if not self.has_pending_shifts(session, trip_id):
+                trip = session.get(Trip, trip_id)
+                if trip and trip.status in (
+                    "active_pending_otp",
+                    "paused",
+                    "ongoing",
+                ):
+                    # If no shift was ever started, the trip closes as `skipped`;
+                    # otherwise it closes as `completed`.
+                    has_any_present = session.exec(
+                        select(TripAttendance).where(
+                            TripAttendance.trip_id == trip_id,
+                            TripAttendance.status == "present",
+                        )
+                    ).first()
+                    target = "completed" if has_any_present else "skipped"
+                    # Allow direct hop from paused/ongoing to skipped/completed.
+                    self.transition_trip_state(
+                        session, trip_id, target, validate=False
+                    )
+
             return True, None
 
         except Exception as e:
@@ -350,11 +407,63 @@ class TripService:
                 return None
 
             attendances = session.exec(
-                select(TripAttendance).where(TripAttendance.trip_id == trip_id)
+                select(TripAttendance)
+                .where(TripAttendance.trip_id == trip_id)
+                .order_by(TripAttendance.trip_date)
             ).all()
 
             present_count = len([a for a in attendances if a.status == "present"])
             absent_count = len([a for a in attendances if "skipped" in a.status])
+            pending_count = len(
+                [a for a in attendances if a.status in ("scheduled", "paused_payment")]
+            )
+
+            # Source of truth: attendance rows. Trip-level scheduled/actual fields
+            # rotate to the *current* shift, so they don't represent the booking's
+            # overall start — and they may be null before the first shift fires.
+            if attendances:
+                total_days = len(attendances)
+                first_att = attendances[0]
+                last_att = attendances[-1]
+
+                scheduled_start = first_att.scheduled_start
+                scheduled_end = last_att.scheduled_end
+
+                actual_starts = [a.actual_start for a in attendances if a.actual_start]
+                actual_ends = [a.actual_end for a in attendances if a.actual_end]
+                actual_start = min(actual_starts) if actual_starts else None
+                actual_end = max(actual_ends) if actual_ends else None
+            else:
+                # Attendance rows aren't created until the driver-payment callback
+                # runs. Synthesize the planned schedule so summaries before that
+                # point still show meaningful totals/timings.
+                total_days = self._expected_total_days(
+                    trip.start_date, trip.end_date, trip.selected_days
+                )
+                scheduled_start = trip.scheduled_start_time or self.get_trip_start_time(
+                    trip.shift_details, trip.start_date
+                )
+                duration_hours = (
+                    self.get_trip_duration_hours(trip.shift_details)
+                    or trip.trip_duration_hours
+                )
+                if trip.scheduled_end_time:
+                    scheduled_end = trip.scheduled_end_time
+                elif scheduled_start and duration_hours and trip.end_date:
+                    scheduled_end = datetime.combine(
+                        trip.end_date,
+                        scheduled_start.time(),
+                    ) + timedelta(hours=duration_hours)
+                else:
+                    scheduled_end = trip.scheduled_end_time
+                actual_start = trip.actual_start_time
+                actual_end = trip.actual_end_time
+
+            # Final fallback: never return null for scheduled_start when start_date exists.
+            if not scheduled_start and trip.start_date:
+                scheduled_start = self.get_trip_start_time(
+                    trip.shift_details, trip.start_date
+                ) or datetime.combine(trip.start_date, datetime.min.time())
 
             user_payments = session.exec(
                 select(PaymentTransaction).where(
@@ -378,14 +487,15 @@ class TripService:
                 "payment_method": trip.payment_method,
                 "start_date": trip.start_date,
                 "end_date": trip.end_date,
-                "total_days": len(attendances),
+                "total_days": total_days,
                 "present_days": present_count,
                 "absent_days": absent_count,
+                "pending_days": pending_count,
                 "total_user_paid": sum(p.amount for p in user_payments),
-                "scheduled_start": trip.scheduled_start_time,
-                "scheduled_end": trip.scheduled_end_time,
-                "actual_start": trip.actual_start_time,
-                "actual_end": trip.actual_end_time,
+                "scheduled_start": scheduled_start,
+                "scheduled_end": scheduled_end,
+                "actual_start": actual_start,
+                "actual_end": actual_end,
                 "fare": trip.fare,
                 "fare_breakdown": trip.fare_breakdown,
             }
@@ -395,5 +505,27 @@ class TripService:
 
             return result
 
-        except Exception as e:
+        except Exception:
             return None
+
+    def _expected_total_days(
+        self,
+        start_date: Optional[date],
+        end_date: Optional[date],
+        selected_days: Optional[str],
+    ) -> int:
+        if not start_date:
+            return 0
+        end = end_date or start_date
+        if end < start_date:
+            return 0
+        day_filter = self.parse_selected_days(selected_days)
+        if day_filter is None:
+            return (end - start_date).days + 1
+        count = 0
+        current = start_date
+        while current <= end:
+            if current.weekday() in day_filter:
+                count += 1
+            current = current + timedelta(days=1)
+        return count

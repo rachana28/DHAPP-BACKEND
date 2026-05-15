@@ -50,8 +50,19 @@ async def generate_otp_for_trip_scheduler():
 
             payment_service = PaymentService(redis_client)
 
+            # Batch-fetch trips to avoid N+1.
+            trip_ids = list({a.trip_id for a in attendances})
+            trips_by_id = {
+                t.id: t
+                for t in (
+                    session.exec(select(Trip).where(Trip.id.in_(trip_ids))).all()
+                    if trip_ids
+                    else []
+                )
+            }
+
             for att in attendances:
-                trip = session.get(Trip, att.trip_id)
+                trip = trips_by_id.get(att.trip_id)
                 if not trip or trip.status not in (
                     "active_pending_otp",
                     "ongoing",
@@ -127,8 +138,21 @@ async def expire_otp_for_trip_scheduler():
                 )
             ).all()
 
+            trip_service = TripService()
+
+            # Batch-fetch trips to avoid N+1.
+            trip_ids = list({r.trip_id for r in expired_rows})
+            trips_by_id = {
+                t.id: t
+                for t in (
+                    session.exec(select(Trip).where(Trip.id.in_(trip_ids))).all()
+                    if trip_ids
+                    else []
+                )
+            }
+
             for row in expired_rows:
-                trip = session.get(Trip, row.trip_id)
+                trip = trips_by_id.get(row.trip_id)
                 if not trip:
                     continue
 
@@ -150,6 +174,21 @@ async def expire_otp_for_trip_scheduler():
                     session.add(attendance)
                     session.commit()
 
+                    # If this was the trip's last pending shift, advance the
+                    # trip status. Without this the trip stays in
+                    # active_pending_otp forever after an OTP timeout.
+                    if not trip_service.has_pending_shifts(session, trip.id):
+                        has_any_present = session.exec(
+                            select(TripAttendance).where(
+                                TripAttendance.trip_id == trip.id,
+                                TripAttendance.status == "present",
+                            )
+                        ).first()
+                        target = "completed" if has_any_present else "skipped"
+                        trip_service.transition_trip_state(
+                            session, trip.id, target, validate=False
+                        )
+
                 otp_service.invalidate_otp(trip.id, row.trip_date)
                 logger.info(
                     f"Trip {trip.id} OTP expired for {row.trip_date}; attendance marked missed"
@@ -166,15 +205,28 @@ async def auto_end_trip_scheduler():
 
             now = now_ist()
 
-            trips = session.exec(
-                select(Trip).where(
-                    Trip.status == "ongoing",
-                    Trip.scheduled_end_time <= now,
-                    Trip.actual_end_time.is_(None),
-                )
-            ).all()
+            candidate_ids = [
+                row.id
+                for row in session.exec(
+                    select(Trip.id).where(
+                        Trip.status == "ongoing",
+                        Trip.scheduled_end_time <= now,
+                        Trip.actual_end_time.is_(None),
+                    )
+                ).all()
+            ]
 
-            for trip in trips:
+            for trip_id in candidate_ids:
+                # Re-fetch under a row lock and re-check state — driver may
+                # have called /end-trip in parallel between the bulk select
+                # above and now.
+                trip = session.exec(
+                    select(Trip).where(Trip.id == trip_id).with_for_update()
+                ).first()
+                if not trip or trip.status != "ongoing":
+                    session.commit()
+                    continue
+
                 active_attendance = session.exec(
                     select(TripAttendance)
                     .where(
@@ -219,7 +271,11 @@ async def auto_end_trip_scheduler():
                     session.add(trip)
                     session.commit()
 
-                    trip_service.mark_trip_day_present(session, trip.id, shift_date)
+                    # Stamp per-day actual_end so summaries reflect each shift.
+                    if active_attendance:
+                        trip_service.mark_trip_day_present(
+                            session, trip.id, shift_date, actual_end=now
+                        )
 
                     logger.info(f"Trip {trip.id} auto-ended")
 
@@ -377,12 +433,20 @@ async def daily_settlement_scheduler():
 
             today = today_ist()
 
-            completed_trips = session.exec(
-                select(Trip).where(
+            # Filter at the DB level: only trips that are completed/auto_completed,
+            # have ended, are past end_date (or end_date is null), and do NOT
+            # already have a settlement. Avoids loading every historical trip
+            # on every cron tick.
+            stmt = (
+                select(Trip)
+                .outerjoin(TripSettlement, TripSettlement.trip_id == Trip.id)
+                .where(
                     Trip.status.in_(["completed", "auto_completed"]),
                     Trip.actual_end_time.isnot(None),
+                    TripSettlement.id.is_(None),
                 )
-            ).all()
+            )
+            completed_trips = session.exec(stmt).all()
 
             for trip in completed_trips:
                 if trip.end_date and today < trip.end_date:
@@ -395,12 +459,6 @@ async def daily_settlement_scheduler():
                     )
                 ).first()
                 if pending_attendance:
-                    continue
-
-                existing_settlement = session.exec(
-                    select(TripSettlement).where(TripSettlement.trip_id == trip.id)
-                ).first()
-                if existing_settlement:
                     continue
 
                 success, settlement_id, error = (

@@ -162,6 +162,14 @@ class OTPService:
         else:
             attempts = 0
 
+        # Defense in depth: ensure the caller is the trip's assigned driver,
+        # even if the router accidentally permitted otherwise in the future.
+        trip = session.get(Trip, trip_id)
+        if not trip:
+            return False, "Trip not found"
+        if trip.driver_id != driver_id:
+            return False, "Driver not assigned to this trip"
+
         db_row = session.exec(
             select(OTPRegistry).where(
                 OTPRegistry.trip_id == trip_id,

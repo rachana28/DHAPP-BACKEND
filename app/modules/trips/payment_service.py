@@ -219,16 +219,45 @@ class PaymentService:
         except Exception as e:
             return False, f"User payment processing failed: {str(e)}"
 
+    def calculate_driver_fee_refund(
+        self, session: Session, trip_id: int, driver_id: Optional[int]
+    ) -> float:
+        """Return the driver-acceptance fee paid (and not yet refunded) for this trip.
+
+        Used by the cancel flow so the driver gets their ₹100 back when the
+        trip terminates before any shift starts (or the user cancels), instead
+        of silently keeping it.
+        """
+        if not driver_id:
+            return 0.0
+        paid = session.exec(
+            select(PaymentTransaction).where(
+                PaymentTransaction.trip_id == trip_id,
+                PaymentTransaction.driver_id == driver_id,
+                PaymentTransaction.payer_type == "driver",
+                PaymentTransaction.payment_type == "driver_acceptance",
+                PaymentTransaction.payment_status == "success",
+            )
+        ).first()
+        if not paid:
+            return 0.0
+        already = session.exec(
+            select(PaymentTransaction).where(
+                PaymentTransaction.trip_id == trip_id,
+                PaymentTransaction.driver_id == driver_id,
+                PaymentTransaction.payer_type == "driver",
+                PaymentTransaction.payment_status == "refunded",
+            )
+        ).first()
+        if already:
+            return 0.0
+        return float(paid.amount)
+
     def calculate_refund_amount(
-        self, session: Session, trip_id: int, cancellation_reason: Optional[str] = None
+        self, session: Session, trip_id: int
     ) -> Tuple[float, Optional[str]]:
         """
         Calculate refund amount based on payment method and trip status
-
-        Args:
-            session: Database session
-            trip_id: Trip ID
-            cancellation_reason: Why trip is being cancelled
 
         Returns:
             Tuple of (refund_amount, error_message)
@@ -512,14 +541,32 @@ class PaymentService:
         """
         if self.trip_has_unpaid_bills(session, trip_id):
             return
-        trip = session.get(Trip, trip_id)
+        # Lock the trip row so we don't race with end-trip / auto-end / skip.
+        trip = session.exec(
+            select(Trip).where(Trip.id == trip_id).with_for_update()
+        ).first()
         if not trip:
             return
+        changed = False
         if trip.is_payment_blocked:
             trip.is_payment_blocked = False
-            session.add(trip)
+            changed = True
         if trip.status == "paused":
-            trip.status = "active_pending_otp"
+            # Only re-arm OTP if there's actually a pending shift to run.
+            from app.core.models import TripAttendance  # local to avoid cycle
+
+            pending = session.exec(
+                select(TripAttendance).where(
+                    TripAttendance.trip_id == trip_id,
+                    TripAttendance.status.in_(["scheduled", "paused_payment"]),
+                )
+            ).first()
+            if pending:
+                trip.status = "active_pending_otp"
+            else:
+                trip.status = "completed"
+            changed = True
+        if changed:
             trip.state_version += 1
             session.add(trip)
 
