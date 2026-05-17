@@ -591,6 +591,21 @@ class TripService:
                 )
             ).all()
 
+            upfront_amount_due = 0.0
+            total_amount_due = 0.0
+            user_paid = sum(p.amount for p in user_payments)
+
+            if trip.payment_method == "full_payment":
+                upfront_amount_due = round(trip.fare * 0.95, 2) if trip.fare else 0.0
+                total_amount_due = round(trip.fare * 0.05, 2) if trip.fare else 0.0
+            elif trip.payment_method == "advance_20":
+                upfront_amount_due = round(trip.fare * 0.20, 2) if trip.fare else 0.0
+                total_amount_due = round(trip.fare * 0.80, 2) if trip.fare else 0.0
+            else:
+                total_amount_due = trip.fare or 0.0
+
+            amount_due = max(0.0, total_amount_due - user_paid)
+
             result = {
                 "trip_id": trip.id,
                 "status": trip.status,
@@ -601,13 +616,15 @@ class TripService:
                 "present_days": present_count,
                 "absent_days": absent_count,
                 "pending_days": pending_count,
-                "total_user_paid": sum(p.amount for p in user_payments),
+                "total_user_paid": user_paid,
                 "scheduled_start": scheduled_start,
                 "scheduled_end": scheduled_end,
                 "actual_start": actual_start,
                 "actual_end": actual_end,
                 "fare": trip.fare,
                 "fare_breakdown": trip.fare_breakdown,
+                "upfront_amount_due": upfront_amount_due,
+                "amount_due": amount_due,
             }
 
             if is_driver:
