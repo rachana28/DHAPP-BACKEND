@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from app.core.database import engine, get_redis
 from app.core.models import (
     Trip,
+    TripOffer,
     OTPRegistry,
     PaymentTransaction,
     TripAttendance,
@@ -240,9 +241,18 @@ async def auto_end_trip_scheduler():
                 shift_date = (
                     active_attendance.trip_date if active_attendance else today_ist()
                 )
-                has_future_shifts = (
-                    trip.end_date is not None and shift_date < trip.end_date
-                )
+
+                next_attendance = session.exec(
+                    select(TripAttendance)
+                    .where(
+                        TripAttendance.trip_id == trip.id,
+                        TripAttendance.trip_date > shift_date,
+                        TripAttendance.status.in_(["scheduled", "paused_payment"]),
+                        TripAttendance.user_otp_verified == False,  # noqa: E712
+                    )
+                    .order_by(TripAttendance.trip_date)
+                ).first()
+                has_future_shifts = next_attendance is not None
 
                 next_state = (
                     "active_pending_otp" if has_future_shifts else "auto_completed"
@@ -253,18 +263,8 @@ async def auto_end_trip_scheduler():
 
                 if success:
                     if has_future_shifts:
-                        next_attendance = session.exec(
-                            select(TripAttendance)
-                            .where(
-                                TripAttendance.trip_id == trip.id,
-                                TripAttendance.trip_date > shift_date,
-                            )
-                            .order_by(TripAttendance.trip_date)
-                        ).first()
-
-                        if next_attendance:
-                            trip.scheduled_start_time = next_attendance.scheduled_start
-                            trip.scheduled_end_time = next_attendance.scheduled_end
+                        trip.scheduled_start_time = next_attendance.scheduled_start
+                        trip.scheduled_end_time = next_attendance.scheduled_end
                     else:
                         trip.actual_end_time = now
 
@@ -304,9 +304,7 @@ async def auto_end_trip_scheduler():
 
                     if not has_future_shifts:
                         try:
-                            billing_service.generate_final_settlement(
-                                session, trip.id
-                            )
+                            billing_service.generate_final_settlement(session, trip.id)
                         except Exception as settle_err:
                             logger.warning(
                                 f"Inline settlement generation failed for trip {trip.id}: {settle_err}"
@@ -410,17 +408,41 @@ async def driver_payment_timeout_scheduler():
                 )
 
                 if success:
+                    timed_out_driver_id = locked_trip.driver_id
                     locked_trip.driver_id = None
                     locked_trip.driver_payment_status = "unpaid"
+                    stale_offer = session.exec(
+                        select(TripOffer).where(
+                            TripOffer.trip_id == locked_trip.id,
+                            TripOffer.driver_id == timed_out_driver_id,
+                        )
+                    ).first()
+                    if stale_offer:
+                        stale_offer.status = "rejected"
+                        session.add(stale_offer)
                     session.add(locked_trip)
                     session.commit()
+
+                    try:
+                        from app.modules.trips.allocation import (
+                            attempt_trip_escalation,
+                        )
+
+                        if attempt_trip_escalation(session, locked_trip):
+                            session.commit()
+                    except Exception as esc_err:
+                        logger.warning(
+                            f"Re-allocation after payment timeout failed for trip {locked_trip.id}: {esc_err}"
+                        )
 
                     logger.info(
                         f"Trip {locked_trip.id} auto-rejected due to driver payment timeout; back to searching"
                     )
                 else:
                     session.commit()  # release the row lock
-                    logger.error(f"Failed to auto-reject trip {locked_trip.id}: {error}")
+                    logger.error(
+                        f"Failed to auto-reject trip {locked_trip.id}: {error}"
+                    )
 
     except Exception as e:
         logger.error(f"Driver payment timeout scheduler failed: {str(e)}")

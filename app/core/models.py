@@ -855,6 +855,11 @@ class TripCreate(TripBase):
     tow_truck_driver_id: Optional[int] = None
 
 
+class TripDaySkipRequest(SQLModel):
+    trip_date: date
+    reason: Optional[str] = None
+
+
 class LocationUpdate(SQLModel):
     latitude: float
     longitude: float
