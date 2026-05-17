@@ -188,6 +188,10 @@ class OTPService:
         if db_row.verified_at is not None:
             return False, "OTP already used"
 
+        max_db_attempts = db_row.max_attempts or self.MAX_ATTEMPTS
+        if db_row.verification_attempts >= max_db_attempts:
+            return False, "Maximum OTP verification attempts exceeded"
+
         is_valid = secrets.compare_digest(self._hash_otp(otp_input), db_row.otp_hash)
         if not is_valid:
             db_row.verification_attempts += 1

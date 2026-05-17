@@ -205,13 +205,39 @@ class TripService:
         trip_start_dt: datetime,
         trip_duration_hours: int,
         selected_days: Optional[str] = None,
+        single_shift: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         try:
+            start_hour = trip_start_dt.hour
+            start_minute = trip_start_dt.minute
+
+            if single_shift:
+                scheduled_start = datetime.combine(
+                    start_date,
+                    datetime.min.time().replace(hour=start_hour, minute=start_minute),
+                )
+                scheduled_end = datetime.combine(
+                    end_date,
+                    datetime.min.time().replace(hour=start_hour, minute=start_minute),
+                ) + timedelta(hours=trip_duration_hours)
+                session.add(
+                    TripAttendance(
+                        trip_id=trip_id,
+                        trip_date=start_date,
+                        status="scheduled",
+                        marked_by="system",
+                        user_otp_verified=False,
+                        driver_otp_verified=False,
+                        scheduled_start=scheduled_start,
+                        scheduled_end=scheduled_end,
+                    )
+                )
+                session.commit()
+                return True, None
+
             day_filter = self.parse_selected_days(selected_days)
             current_date = start_date
             created = 0
-            start_hour = trip_start_dt.hour
-            start_minute = trip_start_dt.minute
 
             while current_date <= end_date:
                 if day_filter is None or current_date.weekday() in day_filter:
@@ -303,7 +329,11 @@ class TripService:
 
             # Driver flow is no longer supported.
             if driver_id is not None:
-                return False, "Drivers cannot cancel trips. Reject the offer instead.", False
+                return (
+                    False,
+                    "Drivers cannot cancel trips. Reject the offer instead.",
+                    False,
+                )
 
             if user_id and str(trip.user_id) != user_id:
                 return False, "Not authorized to cancel this trip", False
@@ -457,9 +487,7 @@ class TripService:
                     ).first()
                     target = "completed" if has_any_present else "skipped"
                     # Allow direct hop from paused/ongoing to skipped/completed.
-                    self.transition_trip_state(
-                        session, trip_id, target, validate=False
-                    )
+                    self.transition_trip_state(session, trip_id, target, validate=False)
 
             return True, None
 

@@ -14,6 +14,7 @@ from app.core.models import (
     PaymentTransaction,
     TripAttendance,
     TripBill,
+    TripSettlement,
     SystemConfig,
 )
 
@@ -515,7 +516,17 @@ class PaymentService:
                 TripBill.amount_due > 0,  # Changed from is_paid == False
             )
         ).first()
-        return row is not None
+        if row is not None:
+            return True
+
+        settlement = session.exec(
+            select(TripSettlement).where(
+                TripSettlement.user_id == user_id,
+                TripSettlement.user_payment_status != "paid",
+                TripSettlement.remaining_due > 0,
+            )
+        ).first()
+        return settlement is not None
 
     def trip_has_unpaid_bills(self, session: Session, trip_id: int) -> bool:
         """Check if a trip has any daily bills with amount_due > 0.
@@ -541,6 +552,19 @@ class PaymentService:
         """
         if self.trip_has_unpaid_bills(session, trip_id):
             return
+
+        paused_atts = session.exec(
+            select(TripAttendance).where(
+                TripAttendance.trip_id == trip_id,
+                TripAttendance.status == "paused_payment",
+            )
+        ).all()
+        for att in paused_atts:
+            att.status = "scheduled"
+            att.skip_reason = None
+            att.marked_by = "system"
+            session.add(att)
+
         # Lock the trip row so we don't race with end-trip / auto-end / skip.
         trip = session.exec(
             select(Trip).where(Trip.id == trip_id).with_for_update()
@@ -553,8 +577,6 @@ class PaymentService:
             changed = True
         if trip.status == "paused":
             # Only re-arm OTP if there's actually a pending shift to run.
-            from app.core.models import TripAttendance  # local to avoid cycle
-
             pending = session.exec(
                 select(TripAttendance).where(
                     TripAttendance.trip_id == trip_id,

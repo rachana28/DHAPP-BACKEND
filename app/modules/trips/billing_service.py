@@ -147,17 +147,29 @@ class BillingService:
             if error:
                 return False, None, error
 
-            # Get existing payment
-            existing_payments = session.exec(
+            upfront_payments = session.exec(
                 select(PaymentTransaction).where(
                     PaymentTransaction.trip_id == trip_id,
                     PaymentTransaction.payer_type == "user",
                     PaymentTransaction.payment_status == "success",
+                    PaymentTransaction.payment_type.notin_(
+                        ["trip_day_bill", "settlement"]
+                    ),
                 )
             ).all()
+            total_upfront = sum(p.amount for p in upfront_payments)
 
-            amount_paid = sum(p.amount for p in existing_payments)
-            amount_due = max(0, total_amount - amount_paid)
+            prior_daily_bills = session.exec(
+                select(TripBill).where(
+                    TripBill.trip_id == trip_id,
+                    TripBill.bill_type == "daily_bill",
+                )
+            ).all()
+            already_allocated = sum(b.amount_paid for b in prior_daily_bills)
+
+            credit_available = max(0.0, total_upfront - already_allocated)
+            amount_paid = min(total_amount, credit_available)
+            amount_due = max(0.0, total_amount - amount_paid)
 
             is_paid = amount_due == 0
 
