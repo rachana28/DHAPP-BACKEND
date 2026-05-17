@@ -591,20 +591,24 @@ class TripService:
                 )
             ).all()
 
-            upfront_amount_due = 0.0
-            total_amount_due = 0.0
             user_paid = sum(p.amount for p in user_payments)
 
-            if trip.payment_method == "full_payment":
-                upfront_amount_due = round(trip.fare * 0.95, 2) if trip.fare else 0.0
-                total_amount_due = round(trip.fare * 0.05, 2) if trip.fare else 0.0
-            elif trip.payment_method == "advance_20":
-                upfront_amount_due = round(trip.fare * 0.20, 2) if trip.fare else 0.0
-                total_amount_due = round(trip.fare * 0.80, 2) if trip.fare else 0.0
-            else:
-                total_amount_due = trip.fare or 0.0
+            upfront_required = 0.0
+            remainder_due = 0.0
 
-            amount_due = max(0.0, total_amount_due - user_paid)
+            if trip.payment_method == "full_payment":
+                upfront_required = round(trip.fare * 0.95, 2) if trip.fare else 0.0
+            elif trip.payment_method == "advance_20":
+                upfront_required = round(trip.fare * 0.20, 2) if trip.fare else 0.0
+                remainder_due = round(trip.fare * 0.78, 2) if trip.fare else 0.0
+            else:
+                remainder_due = trip.fare or 0.0
+
+            upfront_paid = min(user_paid, upfront_required)
+            remainder_paid = max(0.0, user_paid - upfront_required)
+
+            upfront_amount_due = max(0.0, upfront_required - upfront_paid)
+            amount_due = max(0.0, remainder_due - remainder_paid)
 
             result = {
                 "trip_id": trip.id,
@@ -623,9 +627,11 @@ class TripService:
                 "actual_end": actual_end,
                 "fare": trip.fare,
                 "fare_breakdown": trip.fare_breakdown,
-                "upfront_amount_due": upfront_amount_due,
                 "amount_due": amount_due,
             }
+
+            if trip.payment_method in ("advance_20", "full_payment"):
+                result["upfront_amount_due"] = upfront_amount_due
 
             if is_driver:
                 result["total_driver_paid"] = sum(p.amount for p in driver_payments)
