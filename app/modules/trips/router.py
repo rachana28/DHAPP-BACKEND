@@ -575,7 +575,9 @@ def select_payment_method(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    trip = session.get(Trip, trip_id)
+    trip = session.exec(
+        select(Trip).where(Trip.id == trip_id).with_for_update()
+    ).first()
     if not trip:
         raise HTTPException(404, "Trip not found")
 
@@ -589,10 +591,25 @@ def select_payment_method(
         raise HTTPException(400, "Invalid payment method")
 
     trip.payment_method = payment_method
+    if payment_method in ("advance_20", "full_payment"):
+        trip.is_payment_blocked = True
+
     session.add(trip)
     session.commit()
 
-    return {"message": f"Payment method {payment_method} selected"}
+    if payment_method in ("advance_20", "full_payment"):
+        if payment_method == "full_payment":
+            upfront = round(trip.fare * 0.95, 2) if trip.fare else 0.0
+        else:  # advance_20
+            upfront = round(trip.fare * 0.20, 2) if trip.fare else 0.0
+        return {
+            "message": f"Payment method {payment_method} selected",
+            "next_step": "upfront_payment_required",
+            "upfront_amount_due": upfront,
+            "full_fare": trip.fare,
+        }
+    else:
+        return {"message": f"Payment method {payment_method} selected"}
 
 
 @router.post("/{trip_id}/pay-upfront")
@@ -609,7 +626,9 @@ def user_pay_upfront(
     full_payment → 100% of the trip fare collected now.
     trip_day has no upfront step (collected per day via /bill/{id}/pay).
     """
-    trip = session.get(Trip, trip_id)
+    trip = session.exec(
+        select(Trip).where(Trip.id == trip_id).with_for_update()
+    ).first()
     if not trip:
         raise HTTPException(404, "Trip not found")
     if trip.user_id != current_user.id:
@@ -647,11 +666,16 @@ def user_pay_upfront(
     if not ok:
         raise HTTPException(400, err or "Upfront payment failed")
 
+    trip.is_payment_blocked = False
+    session.add(trip)
+    session.commit()
+
     return {
         "message": "Upfront payment successful",
         "trip_id": trip_id,
         "amount_paid": amount,
         "payment_method": trip.payment_method,
+        "trip_status": trip.status,
     }
 
 
@@ -818,6 +842,12 @@ def driver_process_payment(
             400, f"Trip status is {trip.status}, cannot process payment now"
         )
 
+    if not trip.payment_method:
+        raise HTTPException(
+            400,
+            "User must select a payment method before driver can complete payment.",
+        )
+
     payment_service = PaymentService(redis_client)
     success, error = payment_service.driver_accept_payment(session, trip_id, driver.id)
 
@@ -826,7 +856,7 @@ def driver_process_payment(
 
     trip_service = TripService()
 
-    # Generate schedules upon successful driver payment and fast track to active_pending_otp
+    # Generate schedules upon successful driver payment
     if trip.start_date:
         duration_hours = (
             trip_service.get_trip_duration_hours(trip.shift_details)
@@ -883,11 +913,19 @@ def driver_process_payment(
     redis_key = f"driver_payment_timer:{trip_id}:{driver.id}"
     redis_client.delete(redis_key)
 
-    return {
-        "message": "Driver payment successful. Trip is ready for OTP verification.",
-        "trip_id": trip_id,
-        "trip_status": trip.status,
-    }
+    if trip.payment_method in ("advance_20", "full_payment"):
+        return {
+            "message": "Driver payment successful. Awaiting user upfront payment before OTP can be requested.",
+            "trip_id": trip_id,
+            "trip_status": trip.status,
+            "next_step": "user_upfront_payment",
+        }
+    else:
+        return {
+            "message": "Driver payment successful. Trip is ready for OTP verification.",
+            "trip_id": trip_id,
+            "trip_status": trip.status,
+        }
 
 
 @router.post("/{trip_id}/request-otp")
@@ -918,10 +956,16 @@ def request_otp_for_trip(
         raise HTTPException(400, "Trip schedule not set")
 
     if trip.is_payment_blocked:
-        raise HTTPException(
-            400,
-            "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
-        )
+        if trip.payment_method in ("advance_20", "full_payment"):
+            raise HTTPException(
+                400,
+                f"Trip is paused — complete {trip.payment_method} upfront payment before requesting OTP.",
+            )
+        else:
+            raise HTTPException(
+                400,
+                "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
+            )
 
     attendances_raw = session.exec(
         select(TripAttendance)
