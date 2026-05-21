@@ -4,14 +4,18 @@ Trip Service for managing trip lifecycle and state machine
 
 from datetime import datetime, timedelta, date
 from typing import Optional, Tuple, Dict, Any
-from sqlmodel import Session, select
+from sqlmodel import Session, select, func
 import re
 
 from app.core.models import (
     Trip,
     TripAttendance,
     PaymentTransaction,
+    TripBill,
+    TripSettlement,
+    Driver,
 )
+from app.utils.time_utils import today_ist
 
 
 class TripService:
@@ -55,6 +59,18 @@ class TripService:
         "cancelled_by_driver": ["refund_processing"],
         "refund_processing": ["settled"],
     }
+
+    # Trip states in which the assigned driver is still engaged on the booking
+    # and therefore cannot accept or be offered another trip. A driver is free
+    # again once the trip reaches a closed/terminal state.
+    DRIVER_BUSY_STATES = (
+        "accepted_pending_payment",
+        "payment_in_progress",
+        "active_pending_otp",
+        "active",
+        "ongoing",
+        "paused",
+    )
 
     def __init__(self):
         pass
@@ -125,6 +141,79 @@ class TripService:
             )
         ).first()
         return row is not None
+
+    def compute_outstanding_portion(
+        self, session: Session, trip: Trip
+    ) -> Dict[str, Any]:
+        """Outstanding (not-yet-paid / not-yet-run) portion of a booking.
+
+        Used when the user switches payment method mid-trip: the new upfront is
+        charged on this portion only, so days already completed and paid keep
+        the rate they were billed at.
+
+        Returns a dict with:
+          per_day            - gross fare for one scheduled day
+          remaining_count    - shifts still to run (scheduled / paused_payment)
+          unsettled_bills    - existing daily bills still carrying amount_due > 0
+                               (ordered by bill_date)
+          outstanding_gross  - gross fare still owed (remaining + unsettled days)
+          payments_applied   - user money already paid toward that portion
+          total_attendance   - number of attendance rows (0 before scheduling)
+        """
+        fare = trip.fare or 0.0
+
+        attendances = session.exec(
+            select(TripAttendance).where(TripAttendance.trip_id == trip.id)
+        ).all()
+        total_att = len(attendances)
+        per_day = (fare / total_att) if total_att else fare
+
+        remaining_count = len(
+            [a for a in attendances if a.status in ("scheduled", "paused_payment")]
+        )
+
+        daily_bills = session.exec(
+            select(TripBill)
+            .where(
+                TripBill.trip_id == trip.id,
+                TripBill.bill_type == "daily_bill",
+            )
+            .order_by(TripBill.bill_date)
+        ).all()
+        unsettled_bills = [b for b in daily_bills if (b.amount_due or 0.0) > 0]
+        settled_paid = sum(
+            (b.amount_paid or 0.0) for b in daily_bills if (b.amount_due or 0.0) <= 0
+        )
+
+        if total_att == 0:
+            # Pre-scheduling (method chosen before the driver accepted): the
+            # whole fare is still outstanding.
+            outstanding_gross = round(fare, 2)
+        else:
+            outstanding_gross = round(
+                per_day * (remaining_count + len(unsettled_bills)), 2
+            )
+
+        user_paid = sum(
+            p.amount
+            for p in session.exec(
+                select(PaymentTransaction).where(
+                    PaymentTransaction.trip_id == trip.id,
+                    PaymentTransaction.payer_type == "user",
+                    PaymentTransaction.payment_status == "success",
+                )
+            ).all()
+        )
+        payments_applied = max(0.0, round(user_paid - settled_paid, 2))
+
+        return {
+            "per_day": per_day,
+            "remaining_count": remaining_count,
+            "unsettled_bills": unsettled_bills,
+            "outstanding_gross": outstanding_gross,
+            "payments_applied": payments_applied,
+            "total_attendance": total_att,
+        }
 
     def get_trip_duration_hours(self, shift_details: Optional[str]) -> Optional[int]:
         if not shift_details:
@@ -426,6 +515,45 @@ class TripService:
         except Exception as e:
             return False, f"Marking present failed: {str(e)}"
 
+    # A driver may skip at most this many shifts per calendar month on a given
+    # trip booking. The allowance is scoped to BOTH the trip and the month, so:
+    #   * a short trip running a month  -> up to 3 skips,
+    #   * a 5-month monthly booking     -> up to 3 skips in EACH of its months,
+    #   * skips on one trip never consume another trip's allowance.
+    # Users are unlimited. System-marked no-shows (skipped_by_system) never
+    # count here — only skips the driver themselves initiated.
+    DRIVER_SKIP_LIMIT_PER_TRIP_MONTH = 3
+
+    def count_driver_skips_for_trip_in_month(
+        self, session: Session, trip_id: int, ref_date: date
+    ) -> int:
+        """Shifts the driver has skipped (skipped_by_driver) on this trip
+        booking within ref_date's calendar month."""
+        month_start = ref_date.replace(day=1)
+        if ref_date.month == 12:
+            next_month_start = date(ref_date.year + 1, 1, 1)
+        else:
+            next_month_start = date(ref_date.year, ref_date.month + 1, 1)
+
+        rows = session.exec(
+            select(TripAttendance.id).where(
+                TripAttendance.trip_id == trip_id,
+                TripAttendance.status == "skipped_by_driver",
+                TripAttendance.trip_date >= month_start,
+                TripAttendance.trip_date < next_month_start,
+            )
+        ).all()
+        return len(rows)
+
+    def driver_skips_remaining(
+        self, session: Session, trip_id: int, ref_date: Optional[date] = None
+    ) -> int:
+        """Skips the driver has left on this trip booking for ref_date's
+        calendar month (defaults to the current month)."""
+        ref = ref_date or today_ist()
+        used = self.count_driver_skips_for_trip_in_month(session, trip_id, ref)
+        return max(0, self.DRIVER_SKIP_LIMIT_PER_TRIP_MONTH - used)
+
     def mark_trip_day_absent(
         self,
         session: Session,
@@ -460,6 +588,21 @@ class TripService:
                     False,
                     "Cannot skip a day that has already started. Use end-trip instead.",
                 )
+
+            # Driver-initiated skips are capped per calendar month on this trip
+            # booking; user-initiated skips remain unlimited. trip_date is the
+            # day being skipped (always today), so it scopes to the right month.
+            if marked_by == "driver":
+                used = self.count_driver_skips_for_trip_in_month(
+                    session, trip_id, trip_date
+                )
+                if used >= self.DRIVER_SKIP_LIMIT_PER_TRIP_MONTH:
+                    return (
+                        False,
+                        f"Skip limit reached — a driver can skip at most "
+                        f"{self.DRIVER_SKIP_LIMIT_PER_TRIP_MONTH} shifts per "
+                        f"calendar month on a trip booking.",
+                    )
 
             status = f"skipped_by_{marked_by}"
             attendance.status = status
@@ -593,22 +736,46 @@ class TripService:
 
             user_paid = sum(p.amount for p in user_payments)
 
-            upfront_required = 0.0
-            remainder_due = 0.0
+            # Financials are derived from the actual daily bills + final
+            # settlement, so they stay correct after a mid-trip payment-method
+            # switch and reflect the per-bill discounts baked in by
+            # generate_daily_bill (advance_20 2% / full_payment 5% /
+            # outstation 3%).
+            daily_bills = session.exec(
+                select(TripBill).where(
+                    TripBill.trip_id == trip_id,
+                    TripBill.bill_type == "daily_bill",
+                )
+            ).all()
+            settlement = session.exec(
+                select(TripSettlement).where(TripSettlement.trip_id == trip_id)
+            ).first()
 
-            if trip.payment_method == "full_payment":
-                upfront_required = round(trip.fare * 0.95, 2) if trip.fare else 0.0
-            elif trip.payment_method == "advance_20":
-                upfront_required = round(trip.fare * 0.20, 2) if trip.fare else 0.0
-                remainder_due = round(trip.fare * 0.78, 2) if trip.fare else 0.0
+            # Upfront still owed: only while the trip is blocked awaiting an
+            # advance_20 / full_payment upfront (initial choice or a mid-trip
+            # switch) — charged on the still-outstanding portion only.
+            upfront_amount_due = 0.0
+            if trip.is_payment_blocked and trip.payment_method in (
+                "advance_20",
+                "full_payment",
+            ):
+                portion = self.compute_outstanding_portion(session, trip)
+                rate = 0.95 if trip.payment_method == "full_payment" else 0.20
+                upfront_amount_due = max(
+                    0.0,
+                    round(
+                        rate * portion["outstanding_gross"]
+                        - portion["payments_applied"],
+                        2,
+                    ),
+                )
+
+            # Amount still due: the final settlement balance once generated,
+            # otherwise the sum of unpaid daily bills raised so far.
+            if settlement is not None:
+                amount_due = round(settlement.remaining_due or 0.0, 2)
             else:
-                remainder_due = trip.fare or 0.0
-
-            upfront_paid = min(user_paid, upfront_required)
-            remainder_paid = max(0.0, user_paid - upfront_required)
-
-            upfront_amount_due = max(0.0, upfront_required - upfront_paid)
-            amount_due = max(0.0, remainder_due - remainder_paid)
+                amount_due = round(sum((b.amount_due or 0.0) for b in daily_bills), 2)
 
             result = {
                 "trip_id": trip.id,
@@ -635,6 +802,27 @@ class TripService:
 
             if is_driver:
                 result["total_driver_paid"] = sum(p.amount for p in driver_payments)
+
+            # Driver details — only once the driver has accepted AND paid the
+            # acceptance fee (a successful "driver_acceptance" transaction).
+            # Until then the trip has no committed driver, so return {}.
+            driver_detail: Dict[str, Any] = {}
+            driver_paid_acceptance = any(
+                p.payment_type == "driver_acceptance" for p in driver_payments
+            )
+            if trip.driver_id is not None and driver_paid_acceptance:
+                driver = session.get(Driver, trip.driver_id)
+                if driver:
+                    driver_total_trips = session.exec(
+                        select(func.count(Trip.id)).where(Trip.driver_id == driver.id)
+                    ).one()
+                    driver_detail = {
+                        "id": driver.id,
+                        "name": driver.name,
+                        "rating": driver.rating,
+                        "total_trips": driver_total_trips,
+                    }
+            result["driver"] = driver_detail
 
             return result
 

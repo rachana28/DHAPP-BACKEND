@@ -34,7 +34,10 @@ from app.modules.trips.allocation import (
 from app.modules.trips.otp_service import OTPService
 from app.modules.trips.payment_service import PaymentService, get_driver_acceptance_fee
 from app.modules.trips.trip_service import TripService
-from app.modules.trips.billing_service import BillingService
+from app.modules.trips.billing_service import (
+    BillingService,
+    payment_method_discount_pct,
+)
 from app.modules.trips.pricing_calculator import (
     calculate_fare,
     validate_pricing_inputs,
@@ -261,13 +264,16 @@ def get_my_bookings(
             .order_by(desc(Trip.booking_time))
             .options(selectinload(Trip.user))
         ).all()
+        # Skip allowance is scoped per trip booking — surface each trip's own
+        # remaining count.
+        trip_service = TripService()
         # Hand-marshal so we never leak the user UUID or internal flags.
         return [
             TripReadDriver(
                 **{
                     k: getattr(t, k)
                     for k in TripReadDriver.model_fields.keys()
-                    if k != "user"
+                    if k not in ("user", "driver_skips_remaining")
                 },
                 user={
                     "full_name": t.user.full_name if t.user else None,
@@ -278,6 +284,9 @@ def get_my_bookings(
                 }
                 if t.user
                 else None,
+                driver_skips_remaining=trip_service.driver_skips_remaining(
+                    session, t.id
+                ),
             )
             for t in trips
         ]
@@ -301,11 +310,18 @@ def get_my_bookings(
 
         # Build a Pydantic view per trip so mutating `driver`/`driver_id`
         # on the in-memory ORM row can never accidentally persist.
+        trip_service = TripService()
         result = []
         for t in trips:
             view = TripReadUser.model_validate(t, from_attributes=True)
             if t.status in DRIVER_HIDDEN_STATES:
                 view.driver = None
+            elif t.driver_id is not None:
+                # Surface the assigned driver's per-trip skip allowance for
+                # transparency, only once the driver is visible to the user.
+                view.driver_skips_remaining = trip_service.driver_skips_remaining(
+                    session, t.id
+                )
             result.append(view)
         return result
     else:
@@ -575,6 +591,14 @@ def select_payment_method(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
+    """Select or change the trip's payment method.
+
+    Allowed moves: trip_day -> advance_20 / full_payment, and advance_20 ->
+    full_payment. A trip can never move back to trip_day, and full_payment is
+    final. advance_20 / full_payment require an upfront payment (see
+    /pay-upfront) computed on the still-outstanding portion of the booking, so
+    a mid-trip switch never re-charges shifts already completed and paid.
+    """
     trip = session.exec(
         select(Trip).where(Trip.id == trip_id).with_for_update()
     ).first()
@@ -584,32 +608,144 @@ def select_payment_method(
     if trip.user_id != current_user.id:
         raise HTTPException(403, "Not authorized")
 
-    if trip.payment_method:
-        raise HTTPException(400, "Payment method already selected")
-
-    if payment_method not in ["trip_day", "advance_20", "full_payment"]:
+    if payment_method not in ("trip_day", "advance_20", "full_payment"):
         raise HTTPException(400, "Invalid payment method")
 
-    trip.payment_method = payment_method
-    if payment_method in ("advance_20", "full_payment"):
-        trip.is_payment_blocked = True
+    # Outstation is billed once at the end of the trip with a flat 3% discount —
+    # there is no payment-method choice for it.
+    if (trip.hiring_type or "").strip().lower() == "outstation":
+        raise HTTPException(
+            400,
+            "Outstation trips are billed once at trip end (3% discount) — "
+            "the payment method cannot be selected or changed.",
+        )
 
+    current = trip.payment_method  # None before the driver accepts the booking
+
+    # Transition matrix. An unset method may still be set to anything (initial
+    # selection); otherwise only upgrades are allowed.
+    if current is None:
+        allowed = {"trip_day", "advance_20", "full_payment"}
+    elif current == "trip_day":
+        allowed = {"advance_20", "full_payment"}
+    elif current == "advance_20":
+        allowed = {"full_payment"}
+    else:  # full_payment
+        allowed = set()
+
+    if payment_method == current:
+        raise HTTPException(400, f"Payment method is already '{current}'.")
+    if payment_method not in allowed:
+        if current == "full_payment":
+            raise HTTPException(
+                400,
+                "Full payment is already settled upfront — the payment method "
+                "cannot be changed.",
+            )
+        if payment_method == "trip_day":
+            raise HTTPException(
+                400,
+                "Cannot switch back to trip-day billing once advance_20 / "
+                "full_payment has been chosen.",
+            )
+        raise HTTPException(
+            400,
+            f"Cannot change payment method from '{current}' to '{payment_method}'.",
+        )
+
+    # Timing: never change while a shift is physically running, or once the
+    # trip has closed.
+    if trip.status in ("ongoing", "active"):
+        raise HTTPException(
+            400,
+            "A shift is currently in progress. Change the payment method "
+            "between shifts.",
+        )
+    CHANGE_ALLOWED_STATES = (
+        "searching",
+        "accepted_pending_payment",
+        "payment_in_progress",
+        "active_pending_otp",
+        "paused",
+    )
+    if trip.status not in CHANGE_ALLOWED_STATES:
+        raise HTTPException(
+            400,
+            f"Payment method cannot be changed while the trip is '{trip.status}'.",
+        )
+
+    trip_service = TripService()
+
+    # Once every shift is done, only the final settlement is left — it must be
+    # paid with the method already in effect.
+    attendance_count = len(
+        session.exec(
+            select(TripAttendance.id).where(TripAttendance.trip_id == trip_id)
+        ).all()
+    )
+    if attendance_count > 0 and not trip_service.has_pending_shifts(session, trip_id):
+        raise HTTPException(
+            400,
+            "All shifts are completed — settle the final bill with the current "
+            "payment method.",
+        )
+
+    # Setting (or keeping) trip_day needs no upfront step.
+    if payment_method == "trip_day":
+        trip.payment_method = "trip_day"
+        trip.state_version += 1
+        session.add(trip)
+        session.commit()
+        return {"message": "Payment method set to trip_day"}
+
+    # advance_20 / full_payment — compute the upfront due on the outstanding
+    # portion only.
+    portion = trip_service.compute_outstanding_portion(session, trip)
+    outstanding_gross = portion["outstanding_gross"]
+    if outstanding_gross <= 0:
+        raise HTTPException(
+            400, "Nothing left to bill — the payment method cannot be changed."
+        )
+
+    if payment_method == "advance_20":
+        upfront = round(0.20 * outstanding_gross, 2)
+        # Anti-fraud: the 20% upfront must at least cover the most recent
+        # pending shift bill, so a switch can't be used to dodge an unpaid day.
+        unsettled = portion["unsettled_bills"]
+        if unsettled:
+            most_recent_due = unsettled[-1].amount_due or 0.0
+            if upfront < most_recent_due:
+                raise HTTPException(
+                    400,
+                    f"advance_20 not allowed here: the 20% upfront "
+                    f"(₹{upfront:.2f}) is less than the pending shift bill "
+                    f"(₹{most_recent_due:.2f}). Pay the pending bill or choose "
+                    f"full_payment.",
+                )
+
+    amount_due = max(
+        0.0,
+        round(
+            (0.20 if payment_method == "advance_20" else 0.95) * outstanding_gross
+            - portion["payments_applied"],
+            2,
+        ),
+    )
+
+    trip.payment_method = payment_method
+    trip.is_payment_blocked = True
+    trip.state_version += 1
     session.add(trip)
     session.commit()
 
-    if payment_method in ("advance_20", "full_payment"):
-        if payment_method == "full_payment":
-            upfront = round(trip.fare * 0.95, 2) if trip.fare else 0.0
-        else:  # advance_20
-            upfront = round(trip.fare * 0.20, 2) if trip.fare else 0.0
-        return {
-            "message": f"Payment method {payment_method} selected",
-            "next_step": "upfront_payment_required",
-            "upfront_amount_due": upfront,
-            "full_fare": trip.fare,
-        }
-    else:
-        return {"message": f"Payment method {payment_method} selected"}
+    return {
+        "message": f"Payment method changed to {payment_method}",
+        "next_step": "upfront_payment_required",
+        "amount_due": amount_due,
+        "upfront_amount_due": amount_due,
+        "full_fare": trip.fare,
+        "trip_status": trip.status,
+    }
 
 
 @router.post("/{trip_id}/pay-upfront")
@@ -620,10 +756,15 @@ def user_pay_upfront(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """User upfront payment.
+    """User upfront payment for an advance_20 / full_payment trip.
 
-    advance_20  → 20% of the trip fare collected now.
-    full_payment → 100% of the trip fare collected now.
+    The amount is computed on the still-outstanding portion of the booking
+    (remaining shifts + any unpaid completed shift), so:
+      * a fresh booking pays 20% / 95% of the whole fare, and
+      * a mid-trip switch pays only for what is left, crediting whatever the
+        user already paid.
+    Once paid, any unpaid completed-shift bills are settled under the new
+    method and the trip is un-blocked / un-paused so it can continue.
     trip_day has no upfront step (collected per day via /bill/{id}/pay).
     """
     trip = session.exec(
@@ -638,35 +779,120 @@ def user_pay_upfront(
             400,
             "Upfront payment applies only to advance_20 / full_payment trips.",
         )
-    if trip.actual_start_time is not None:
-        raise HTTPException(400, "Trip has already started; upfront window closed.")
     if not trip.fare or trip.fare <= 0:
         raise HTTPException(400, "Trip fare not calculated yet")
-
-    existing = session.exec(
-        select(PaymentTransaction).where(
-            PaymentTransaction.trip_id == trip_id,
-            PaymentTransaction.payer_type == "user",
-            PaymentTransaction.payment_type.in_(["advance_20", "full_payment"]),
-            PaymentTransaction.payment_status == "success",
+    if trip.status in ("ongoing", "active"):
+        raise HTTPException(
+            400, "A shift is in progress — complete it before paying upfront."
         )
-    ).first()
-    if existing:
-        raise HTTPException(400, "Upfront payment already made for this trip")
 
-    if trip.payment_method == "full_payment":
-        amount = round(trip.fare * 0.95, 2)
-    else:  # advance_20
-        amount = round(trip.fare * 0.20, 2)
+    trip_service = TripService()
+    portion = trip_service.compute_outstanding_portion(session, trip)
+    outstanding_gross = portion["outstanding_gross"]
+    rate = 0.95 if trip.payment_method == "full_payment" else 0.20
+    amount = max(0.0, round(rate * outstanding_gross - portion["payments_applied"], 2))
 
     payment_service = PaymentService(redis_client)
-    ok, err = payment_service.user_make_payment(
-        session, trip_id, str(current_user.id), amount, payment_method
-    )
-    if not ok:
-        raise HTTPException(400, err or "Upfront payment failed")
 
+    if amount > 0:
+        ok, err = payment_service.user_make_payment(
+            session, trip_id, str(current_user.id), amount, payment_method
+        )
+        if not ok:
+            raise HTTPException(400, err or "Upfront payment failed")
+
+    # Settle any already-generated daily bills that still carry a balance,
+    # under the new payment method. The credit pool (advance/full upfront
+    # payments) is drawn down in shift-date order; trip_day cash that cleared
+    # earlier days is excluded so the maths matches generate_daily_bill.
+    discount_pct = payment_method_discount_pct(trip.hiring_type, trip.payment_method)
+    per_day = portion["per_day"]
+
+    total_upfront = sum(
+        p.amount
+        for p in session.exec(
+            select(PaymentTransaction).where(
+                PaymentTransaction.trip_id == trip_id,
+                PaymentTransaction.payer_type == "user",
+                PaymentTransaction.payment_status == "success",
+                PaymentTransaction.payment_type.notin_(["trip_day_bill", "settlement"]),
+            )
+        ).all()
+    )
+    trip_day_cash = sum(
+        p.amount
+        for p in session.exec(
+            select(PaymentTransaction).where(
+                PaymentTransaction.trip_id == trip_id,
+                PaymentTransaction.payer_type == "user",
+                PaymentTransaction.payment_status == "success",
+                PaymentTransaction.payment_type == "trip_day_bill",
+            )
+        ).all()
+    )
+
+    daily_bills = session.exec(
+        select(TripBill)
+        .where(
+            TripBill.trip_id == trip_id,
+            TripBill.bill_type == "daily_bill",
+        )
+        .order_by(TripBill.bill_date)
+        .with_for_update()
+    ).all()
+
+    running_paid = 0.0
+    now = now_ist()
+    for bill in daily_bills:
+        if (bill.amount_due or 0.0) > 0:
+            disc = round(per_day * discount_pct / 100.0, 2)
+            net = round(per_day - disc, 2)
+            credit_available = max(
+                0.0, total_upfront - max(0.0, running_paid - trip_day_cash)
+            )
+            paid = min(net, credit_available)
+            bill.discount_percentage = discount_pct or None
+            bill.discount_amount = disc
+            bill.total_amount = net
+            bill.amount_paid = paid
+            bill.amount_due = max(0.0, round(net - paid, 2))
+            bill.is_paid = bill.amount_due <= 0
+            if bill.is_paid:
+                bill.paid_at = now
+                bill.paid_by = "user_online"
+            if disc > 0 and isinstance(bill.components, list):
+                bill.components = bill.components + [
+                    {
+                        "name": f"Payment Discount ({discount_pct:.0f}%)",
+                        "amount": -disc,
+                        "percentage": -discount_pct,
+                    }
+                ]
+            session.add(bill)
+        running_paid += bill.amount_paid or 0.0
+
+    # Un-block and re-arm: a mid-trip switch is done from a `paused` (unpaid
+    # bill) or `active_pending_otp` state — clear the block, flip any
+    # payment-paused shift back to scheduled, and move a paused trip to
+    # active_pending_otp so the next shift's OTP can be requested.
     trip.is_payment_blocked = False
+    for att in session.exec(
+        select(TripAttendance).where(
+            TripAttendance.trip_id == trip_id,
+            TripAttendance.status == "paused_payment",
+        )
+    ).all():
+        att.status = "scheduled"
+        att.skip_reason = None
+        att.marked_by = "system"
+        session.add(att)
+    if trip.status == "paused":
+        trip.status = (
+            "active_pending_otp"
+            if trip_service.has_pending_shifts(session, trip_id)
+            else "completed"
+        )
+    trip.state_version += 1
     session.add(trip)
     session.commit()
 
@@ -687,8 +913,11 @@ def driver_accept_and_initiate_payment(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
+    # Row-lock the driver so two concurrent accepts by the same driver are
+    # serialized — this is what makes the one-driver-one-trip check below race
+    # free.
     driver = session.exec(
-        select(Driver).where(Driver.user_id == current_user.id)
+        select(Driver).where(Driver.user_id == current_user.id).with_for_update()
     ).first()
     if not driver:
         raise HTTPException(403, "Only drivers can perform this action")
@@ -753,6 +982,23 @@ def driver_accept_and_initiate_payment(
             raise HTTPException(
                 400,
                 f"Trip cannot be accepted in status '{trip.status}'.",
+            )
+
+        # One driver = one active trip. Block accepting a new booking while the
+        # driver still has another in-flight trip. The driver row is locked
+        # above, so two concurrent accepts cannot both slip past this check.
+        busy_trip = session.exec(
+            select(Trip).where(
+                Trip.driver_id == driver.id,
+                Trip.id != trip_id,
+                Trip.status.in_(TripService.DRIVER_BUSY_STATES),
+            )
+        ).first()
+        if busy_trip:
+            raise HTTPException(
+                409,
+                f"You already have an active trip (id={busy_trip.id}, "
+                f"status={busy_trip.status}). Complete it before accepting another.",
             )
 
         accepted_offer = session.exec(
@@ -842,11 +1088,13 @@ def driver_process_payment(
             400, f"Trip status is {trip.status}, cannot process payment now"
         )
 
+    # Payment method is optional at booking time. Now that the driver has
+    # accepted (by paying the acceptance fee), default it to trip-day billing
+    # so the trip can proceed without waiting on the user — the user can still
+    # switch to advance_20 / full_payment later via /select-payment-method.
     if not trip.payment_method:
-        raise HTTPException(
-            400,
-            "User must select a payment method before driver can complete payment.",
-        )
+        trip.payment_method = "trip_day"
+        session.add(trip)
 
     payment_service = PaymentService(redis_client)
     success, error = payment_service.driver_accept_payment(session, trip_id, driver.id)
@@ -1180,6 +1428,14 @@ def skip_trip_day(
         if not driver or trip.driver_id != driver.id:
             raise HTTPException(403, "Not authorized")
         marked_by = "driver"
+
+    # Outstation trips are a single continuous booking with one OTP and no
+    # per-day shifts — there is nothing to skip. Use cancellation instead.
+    if (trip.hiring_type or "").strip().lower() == "outstation":
+        raise HTTPException(
+            400,
+            "Outstation trips cannot be skipped. Use the cancel option to drop this booking.",
+        )
 
     today = today_ist()
 

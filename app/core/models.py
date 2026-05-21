@@ -651,6 +651,8 @@ class TripReadUser(TripSafe):
         None  # Added support for tow driver details
     )
     mechanic: Optional[MechanicPublic] = None
+    # Assigned driver's remaining shift-skips on this trip booking this month.
+    driver_skips_remaining: Optional[int] = None
 
 
 class DriverPrivate(DriverBase):
@@ -1163,6 +1165,8 @@ class TripReadDriver(SQLModel):
     actual_end_time: Optional[datetime] = None
     trip_duration_hours: Optional[int] = None
     user: Optional[UserPublicForDriver] = None
+    # Driver's remaining shift-skips on this trip booking this month (limit 3).
+    driver_skips_remaining: Optional[int] = None
 
 
 class TripBillRead(SQLModel):

@@ -2,6 +2,7 @@ from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
 from app.core.models import Driver, Trip, TripOffer
+from app.modules.trips.trip_service import TripService
 from app.utils.time_utils import now_ist
 
 
@@ -54,9 +55,23 @@ def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
     )
     drivers = session.exec(query).all()
 
+    # One driver = one active trip: drivers already engaged on an in-flight
+    # booking are excluded so they are never offered (or ranked for) a second.
+    busy_driver_ids = set(
+        session.exec(
+            select(Trip.driver_id).where(
+                Trip.driver_id.isnot(None),
+                Trip.status.in_(TripService.DRIVER_BUSY_STATES),
+            )
+        ).all()
+    )
+
     driver_scores = []
 
     for driver in drivers:
+        if driver.id in busy_driver_ids:
+            continue
+
         # Get Last Trip Time
         last_trip = session.exec(
             select(Trip.booking_time)

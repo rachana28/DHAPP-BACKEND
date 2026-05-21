@@ -19,6 +19,26 @@ from app.core.models import (
 )
 
 
+def payment_method_discount_pct(
+    hiring_type: Optional[str], payment_method: Optional[str]
+) -> float:
+    """Discount % baked into a trip's billing for the given payment method.
+
+    Outstation trips are billed once at the end of the trip and always carry a
+    flat 3% discount regardless of payment method. For every other hiring type:
+      * full_payment -> 5%
+      * advance_20   -> 2%
+      * trip_day / unset -> 0%
+    """
+    if (hiring_type or "").strip().lower() == "outstation":
+        return 3.0
+    if payment_method == "full_payment":
+        return 5.0
+    if payment_method == "advance_20":
+        return 2.0
+    return 0.0
+
+
 class BillingService:
     """
     Handles bill generation and final settlement
@@ -139,13 +159,22 @@ class BillingService:
             if existing_bill:
                 return False, existing_bill.id, "Bill already exists for this day"
 
-            # Calculate components
-            components, total_amount, error = self.calculate_daily_bill_components(
+            # Calculate components (gross — before any payment-method discount)
+            components, gross_amount, error = self.calculate_daily_bill_components(
                 session, trip_id, trip_date
             )
 
             if error:
                 return False, None, error
+
+            # Payment-method discount is baked into the bill so total_amount is
+            # always the net amount actually owed for the day:
+            #   outstation 3% (flat) · full_payment 5% · advance_20 2% · trip_day 0%
+            discount_pct = payment_method_discount_pct(
+                trip.hiring_type, trip.payment_method
+            )
+            discount_amount = round(gross_amount * discount_pct / 100.0, 2)
+            total_amount = round(gross_amount - discount_amount, 2)
 
             upfront_payments = session.exec(
                 select(PaymentTransaction).where(
@@ -165,7 +194,25 @@ class BillingService:
                     TripBill.bill_type == "daily_bill",
                 )
             ).all()
-            already_allocated = sum(b.amount_paid for b in prior_daily_bills)
+            # trip_day daily bills are cleared with their own cash (a
+            # "trip_day_bill" transaction), not from the advance/full upfront
+            # pool. Exclude that cash so a mid-trip payment-method switch keeps
+            # the remaining-credit maths correct for the days billed afterwards.
+            trip_day_cash = sum(
+                p.amount
+                for p in session.exec(
+                    select(PaymentTransaction).where(
+                        PaymentTransaction.trip_id == trip_id,
+                        PaymentTransaction.payer_type == "user",
+                        PaymentTransaction.payment_status == "success",
+                        PaymentTransaction.payment_type == "trip_day_bill",
+                    )
+                ).all()
+            )
+            already_allocated = max(
+                0.0,
+                sum(b.amount_paid for b in prior_daily_bills) - trip_day_cash,
+            )
 
             credit_available = max(0.0, total_upfront - already_allocated)
             amount_paid = min(total_amount, credit_available)
@@ -178,12 +225,22 @@ class BillingService:
                 {
                     "name": name,
                     "amount": amount,
-                    "percentage": (amount / total_amount * 100)
-                    if total_amount > 0
+                    "percentage": (amount / gross_amount * 100)
+                    if gross_amount > 0
                     else 0.0,
                 }
                 for name, amount in components.items()
             ]
+            # Surface the payment-method discount as its own line so the
+            # component breakdown still sums to total_amount.
+            if discount_amount > 0:
+                components_list.append(
+                    {
+                        "name": f"Payment Discount ({discount_pct:.0f}%)",
+                        "amount": -discount_amount,
+                        "percentage": -discount_pct,
+                    }
+                )
 
             # Create bill
             bill = TripBill(
@@ -195,6 +252,8 @@ class BillingService:
                 total_amount=total_amount,
                 amount_paid=amount_paid,
                 amount_due=amount_due,
+                discount_percentage=discount_pct or None,
+                discount_amount=discount_amount,
                 is_paid=is_paid,
                 paid_at=now_ist() if is_paid else None,  # Also set paid_at if auto-paid
                 is_generated=True,
@@ -294,13 +353,10 @@ class BillingService:
             total_user_paid = sum(p.amount for p in user_payments)
             total_driver_paid = sum(p.amount for p in driver_payments)
 
-            # Apply payment method discount
-            discount_percentage = 0.0
-            if trip.payment_method == "full_payment":
-                discount_percentage = 5.0
-
-            discount_amount = total_earned * (discount_percentage / 100)
-            final_earned = total_earned - discount_amount
+            # Daily bills already carry their payment-method discount inside
+            # total_amount (see generate_daily_bill / payment_method_discount_pct),
+            # so the summed earnings are already net — nothing more to deduct.
+            final_earned = round(total_earned, 2)
 
             # Calculate remaining balance
             remaining_due = max(0, final_earned - total_user_paid)

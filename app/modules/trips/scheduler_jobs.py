@@ -360,6 +360,134 @@ async def auto_end_trip_scheduler():
     except Exception as e:
         logger.error(f"Trip auto-end scheduler failed: {str(e)}")
 
+    # Same cadence handles the inverse case: shifts that were never started and
+    # whose scheduled window has now fully ended.
+    await auto_mark_missed_shifts_scheduler()
+
+
+async def auto_mark_missed_shifts_scheduler():
+    """Mark un-started shifts absent once their scheduled window has fully ended.
+
+    Real-time scenario: neither the user nor the driver started a shift (no OTP
+    verified) and its scheduled_end has now passed — e.g. a 4 PM shift of 7
+    hours whose scheduled_end is 11 PM. The day is a no-show, marked
+    skipped_by_system so it is excluded from billing.
+
+    It is deliberately a SYSTEM skip (marked_by="system"): a forgotten shift is
+    not the driver's deliberate choice, so it never counts against the driver's
+    monthly skip limit (which only tallies skipped_by_driver).
+
+    Each TripAttendance row carries its own scheduled_end, so the correct
+    calendar day is always targeted: a shift running past midnight is closed by
+    its own row, and the next day's row (later scheduled_end, still in the
+    future) is left untouched.
+    """
+    try:
+        with Session(engine) as session:
+            trip_service = TripService()
+            billing_service = BillingService()
+            now = now_ist()
+
+            missed_stubs = session.exec(
+                select(TripAttendance)
+                .where(
+                    TripAttendance.status.in_(["scheduled", "paused_payment"]),
+                    TripAttendance.user_otp_verified == False,  # noqa: E712
+                    TripAttendance.driver_otp_verified == False,  # noqa: E712
+                    TripAttendance.scheduled_end <= now,
+                )
+                .order_by(TripAttendance.trip_date)
+            ).all()
+
+            if not missed_stubs:
+                return
+
+            trip_ids = list({a.trip_id for a in missed_stubs})
+            trips_by_id = {
+                t.id: t
+                for t in session.exec(select(Trip).where(Trip.id.in_(trip_ids))).all()
+            }
+
+            for stub in missed_stubs:
+                trip = trips_by_id.get(stub.trip_id)
+                # Only finalize shifts for trips still waiting on / holding a shift.
+                if not trip or trip.status not in ("active_pending_otp", "paused"):
+                    continue
+
+                # Re-fetch under a row lock and re-check — verify-otp or
+                # skip-day may have acted between the bulk select above and now.
+                att = session.exec(
+                    select(TripAttendance)
+                    .where(TripAttendance.id == stub.id)
+                    .with_for_update()
+                ).first()
+                if (
+                    not att
+                    or att.status not in ("scheduled", "paused_payment")
+                    or att.user_otp_verified
+                    or att.driver_otp_verified
+                    or att.scheduled_end > now
+                ):
+                    session.commit()  # release the row lock
+                    continue
+
+                att.status = "skipped_by_system"
+                att.skip_reason = "Shift not started before its scheduled end time"
+                att.marked_by = "system"
+                session.add(att)
+                session.commit()
+
+                logger.info(
+                    f"Trip {trip.id}: shift {att.trip_date} auto-marked absent "
+                    f"(not started by scheduled end {att.scheduled_end})"
+                )
+
+                # If that was the trip's last pending shift, push it to a
+                # terminal state so it doesn't sit in active_pending_otp /
+                # paused forever.
+                if trip_service.has_pending_shifts(session, trip.id):
+                    continue
+
+                fresh = session.get(Trip, trip.id)
+                if not fresh or fresh.status not in (
+                    "active_pending_otp",
+                    "paused",
+                    "ongoing",
+                ):
+                    continue
+
+                has_any_present = session.exec(
+                    select(TripAttendance).where(
+                        TripAttendance.trip_id == trip.id,
+                        TripAttendance.status == "present",
+                    )
+                ).first()
+                target = "completed" if has_any_present else "skipped"
+                success, error = trip_service.transition_trip_state(
+                    session, trip.id, target, validate=False
+                )
+                if not success:
+                    logger.warning(
+                        f"Failed to close trip {trip.id} after missed shift: {error}"
+                    )
+                    continue
+
+                closed = session.get(Trip, trip.id)
+                if closed and closed.actual_end_time is None:
+                    closed.actual_end_time = now
+                    session.add(closed)
+                    session.commit()
+
+                try:
+                    billing_service.generate_final_settlement(session, trip.id)
+                except Exception as settle_err:
+                    logger.warning(
+                        f"Inline settlement after missed-shift close failed "
+                        f"for trip {trip.id}: {settle_err}"
+                    )
+    except Exception as e:
+        logger.error(f"Missed-shift auto-absent scheduler failed: {str(e)}")
+
 
 async def driver_payment_timeout_scheduler():
     try:
