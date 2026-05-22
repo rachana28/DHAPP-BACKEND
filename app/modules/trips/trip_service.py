@@ -866,6 +866,7 @@ class TripService:
             result = {
                 "trip_id": trip.id,
                 "status": trip.status,
+                "hiring_type": trip.hiring_type,
                 "payment_method": trip.payment_method,
                 "start_date": trip.start_date,
                 "end_date": trip.end_date,
@@ -885,6 +886,33 @@ class TripService:
 
             if trip.payment_method in ("advance_20", "full_payment"):
                 result["upfront_amount_due"] = upfront_amount_due
+
+            # Total refunded to the user — surfaced only for a cancelled trip.
+            # Refunds are recorded as PaymentTransaction rows with
+            # payer_type="user" and payment_status="refunded" (see
+            # PaymentService.process_refund); driver-fee refunds carry
+            # payer_type="driver" and are deliberately excluded here.
+            if (trip.status or "").startswith("cancel"):
+                user_refund_txns = session.exec(
+                    select(PaymentTransaction).where(
+                        PaymentTransaction.trip_id == trip_id,
+                        PaymentTransaction.payer_type == "user",
+                        PaymentTransaction.payment_status == "refunded",
+                    )
+                ).all()
+                result["total_amount_refunded"] = round(
+                    sum(p.amount for p in user_refund_txns), 2
+                )
+
+            # Outstation trips are point-to-point, so the booked route
+            # (locations + coordinates) is part of the trip summary.
+            if (trip.hiring_type or "").strip().lower() == "outstation":
+                result["start_location"] = trip.start_location
+                result["end_location"] = trip.end_location
+                result["start_lat"] = trip.start_lat
+                result["start_lng"] = trip.start_lng
+                result["end_lat"] = trip.end_lat
+                result["end_lng"] = trip.end_lng
 
             if is_driver:
                 result["total_driver_paid"] = sum(p.amount for p in driver_payments)
