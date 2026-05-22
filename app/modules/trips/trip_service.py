@@ -15,6 +15,7 @@ from app.core.models import (
     TripSettlement,
     Driver,
 )
+from app.modules.trips.billing_service import payment_method_discount_pct
 from app.utils.time_utils import today_ist
 
 
@@ -189,6 +190,23 @@ class TripService:
             (b.amount_paid or 0.0) for b in daily_bills if (b.amount_due or 0.0) <= 0
         )
 
+        # advance_20 / full_payment days never have a daily bill — the upfront
+        # credit those completed days consumed is derived from attendance
+        # instead, so the remaining-credit maths stays correct (this exactly
+        # reproduces the old "settled bill amount_paid" the auto-paid advance/
+        # full daily bills used to contribute).
+        billed_dates = {b.bill_date for b in daily_bills}
+        completed_unbilled = [
+            a
+            for a in attendances
+            if a.status == "present" and a.trip_date not in billed_dates
+        ]
+        discount_pct = payment_method_discount_pct(
+            trip.hiring_type, trip.payment_method
+        )
+        per_day_net = per_day * (1 - discount_pct / 100.0)
+        consumed_advfull = round(per_day_net * len(completed_unbilled), 2)
+
         if total_att == 0:
             # Pre-scheduling (method chosen before the driver accepted): the
             # whole fare is still outstanding.
@@ -208,7 +226,9 @@ class TripService:
                 )
             ).all()
         )
-        payments_applied = max(0.0, round(user_paid - settled_paid, 2))
+        payments_applied = max(
+            0.0, round(user_paid - settled_paid - consumed_advfull, 2)
+        )
 
         return {
             "per_day": per_day,

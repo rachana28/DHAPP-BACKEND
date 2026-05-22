@@ -147,6 +147,14 @@ class BillingService:
             if not trip:
                 return False, None, "Trip not found"
 
+            # Daily bills are a trip_day-only mechanism. advance_20 and
+            # full_payment are settled via the upfront payment plus the final
+            # settlement (earnings are prorated from attendance in
+            # generate_final_settlement), so no per-day TripBill row is ever
+            # created for them.
+            if trip.payment_method in ("advance_20", "full_payment"):
+                return True, None, None
+
             # Check if bill already exists for this day
             existing_bill = session.exec(
                 select(TripBill).where(
@@ -324,7 +332,12 @@ class BillingService:
             absent_count = len([a for a in attendances if "skipped" in a.status])
             total_trips = len(attendances)
 
-            # Calculate total earned
+            # Calculate total earned.
+            #   * trip_day days are billed per-day -> use each daily bill total
+            #     (preserves per-day precision, incl. outstation's flat 3%).
+            #   * advance_20 / full_payment days carry NO daily bill -> prorate
+            #     them from trip.fare at the method's discount, so the
+            #     remaining balance is still charged correctly at settlement.
             daily_bills = session.exec(
                 select(TripBill).where(
                     TripBill.trip_id == trip_id, TripBill.bill_type == "daily_bill"
@@ -332,6 +345,20 @@ class BillingService:
             ).all()
 
             total_earned = sum(bill.total_amount for bill in daily_bills)
+
+            billed_dates = {b.bill_date for b in daily_bills}
+            unbilled_present = [
+                a
+                for a in attendances
+                if a.status == "present" and a.trip_date not in billed_dates
+            ]
+            if unbilled_present and trip.fare and total_trips > 0:
+                per_day_gross = trip.fare / total_trips
+                discount_pct = payment_method_discount_pct(
+                    trip.hiring_type, trip.payment_method
+                )
+                per_day_net = per_day_gross * (1 - discount_pct / 100.0)
+                total_earned += per_day_net * len(unbilled_present)
 
             # Calculate payments
             user_payments = session.exec(
