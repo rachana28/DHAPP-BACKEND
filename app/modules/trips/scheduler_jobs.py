@@ -2,7 +2,7 @@
 Scheduled Jobs for Trip Management
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 from sqlmodel import Session, select
@@ -626,3 +626,216 @@ async def daily_settlement_scheduler():
 
     except Exception as e:
         logger.error(f"Daily settlement scheduler failed: {str(e)}")
+
+
+async def auto_resolve_paused_trips_scheduler():
+    """Resolve trips that have been stuck in `paused` for too long (Issue 8).
+
+    Two real-time scenarios:
+
+      * advance_20 / full_payment upfront unpaid — the trip is paused waiting
+        for the user's upfront payment. After 1 hour the payment method is
+        auto-converted to trip_day and the trip is unpaused, so it can proceed
+        on pay-per-day billing instead of being stuck forever.
+
+      * trip_day with an unpaid daily bill — the trip is paused waiting for the
+        user to clear the daily bill. After 48 hours the whole booking is
+        force-closed: the remaining shifts are voided and a final settlement is
+        raised for the PENDING amount only. Once the user pays that settlement
+        the booking is fully settled — it does NOT continue with the other
+        days in the booking.
+
+    Pause start-times are derived without any new DB column:
+      * upfront pause  -> a Redis anchor key (1-hour grace) is stamped the
+        first time this job sees the paused trip; if Redis is unavailable the
+        conversion is simply skipped (safe degradation).
+      * daily-bill pause -> the oldest unpaid daily bill's generated_at is the
+        anchor (the bill is raised exactly when the pause begins).
+    """
+    try:
+        with Session(engine) as session:
+            trip_service = TripService()
+            billing_service = BillingService()
+            redis_client = get_redis()
+            now = now_ist()
+
+            # ── 8d: advance/full upfront pending > 1h → convert to trip_day ──
+            upfront_paused = session.exec(
+                select(Trip).where(
+                    Trip.status == "paused",
+                    Trip.is_payment_blocked == True,  # noqa: E712
+                    Trip.payment_method.in_(["advance_20", "full_payment"]),
+                )
+            ).all()
+
+            for trip in upfront_paused:
+                anchor_key = f"trip:{trip.id}:upfront_pause_at"
+                started_iso = None
+                if redis_client:
+                    try:
+                        started_iso = redis_client.get(anchor_key)
+                    except Exception:
+                        started_iso = None
+
+                if not started_iso:
+                    # First sighting — stamp the 1-hour grace anchor and wait.
+                    if redis_client:
+                        try:
+                            redis_client.set(anchor_key, now.isoformat(), ex=86400)
+                        except Exception:
+                            pass
+                    continue
+
+                try:
+                    started = datetime.fromisoformat(started_iso)
+                except ValueError:
+                    started = now
+                if (now - started) < timedelta(hours=1):
+                    continue
+
+                locked = session.exec(
+                    select(Trip).where(Trip.id == trip.id).with_for_update()
+                ).first()
+                if (
+                    not locked
+                    or locked.status != "paused"
+                    or locked.payment_method not in ("advance_20", "full_payment")
+                    or not locked.is_payment_blocked
+                ):
+                    session.commit()  # release the row lock
+                    continue
+
+                locked.payment_method = "trip_day"
+                locked.is_payment_blocked = False
+                if trip_service.has_pending_shifts(session, locked.id):
+                    locked.status = "active_pending_otp"
+                else:
+                    locked.status = "completed"
+                locked.state_version += 1
+                session.add(locked)
+
+                # Re-arm any payment-paused shifts so OTP can resume.
+                for att in session.exec(
+                    select(TripAttendance).where(
+                        TripAttendance.trip_id == locked.id,
+                        TripAttendance.status == "paused_payment",
+                    )
+                ).all():
+                    att.status = "scheduled"
+                    att.skip_reason = None
+                    att.marked_by = "system"
+                    session.add(att)
+                session.commit()
+
+                if redis_client:
+                    try:
+                        redis_client.delete(anchor_key)
+                    except Exception:
+                        pass
+
+                logger.info(
+                    f"Trip {locked.id}: advance/full upfront unpaid for 1h — "
+                    f"auto-converted to trip_day and unpaused"
+                )
+                try:
+                    send_push_notification(
+                        session=session,
+                        user_ids=[locked.user_id],
+                        title="Switched to pay-per-day billing",
+                        body=(
+                            f"Upfront payment for trip #{locked.id} wasn't "
+                            f"completed in time, so billing was switched to "
+                            f"trip-day. You can request your OTP now."
+                        ),
+                        data={
+                            "type": "payment_method_auto_converted",
+                            "trip_id": locked.id,
+                        },
+                    )
+                except Exception:
+                    pass
+
+            # ── 8c: trip_day unpaid daily bill paused > 48h → force-close ───
+            billbased_paused = session.exec(
+                select(Trip).where(
+                    Trip.status == "paused",
+                    Trip.payment_method == "trip_day",
+                )
+            ).all()
+
+            for trip in billbased_paused:
+                oldest_unpaid = session.exec(
+                    select(TripBill)
+                    .where(
+                        TripBill.trip_id == trip.id,
+                        TripBill.bill_type == "daily_bill",
+                        TripBill.amount_due > 0,
+                    )
+                    .order_by(TripBill.generated_at)
+                ).first()
+                if not oldest_unpaid:
+                    continue
+                if (now - oldest_unpaid.generated_at) < timedelta(hours=48):
+                    continue
+
+                locked = session.exec(
+                    select(Trip).where(Trip.id == trip.id).with_for_update()
+                ).first()
+                if not locked or locked.status != "paused":
+                    session.commit()  # release the row lock
+                    continue
+
+                # Void every remaining shift — the whole booking ends here.
+                for att in session.exec(
+                    select(TripAttendance).where(
+                        TripAttendance.trip_id == locked.id,
+                        TripAttendance.status.in_(["scheduled", "paused_payment"]),
+                    )
+                ).all():
+                    att.status = "skipped_by_system"
+                    att.skip_reason = (
+                        "Booking closed: daily bill unpaid for over 48 hours"
+                    )
+                    att.marked_by = "system"
+                    session.add(att)
+
+                if locked.actual_end_time is None:
+                    locked.actual_end_time = now
+                locked.status = "billed"
+                locked.is_payment_blocked = False
+                locked.state_version += 1
+                session.add(locked)
+                session.commit()
+
+                # Final settlement carries the PENDING amount only:
+                # remaining_due = billed total − amount already paid.
+                ok, sid, err = billing_service.generate_final_settlement(
+                    session, locked.id
+                )
+                logger.info(
+                    f"Trip {locked.id}: daily bill unpaid for 48h — booking "
+                    f"force-closed to `billed`; final settlement={sid} ({err})"
+                )
+                try:
+                    settlement = session.get(TripSettlement, sid) if sid else None
+                    due = settlement.remaining_due if settlement else 0.0
+                    send_push_notification(
+                        session=session,
+                        user_ids=[locked.user_id],
+                        title="Trip closed — final bill due",
+                        body=(
+                            f"Trip #{locked.id} was closed because the daily "
+                            f"bill stayed unpaid for 48 hours. Pay the pending "
+                            f"amount of ₹{due:.2f} to settle the booking."
+                        ),
+                        data={
+                            "type": "settlement_generated",
+                            "trip_id": locked.id,
+                            "settlement_id": sid,
+                            "amount": due,
+                        },
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Paused-trip resolver scheduler failed: {str(e)}")

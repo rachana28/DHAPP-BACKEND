@@ -45,6 +45,7 @@ from app.modules.trips.scheduler_jobs import (
     auto_end_trip_scheduler,
     driver_payment_timeout_scheduler,
     daily_settlement_scheduler,
+    auto_resolve_paused_trips_scheduler,
 )
 
 
@@ -105,6 +106,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(auto_end_trip_scheduler, "interval", minutes=2)
     scheduler.add_job(driver_payment_timeout_scheduler, "interval", minutes=1)
     scheduler.add_job(daily_settlement_scheduler, "cron", hour=23, minute=59)
+    # Resolve trips stuck in `paused`: advance/full upfront unpaid > 1h
+    # (auto-convert to trip_day) and trip_day daily bill unpaid > 48h
+    # (force-close the booking with a final settlement).
+    scheduler.add_job(auto_resolve_paused_trips_scheduler, "interval", minutes=5)
     scheduler.start()
     print("🚀 Scheduler started.")
 

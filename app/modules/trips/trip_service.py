@@ -37,20 +37,24 @@ class TripService:
         "payment_in_progress": ["active_pending_otp", "payment_failed"],
         "payment_failed": ["searching", "cancelled"],
         "rejected": ["searching", "cancelled"],
-        # active_pending_otp → skipped/completed lets a skipped final shift wrap the trip up
+        # active_pending_otp → skipped/completed lets a skipped final shift wrap the trip up;
+        # → paused holds the trip when an advance_20 / full_payment upfront is unpaid.
         "active_pending_otp": [
             "active",
             "otp_expired",
             "cancelled",
             "skipped",
             "completed",
+            "paused",
         ],
         "active": ["ongoing", "skipped", "cancelled_by_user", "cancelled_by_driver"],
         # ongoing → active_pending_otp lets multi-day trips re-arm OTP for the next shift day
         "ongoing": ["completed", "auto_completed", "paused", "active_pending_otp"],
         # paused → active_pending_otp re-arms the next shift's OTP after a
         # trip_day user clears the outstanding daily bill that held the trip.
-        "paused": ["ongoing", "completed", "active_pending_otp"],
+        # paused → billed force-closes a trip whose daily bill stayed unpaid
+        # for 48 hours (final settlement covers the pending amount only).
+        "paused": ["ongoing", "completed", "active_pending_otp", "billed"],
         "completed": ["billed", "active_pending_otp"],
         "auto_completed": ["billed", "active_pending_otp"],
         "billed": ["settled"],
@@ -466,6 +470,9 @@ class TripService:
                 return True, None, has_completed_shift
 
             if trip.payment_method in ("advance_20", "full_payment"):
+                # Issue 4: once at least one shift has ended (a completed/
+                # present shift) an advance_20 / full_payment trip can no
+                # longer be cancelled — it must run to its final settlement.
                 if has_completed_shift:
                     return (
                         False,
@@ -473,6 +480,20 @@ class TripService:
                         "The trip will close automatically after the final shift.",
                         has_completed_shift,
                     )
+                # Issue 8: while the upfront is still unpaid the trip is paused.
+                # No proceed action (including cancel) is allowed until the user
+                # either pays the upfront or reverts the method to trip-day.
+                if trip.is_payment_blocked or trip.status == "paused":
+                    return (
+                        False,
+                        "Trip is paused awaiting your upfront payment. Pay the "
+                        "upfront amount, or switch back to trip-day billing, "
+                        "before cancelling.",
+                        has_completed_shift,
+                    )
+                # Issue 5: upfront paid, no shift ended yet — cancellation IS
+                # allowed. The router applies the ₹50-per-skipped-day deduction
+                # (0 skipped days => full 100% refund).
                 return True, None, has_completed_shift
 
             # Payment method not yet selected (early states like "searching").
@@ -481,6 +502,51 @@ class TripService:
 
         except Exception as e:
             return False, f"Cancellation validation failed: {str(e)}", False
+
+    def get_selectable_payment_methods(self, session: Session, trip: Trip) -> list:
+        """Payment methods the user may switch this trip TO right now.
+
+        Drives the `selectablePaymentMethod` field of the summary API (Issue 3)
+        so the app only ever offers a legal change:
+
+          * Outstation              -> [] (billed once at trip end, no choice)
+          * current trip_day        -> ["advance_20", "full_payment"]
+          * advance_20, upfront pending -> ["trip_day", "full_payment"]
+          * advance_20, upfront paid    -> ["full_payment"]
+          * full_payment, upfront pending -> ["trip_day", "advance_20"]
+          * full_payment, upfront paid    -> []
+
+        "upfront pending" means the user picked advance_20 / full_payment but
+        has not paid the upfront yet (is_payment_blocked still set) — they are
+        not locked in and may still revert to trip_day (Issue 1).
+
+        Once every shift is done only the final settlement is left, so nothing
+        is selectable.
+        """
+        if (trip.hiring_type or "").strip().lower() == "outstation":
+            return []
+
+        # All shifts done -> only the final settlement remains.
+        attendance_count = len(
+            session.exec(
+                select(TripAttendance.id).where(TripAttendance.trip_id == trip.id)
+            ).all()
+        )
+        if attendance_count > 0 and not self.has_pending_shifts(session, trip.id):
+            return []
+
+        current = trip.payment_method
+        upfront_pending = bool(trip.is_payment_blocked) and current in (
+            "advance_20",
+            "full_payment",
+        )
+        if current is None or current == "trip_day":
+            return ["advance_20", "full_payment"]
+        if current == "advance_20":
+            return ["trip_day", "full_payment"] if upfront_pending else ["full_payment"]
+        if current == "full_payment":
+            return ["trip_day", "advance_20"] if upfront_pending else []
+        return []
 
     def mark_trip_day_present(
         self,
@@ -803,11 +869,13 @@ class TripService:
             if is_driver:
                 result["total_driver_paid"] = sum(p.amount for p in driver_payments)
 
-            # Driver details — only once the driver has accepted AND paid the
-            # acceptance fee (a successful "driver_acceptance" transaction).
-            # Until then the trip has no committed driver, so return {}.
+            # Driver details — surfaced once the driver has accepted AND paid
+            # the acceptance fee. Issue 6: the trip's own driver_payment_status
+            # is the primary signal (set to "paid" in driver_accept_payment),
+            # with a successful "driver_acceptance" transaction as a fallback —
+            # so the driver block reliably appears in the summary.
             driver_detail: Dict[str, Any] = {}
-            driver_paid_acceptance = any(
+            driver_paid_acceptance = trip.driver_payment_status == "paid" or any(
                 p.payment_type == "driver_acceptance" for p in driver_payments
             )
             if trip.driver_id is not None and driver_paid_acceptance:
@@ -820,9 +888,18 @@ class TripService:
                         "id": driver.id,
                         "name": driver.name,
                         "rating": driver.rating,
+                        "profile_picture_url": driver.profile_picture_url,
+                        "vehicle_type": driver.vehicle_type,
+                        "years_of_experience": driver.years_of_experience,
                         "total_trips": driver_total_trips,
                     }
             result["driver"] = driver_detail
+
+            # Issue 3: payment methods the user may switch to right now, given
+            # the current method and whether the upfront has been paid.
+            result["selectablePaymentMethod"] = self.get_selectable_payment_methods(
+                session, trip
+            )
 
             return result
 

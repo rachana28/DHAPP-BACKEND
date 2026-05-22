@@ -226,6 +226,12 @@ def create_booking_request(
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"
 
+    # Issue 7: every booking starts on trip-day billing by default. This lets
+    # the driver accept and pay the acceptance fee without waiting on any user
+    # payment-method selection. The user can still upgrade to advance_20 /
+    # full_payment later via /select-payment-method.
+    trip_data["payment_method"] = "trip_day"
+
     db_trip = Trip.model_validate(trip_data)
 
     session.add(db_trip)
@@ -396,6 +402,7 @@ def cancel_trip(
     # advance_20 / full_payment can only be cancelled pre-start, so any
     # upfront amount is fully refunded.
     user_refund = 0.0
+    cancellation_deduction = 0.0
     if (
         trip.payment_method in ("advance_20", "full_payment")
         and not has_completed_shift
@@ -403,13 +410,40 @@ def cancel_trip(
         amt, refund_err = payment_service.calculate_refund_amount(session, trip_id)
         if refund_err:
             raise HTTPException(400, refund_err)
-        user_refund = amt or 0.0
+        gross_refund = amt or 0.0
+
+        # Issue 5 anti-fraud: when an advance_20 / full_payment user paid the
+        # upfront and then skipped the opening shifts before cancelling, deduct
+        # ₹50 for every skipped day already passed (e.g. 2 skipped days -> ₹100).
+        #   * 0 skipped days  -> full 100% refund
+        #   * N skipped days  -> refund minus ₹50 * N
+        # Driver-initiated skips are NOT the user's fault, so they are excluded.
+        skipped_days = len(
+            session.exec(
+                select(TripAttendance.id).where(
+                    TripAttendance.trip_id == trip_id,
+                    TripAttendance.status.in_(
+                        ["skipped_by_user", "skipped_by_system"]
+                    ),
+                )
+            ).all()
+        )
+        if gross_refund > 0:
+            cancellation_deduction = round(
+                min(gross_refund, 50.0 * skipped_days), 2
+            )
+        user_refund = round(gross_refund - cancellation_deduction, 2)
         if user_refund > 0:
             ok, err = payment_service.process_refund(
                 session,
                 trip_id,
                 user_refund,
-                reason="Trip cancelled by user",
+                reason=(
+                    "Trip cancelled by user"
+                    if cancellation_deduction <= 0
+                    else f"Trip cancelled by user "
+                    f"(₹{cancellation_deduction:.2f} skip deduction)"
+                ),
             )
             if not ok:
                 raise HTTPException(400, err or "Refund failed")
@@ -507,6 +541,7 @@ def cancel_trip(
     return {
         "message": "Trip cancelled successfully",
         "refund_amount": user_refund,
+        "cancellation_deduction": cancellation_deduction,
         "driver_refund_amount": driver_refund,
         "trip_status": trip.status,
         "settlement_id": settlement_id,
@@ -620,18 +655,27 @@ def select_payment_method(
             "the payment method cannot be selected or changed.",
         )
 
-    current = trip.payment_method  # None before the driver accepts the booking
+    current = trip.payment_method  # defaults to trip_day at booking creation
+
+    # Issue 1: an advance_20 / full_payment whose upfront has NOT been paid
+    # yet (is_payment_blocked is still set) can be freely reverted to trip_day
+    # — the user is not locked in until they actually pay the upfront.
+    upfront_pending = bool(trip.is_payment_blocked) and current in (
+        "advance_20",
+        "full_payment",
+    )
 
     # Transition matrix. An unset method may still be set to anything (initial
-    # selection); otherwise only upgrades are allowed.
+    # selection); otherwise only upgrades are allowed, EXCEPT an unpaid
+    # advance_20 / full_payment which may still be reverted to trip_day.
     if current is None:
         allowed = {"trip_day", "advance_20", "full_payment"}
     elif current == "trip_day":
         allowed = {"advance_20", "full_payment"}
     elif current == "advance_20":
-        allowed = {"full_payment"}
+        allowed = {"trip_day", "full_payment"} if upfront_pending else {"full_payment"}
     else:  # full_payment
-        allowed = set()
+        allowed = {"trip_day", "advance_20"} if upfront_pending else set()
 
     if payment_method == current:
         raise HTTPException(400, f"Payment method is already '{current}'.")
@@ -690,13 +734,23 @@ def select_payment_method(
             "payment method.",
         )
 
-    # Setting (or keeping) trip_day needs no upfront step.
+    # Setting (or reverting to) trip_day needs no upfront step.
     if payment_method == "trip_day":
         trip.payment_method = "trip_day"
         trip.state_version += 1
         session.add(trip)
         session.commit()
-        return {"message": "Payment method set to trip_day"}
+        # Issue 1/8: reverting an unpaid advance_20 / full_payment upfront
+        # must lift the upfront pause. unpause_trip_if_clear re-arms OTP and
+        # clears is_payment_blocked, but only when no daily bill is actually
+        # outstanding — otherwise the trip stays paused for that bill.
+        PaymentService(None).unpause_trip_if_clear(session, trip_id)
+        session.commit()
+        session.refresh(trip)
+        return {
+            "message": "Payment method set to trip_day",
+            "trip_status": trip.status,
+        }
 
     # advance_20 / full_payment — compute the upfront due on the outstanding
     # portion only.
@@ -734,6 +788,12 @@ def select_payment_method(
 
     trip.payment_method = payment_method
     trip.is_payment_blocked = True
+    # Issue 8: an unpaid advance_20 / full_payment upfront pauses the trip.
+    # Only pause once the booking has reached its active phase — earlier
+    # states (searching / accepted_pending_payment / payment_in_progress)
+    # belong to the driver-acceptance flow and must not be disturbed.
+    if trip.status == "active_pending_otp":
+        trip.status = "paused"
     trip.state_version += 1
     session.add(trip)
     session.commit()
@@ -1162,6 +1222,14 @@ def driver_process_payment(
     redis_client.delete(redis_key)
 
     if trip.payment_method in ("advance_20", "full_payment"):
+        # Issue 8: advance_20 / full_payment needs the user's upfront before
+        # any OTP can be issued — hold the trip in `paused` until /pay-upfront
+        # clears it (or the 1-hour auto-convert to trip_day fires).
+        trip.status = "paused"
+        trip.is_payment_blocked = True
+        trip.state_version += 1
+        session.add(trip)
+        session.commit()
         return {
             "message": "Driver payment successful. Awaiting user upfront payment before OTP can be requested.",
             "trip_id": trip_id,
@@ -1429,6 +1497,16 @@ def skip_trip_day(
             raise HTTPException(403, "Not authorized")
         marked_by = "driver"
 
+    # Issue 8: a trip paused for a pending payment (advance_20 / full_payment
+    # upfront, or an unpaid trip_day daily bill) is frozen — no proceed action
+    # such as skip is permitted until the outstanding amount is settled.
+    if trip.is_payment_blocked or trip.status == "paused":
+        raise HTTPException(
+            400,
+            "Trip is paused for a pending payment. Settle the outstanding "
+            "amount before skipping a day.",
+        )
+
     # Outstation trips are a single continuous booking with one OTP and no
     # per-day shifts — there is nothing to skip. Use cancellation instead.
     if (trip.hiring_type or "").strip().lower() == "outstation":
@@ -1493,26 +1571,30 @@ def skip_trip_day(
 
 
 @router.post("/{trip_id}/end-trip")
-def driver_end_trip(
+def end_trip(
     trip_id: int,
     notes: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    _ = notes  # currently unused; retained as accepted body field for the driver app
-    driver = session.exec(
-        select(Driver).where(Driver.user_id == current_user.id)
-    ).first()
-    if not driver:
-        raise HTTPException(403, "Only drivers can end trips")
+    """End the current shift — USER-ONLY.
+
+    Issue 2: a driver must NOT be able to end a trip — a driver ending early
+    after the user has already paid would be fraud. Once the OTP is verified
+    the user may end the trip whenever they need, up to the shift's scheduled
+    end time. If the user never ends it, auto_end_trip_scheduler closes the
+    shift automatically once scheduled_end_time passes, so the daily bill /
+    next shift can still proceed.
+    """
+    _ = notes  # currently unused; retained as accepted body field for the app
 
     trip = session.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    if trip.driver_id != driver.id:
-        raise HTTPException(403, "Not authorized")
+    if trip.user_id != current_user.id:
+        raise HTTPException(403, "Only the trip's user can end the trip")
 
     if trip.status != "ongoing":
         raise HTTPException(400, f"Trip status is {trip.status}, cannot end now")
@@ -2000,6 +2082,15 @@ def pay_trip_settlement(
     # paused trip can resume. Without this, a paused trip remains paused
     # even after the user pays the final settlement.
     payment_service.unpause_trip_if_clear(session, settlement.trip_id)
+
+    # Issue 8: a settlement paid against a force-closed (`billed`) trip — one
+    # auto-closed after a daily bill stayed unpaid for 48 hours — settles the
+    # whole booking. Move it to its terminal `settled` state.
+    settled_trip = session.get(Trip, settlement.trip_id)
+    if settled_trip and settled_trip.status == "billed":
+        settled_trip.status = "settled"
+        settled_trip.state_version += 1
+        session.add(settled_trip)
 
     session.commit()
 
