@@ -1,7 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlmodel import Session, select
 from app.core.database import get_redis, get_session
-from app.core.models import LocationUpdate, User, Trip, TowTruckDriver, Mechanic
+from app.core.models import (
+    LocationUpdate,
+    User,
+    TowTrip,
+    MechanicTrip,
+    TowTruckDriver,
+    Mechanic,
+)
 from app.core.security import get_current_user
 from sqlalchemy.orm import selectinload
 import redis
@@ -9,6 +16,37 @@ import json
 import asyncio
 
 router = APIRouter(prefix="/tracking", tags=["Live Tracking"])
+
+
+def _lookup_trip_owner(session: Session, trip_id: int):
+    """
+    Resolve a tracking trip_id to the assigned professional's user_id and the
+    trip's kind ("tow" or "mechanic"). Returns (kind, user_id) or (None, None)
+    if no trip / no professional yet.
+
+    Trip ids are now per-table. After the backfill migration, existing ids are
+    unique across tables (preserved from the old polymorphic trip); future ids
+    use independent sequences and could in principle collide. We probe TowTrip
+    first, then MechanicTrip — and the Redis cache key is namespaced by kind
+    so writes from the two flows can't clobber each other.
+    """
+    tow_trip = session.exec(
+        select(TowTrip)
+        .where(TowTrip.id == trip_id)
+        .options(selectinload(TowTrip.tow_truck_driver))
+    ).first()
+    if tow_trip and tow_trip.tow_truck_driver_id and tow_trip.tow_truck_driver:
+        return "tow", tow_trip.tow_truck_driver.user_id
+
+    mech_trip = session.exec(
+        select(MechanicTrip)
+        .where(MechanicTrip.id == trip_id)
+        .options(selectinload(MechanicTrip.mechanic))
+    ).first()
+    if mech_trip and mech_trip.mechanic_id and mech_trip.mechanic:
+        return "mechanic", mech_trip.mechanic.user_id
+
+    return None, None
 
 
 @router.post("/update")
@@ -28,28 +66,32 @@ def update_location(
     if not location.trip_id:
         raise HTTPException(400, "Active trip ID is required for location updates.")
 
-    trip = session.get(Trip, location.trip_id)
-    if not trip:
-        raise HTTPException(404, "Trip not found.")
-
-    # 2. Role-specific validation
+    # 2. Role-specific lookup — each kind lives in its own table now
     if current_user.role == "tow_truck_driver":
         driver = session.exec(
             select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
         ).first()
         if not driver:
             raise HTTPException(404, "Tow Driver profile not found.")
+
+        trip = session.get(TowTrip, location.trip_id)
+        if not trip:
+            raise HTTPException(404, "Trip not found.")
         if trip.tow_truck_driver_id != driver.id:
             raise HTTPException(
                 403, "You are not authorized to update location for this trip."
             )
 
-    elif current_user.role == "mechanic":
+    else:  # mechanic
         mechanic = session.exec(
             select(Mechanic).where(Mechanic.user_id == current_user.id)
         ).first()
         if not mechanic:
             raise HTTPException(404, "Mechanic profile not found.")
+
+        trip = session.get(MechanicTrip, location.trip_id)
+        if not trip:
+            raise HTTPException(404, "Trip not found.")
         if trip.mechanic_id != mechanic.id:
             raise HTTPException(
                 403, "You are not authorized to update location for this trip."
@@ -69,9 +111,16 @@ def update_location(
         "updated_at": "now",
     }
 
+    # Kind-namespaced trip cache key prevents collisions when a tow trip and a
+    # mechanic trip happen to share the same numeric id (table sequences are
+    # independent post-split).
+    kind = "tow" if current_user.role == "tow_truck_driver" else "mechanic"
+
     if redis_client:
         redis_client.set(f"loc:{current_user.id}", json.dumps(data), ex=300)
-        redis_client.set(f"loc:trip:{location.trip_id}", json.dumps(data), ex=300)
+        redis_client.set(
+            f"loc:trip:{kind}:{location.trip_id}", json.dumps(data), ex=300
+        )
 
     return {"status": "ok"}
 
@@ -83,30 +132,15 @@ def get_trip_location(
     redis_client: redis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ):
-    """Fallback HTTP endpoint for getting current location"""
-    if redis_client:
-        direct_trip_data = redis_client.get(f"loc:trip:{trip_id}")
-        if direct_trip_data:
-            return json.loads(direct_trip_data)
+    """Fallback HTTP endpoint for getting current location."""
+    # Resolve which trip table this id belongs to first; this also tells us
+    # which kind-namespaced Redis key to read.
+    kind, target_user_id = _lookup_trip_owner(session, trip_id)
 
-    # 3. Load both potential relationships
-    statement = (
-        select(Trip)
-        .where(Trip.id == trip_id)
-        .options(selectinload(Trip.tow_truck_driver), selectinload(Trip.mechanic))
-    )
-    trip = session.exec(statement).first()
-
-    if not trip:
-        raise HTTPException(404, "Trip not found")
-
-    target_user_id = None
-
-    # 4. Extract the correct user_id based on who accepted the trip
-    if trip.tow_truck_driver_id and trip.tow_truck_driver:
-        target_user_id = trip.tow_truck_driver.user_id
-    elif trip.mechanic_id and trip.mechanic:
-        target_user_id = trip.mechanic.user_id
+    if redis_client and kind:
+        direct = redis_client.get(f"loc:trip:{kind}:{trip_id}")
+        if direct:
+            return json.loads(direct)
 
     if not target_user_id:
         return {
@@ -137,35 +171,22 @@ async def tracking_websocket(
 
     try:
         last_data = None
+        # Resolve the trip kind once outside the loop so we read the correct
+        # kind-namespaced Redis key on every poll.
+        kind, target_user_id = _lookup_trip_owner(session, trip_id)
         while True:
             data = None
             if redis_client:
-                # Try getting the cached location directly
-                direct_trip_data = redis_client.get(f"loc:trip:{trip_id}")
-                if direct_trip_data:
-                    data = direct_trip_data
-                else:
-                    # Fallback to fetching trip -> professional -> cached location
-                    # 5. Apply the same multi-role check here
-                    statement = (
-                        select(Trip)
-                        .where(Trip.id == trip_id)
-                        .options(
-                            selectinload(Trip.tow_truck_driver),
-                            selectinload(Trip.mechanic),
-                        )
-                    )
-                    trip = session.exec(statement).first()
-
-                    target_user_id = None
-                    if trip:
-                        if trip.tow_truck_driver_id and trip.tow_truck_driver:
-                            target_user_id = trip.tow_truck_driver.user_id
-                        elif trip.mechanic_id and trip.mechanic:
-                            target_user_id = trip.mechanic.user_id
-
-                    if target_user_id:
-                        data = redis_client.get(f"loc:{target_user_id}")
+                if kind:
+                    direct = redis_client.get(f"loc:trip:{kind}:{trip_id}")
+                    if direct:
+                        data = direct
+                if data is None and not kind:
+                    # Trip not yet assigned at WS-open time; re-probe each poll
+                    # in case the assignment lands mid-session.
+                    kind, target_user_id = _lookup_trip_owner(session, trip_id)
+                if data is None and target_user_id:
+                    data = redis_client.get(f"loc:{target_user_id}")
 
             if data:
                 # Decode bytes if needed

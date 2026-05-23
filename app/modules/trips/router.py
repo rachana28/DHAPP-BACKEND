@@ -16,6 +16,12 @@ from app.core.models import (
     TripSafe,
     TripBillRead,
     Driver,
+    Mechanic,
+    MechanicPublic,
+    MechanicTrip,
+    TowTrip,
+    TowTruckDriver,
+    TowTruckDriverPublic,
     User,
     FareEstimateRequest,
     TripAttendance,
@@ -104,6 +110,20 @@ def create_booking_request(
     if not trip_in.vehicle_type:
         raise HTTPException(400, "Vehicle type is required.")
 
+    # Defensive guard: tow and mechanic bookings live in their own tables now
+    # and must be created via /tow-trips/book-request or /mechanic-trips/book-request.
+    if (trip_in.hiring_type or "").strip() in ("Tow Service", "Mechanic Service"):
+        target = (
+            "/tow-trips/book-request"
+            if trip_in.hiring_type.strip() == "Tow Service"
+            else "/mechanic-trips/book-request"
+        )
+        raise HTTPException(
+            400,
+            f"hiring_type='{trip_in.hiring_type}' is not accepted here. "
+            f"Use {target} for this booking kind.",
+        )
+
     BLOCKING_STATES = (
         "searching",
         "accepted_pending_payment",
@@ -136,7 +156,8 @@ def create_booking_request(
     trip_data = trip_in.model_dump()
 
     trip_data["driver_id"] = None
-    trip_data["tow_truck_driver_id"] = None
+    # tow_truck_driver_id no longer exists on Trip — tow trips live in TowTrip
+    trip_data.pop("tow_truck_driver_id", None)
 
     # (Daily / Monthly / Outstation).
     if not trip_data.get("start_date") or not trip_data.get("end_date"):
@@ -306,29 +327,96 @@ def get_my_bookings(
             "payment_failed",
             "rejected",
         }
-        statement = (
+
+        # 1. Ride trips (Trip table: Daily / Monthly / Outstation)
+        ride_rows = session.exec(
             select(Trip)
             .where(Trip.user_id == current_user.id)
             .order_by(desc(Trip.booking_time))
             .options(selectinload(Trip.driver))
-        )
-        trips = session.exec(statement).all()
+        ).all()
 
-        # Build a Pydantic view per trip so mutating `driver`/`driver_id`
-        # on the in-memory ORM row can never accidentally persist.
+        # 2. Tow trips
+        tow_rows = session.exec(
+            select(TowTrip)
+            .where(TowTrip.user_id == current_user.id)
+            .order_by(desc(TowTrip.booking_time))
+            .options(selectinload(TowTrip.tow_truck_driver))
+        ).all()
+
+        # 3. Mechanic trips
+        mech_rows = session.exec(
+            select(MechanicTrip)
+            .where(MechanicTrip.user_id == current_user.id)
+            .order_by(desc(MechanicTrip.booking_time))
+            .options(selectinload(MechanicTrip.mechanic))
+        ).all()
+
         trip_service = TripService()
-        result = []
-        for t in trips:
+        result: list = []
+
+        # Ride rows — preserves the original handling (driver hidden in early
+        # states, surface driver_skips_remaining once visible).
+        for t in ride_rows:
             view = TripReadUser.model_validate(t, from_attributes=True)
             if t.status in DRIVER_HIDDEN_STATES:
                 view.driver = None
             elif t.driver_id is not None:
-                # Surface the assigned driver's per-trip skip allowance for
-                # transparency, only once the driver is visible to the user.
                 view.driver_skips_remaining = trip_service.driver_skips_remaining(
                     session, t.id
                 )
             result.append(view)
+
+        # Tow rows — emit TripReadUser-shaped views with hiring_type set to the
+        # constant discriminator and tow_truck_driver populated when assigned.
+        for t in tow_rows:
+            view = TripReadUser(
+                id=t.id,
+                hiring_type="Tow Service",
+                vehicle_type=t.vehicle_type,
+                start_location=t.start_location,
+                end_location=t.end_location,
+                reason=t.reason,
+                status=t.status,
+                fare=t.fare,
+                fare_breakdown=t.fare_breakdown,
+                start_lat=t.start_lat,
+                start_lng=t.start_lng,
+                end_lat=t.end_lat,
+                end_lng=t.end_lng,
+                distance_km=t.distance_km,
+                booking_time=t.booking_time,
+                tow_truck_driver=(
+                    TowTruckDriverPublic(**t.tow_truck_driver.model_dump())
+                    if t.tow_truck_driver_id and t.tow_truck_driver
+                    else None
+                ),
+            )
+            result.append(view)
+
+        # Mechanic rows — same pattern, mechanic field populated.
+        for t in mech_rows:
+            view = TripReadUser(
+                id=t.id,
+                hiring_type="Mechanic Service",
+                vehicle_type=t.vehicle_type,
+                start_location=t.start_location,
+                reason=t.reason,
+                status=t.status,
+                fare=t.fare,
+                fare_breakdown=t.fare_breakdown,
+                start_lat=t.start_lat,
+                start_lng=t.start_lng,
+                booking_time=t.booking_time,
+                mechanic=(
+                    MechanicPublic(**t.mechanic.model_dump())
+                    if t.mechanic_id and t.mechanic
+                    else None
+                ),
+            )
+            result.append(view)
+
+        result.sort(key=lambda v: v.booking_time, reverse=True)
         return result
     else:
         return []

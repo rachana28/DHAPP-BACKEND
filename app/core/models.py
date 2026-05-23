@@ -76,19 +76,19 @@ class Mechanic(MechanicBase, table=True):
     user_id: uuid.UUID = Field(foreign_key="user.id")
 
     user: "User" = Relationship(back_populates="mechanic_profile")
-    trips: List["Trip"] = Relationship(back_populates="mechanic")
+    mechanic_trips: List["MechanicTrip"] = Relationship(back_populates="mechanic")
     offers: List["MechanicOffer"] = Relationship(back_populates="mechanic")
 
 
 class MechanicOffer(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    trip_id: int = Field(foreign_key="trip.id")
+    trip_id: int = Field(foreign_key="mechanictrip.id")
     mechanic_id: int = Field(foreign_key="mechanic.id")
     status: str = "pending"
     tier: int = 1
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    trip: "Trip" = Relationship(back_populates="mechanic_offers")
+    trip: "MechanicTrip" = Relationship(back_populates="offers")
     mechanic: Mechanic = Relationship(back_populates="offers")
 
 
@@ -103,7 +103,10 @@ class MechanicUpdate(SQLModel):
 class MechanicPublic(SQLModel):
     id: int
     name: str
-    specialization: str
+    # Optional: the DB column allows NULL (MechanicBase.specialization), so the
+    # public response must too — otherwise serializing a mechanic without one
+    # set raises 500.
+    specialization: Optional[str] = None
     status: str
     rating: float
     profile_picture_url: Optional[str] = None
@@ -477,9 +480,6 @@ class ServiceSlotUpdate(SQLModel):
 class TripBase(SQLModel):
     user_id: uuid.UUID = Field(foreign_key="user.id")
     driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
-    tow_truck_driver_id: Optional[int] = Field(
-        default=None, foreign_key="towtruckdriver.id"
-    )
 
     # Booking Details
     hiring_type: str
@@ -533,15 +533,8 @@ class TripBase(SQLModel):
 class Trip(TripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     driver: Optional["Driver"] = Relationship(back_populates="trips")
-    tow_truck_driver: Optional["TowTruckDriver"] = Relationship(
-        back_populates="trips"
-    )  # Added
     user: "User" = Relationship(back_populates="trips")
     offers: List["TripOffer"] = Relationship(back_populates="trip")
-    tow_offers: List["TowTripOffer"] = Relationship(back_populates="trip")
-    mechanic_id: Optional[int] = Field(default=None, foreign_key="mechanic.id")
-    mechanic: Optional["Mechanic"] = Relationship(back_populates="trips")
-    mechanic_offers: List["MechanicOffer"] = Relationship(back_populates="trip")
 
 
 class TripOffer(SQLModel, table=True):
@@ -558,14 +551,72 @@ class TripOffer(SQLModel, table=True):
 
 class TowTripOffer(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    trip_id: int = Field(foreign_key="trip.id")
+    trip_id: int = Field(foreign_key="towtrip.id")
     tow_truck_driver_id: int = Field(foreign_key="towtruckdriver.id")
     status: str = "pending"
     tier: int = 1
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    trip: Trip = Relationship(back_populates="tow_offers")
+    trip: "TowTrip" = Relationship(back_populates="offers")
     driver: "TowTruckDriver" = Relationship(back_populates="offers")
+
+
+# --- MECHANIC TRIP (dedicated table for "Mechanic Service" bookings) ---
+class MechanicTripBase(SQLModel):
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    mechanic_id: Optional[int] = Field(default=None, foreign_key="mechanic.id")
+    vehicle_type: str
+    start_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    reason: Optional[str] = None
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+    status: str = "searching"
+    booking_time: datetime = Field(default_factory=_now_ist_naive)
+    state_version: int = Field(default=1)
+
+
+class MechanicTrip(MechanicTripBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    mechanic: Optional["Mechanic"] = Relationship(back_populates="mechanic_trips")
+    user: "User" = Relationship(back_populates="mechanic_trips")
+    offers: List["MechanicOffer"] = Relationship(back_populates="trip")
+
+
+# --- TOW TRIP (dedicated table for "Tow Service" bookings) ---
+class TowTripBase(SQLModel):
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    tow_truck_driver_id: Optional[int] = Field(
+        default=None, foreign_key="towtruckdriver.id"
+    )
+    vehicle_type: str
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+    reason: Optional[str] = None
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+    status: str = "searching"
+    booking_time: datetime = Field(default_factory=_now_ist_naive)
+    state_version: int = Field(default=1)
+
+
+class TowTrip(TowTripBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tow_truck_driver: Optional["TowTruckDriver"] = Relationship(
+        back_populates="tow_trips"
+    )
+    user: "User" = Relationship(back_populates="tow_trips")
+    offers: List["TowTripOffer"] = Relationship(back_populates="trip")
 
 
 # --- SAFETY LAYER: RESPONSE MODELS ---
@@ -617,7 +668,7 @@ class TowTruckDriver(TowTruckDriverBase, table=True):
     user_id: uuid.UUID = Field(foreign_key="user.id")
 
     user: "User" = Relationship(back_populates="tow_truck_driver_profile")
-    trips: List[Trip] = Relationship(back_populates="tow_truck_driver")
+    tow_trips: List["TowTrip"] = Relationship(back_populates="tow_truck_driver")
     reviews: List["TowTruckDriverReview"] = Relationship(back_populates="driver")
     offers: List[TowTripOffer] = Relationship(back_populates="driver")
 
@@ -640,19 +691,83 @@ class TowTruckDriverPublic(SQLModel):
     name: str
     rating: float
     profile_picture_url: Optional[str] = None
-    vehicle_number: str
+    # Optional: the DB column allows NULL (TowTruckDriverBase.vehicle_number),
+    # so the public response must too — otherwise serializing a tow driver
+    # without one set raises 500.
+    vehicle_number: Optional[str] = None
     status: str
     total_trips: int = 0
 
 
 class TripReadUser(TripSafe):
     driver: Optional[DriverPublic] = None
-    tow_truck_driver: Optional[TowTruckDriverPublic] = (
-        None  # Added support for tow driver details
-    )
+    # tow_truck_driver / mechanic are kept as optional fields here so the
+    # polymorphic /trips/my-bookings endpoint can still surface tow + mechanic
+    # bookings to the user app without changing the response field shape.
+    # Rides leave these as None; tow rows populate tow_truck_driver; mechanic
+    # rows populate mechanic.
+    tow_truck_driver: Optional[TowTruckDriverPublic] = None
     mechanic: Optional[MechanicPublic] = None
     # Assigned driver's remaining shift-skips on this trip booking this month.
     driver_skips_remaining: Optional[int] = None
+
+
+# --- MechanicTrip / TowTrip response models ---
+# Mirrors TripSafe / TripReadUser field shape so the user / mechanic / tow-driver
+# apps can keep consuming the same JSON keys (including a constant `hiring_type`
+# discriminator) without any client-side change after the table split.
+class MechanicTripSafe(SQLModel):
+    id: int
+    hiring_type: str = "Mechanic Service"
+    vehicle_type: str
+    shift_details: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    months: Optional[int] = None
+    selected_days: Optional[str] = None
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    reason: Optional[str] = None
+    status: str
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+    booking_time: datetime
+
+
+class MechanicTripReadUser(MechanicTripSafe):
+    mechanic: Optional[MechanicPublic] = None
+
+
+class TowTripSafe(SQLModel):
+    id: int
+    hiring_type: str = "Tow Service"
+    vehicle_type: str
+    shift_details: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    months: Optional[int] = None
+    selected_days: Optional[str] = None
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    reason: Optional[str] = None
+    status: str
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+    booking_time: datetime
+
+
+class TowTripReadUser(TowTripSafe):
+    tow_truck_driver: Optional[TowTruckDriverPublic] = None
 
 
 class DriverPrivate(DriverBase):
@@ -787,6 +902,8 @@ class User(UserBase, table=True):
         back_populates="user"
     )
     trips: List[Trip] = Relationship(back_populates="user")
+    mechanic_trips: List["MechanicTrip"] = Relationship(back_populates="user")
+    tow_trips: List["TowTrip"] = Relationship(back_populates="user")
     tickets: List["SupportTicket"] = Relationship(back_populates="user")
     mechanic_profile: Optional[Mechanic] = Relationship(back_populates="user")
     service_center_profile: Optional["ServiceCenter"] = Relationship(
@@ -854,7 +971,41 @@ class TripUpdate(SQLModel):
 class TripCreate(TripBase):
     user_id: Optional[uuid.UUID] = None
     driver_id: Optional[int] = None
+
+
+# Permissive request models for the mechanic / tow booking endpoints.
+# Clients today POST the full TripCreate shape (with `hiring_type` etc.);
+# unknown fields are ignored so existing apps need zero changes.
+class MechanicTripCreate(SQLModel):
+    vehicle_type: str  # required, matches existing TripCreate contract
+    user_id: Optional[uuid.UUID] = None
+    mechanic_id: Optional[int] = None
+    hiring_type: Optional[str] = None  # accepted for back-compat; ignored
+    start_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    reason: Optional[str] = None
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+
+
+class TowTripCreate(SQLModel):
+    vehicle_type: str  # required, matches existing TripCreate contract
+    user_id: Optional[uuid.UUID] = None
     tow_truck_driver_id: Optional[int] = None
+    hiring_type: Optional[str] = None  # accepted for back-compat; ignored
+    start_location: Optional[str] = None
+    end_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: Optional[float] = None
+    reason: Optional[str] = None
+    fare: Optional[float] = None
+    fare_breakdown: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
 
 
 class TripDaySkipRequest(SQLModel):

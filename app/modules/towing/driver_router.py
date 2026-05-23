@@ -10,7 +10,7 @@ from app.core.models import (
     TowTruckDriverPublic,
     TowTruckDriverPrivate,
     TowTruckDriverReview,
-    Trip,
+    TowTrip,
 )
 from app.core.security import get_current_active_tow_truck_driver
 from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
@@ -80,7 +80,9 @@ def read_tow_driver(
         raise HTTPException(status_code=404, detail="Driver not found")
 
     trip_count = session.exec(
-        select(func.count(Trip.id)).where(Trip.tow_truck_driver_id == driver_id)
+        select(func.count(TowTrip.id)).where(
+            TowTrip.tow_truck_driver_id == driver_id
+        )
     ).one()
 
     return TowTruckDriverPublic(**driver.model_dump(), total_trips=trip_count)

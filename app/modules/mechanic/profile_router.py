@@ -10,7 +10,7 @@ from app.core.models import (
     MechanicPublic,
     MechanicPrivate,
     MechanicReview,
-    Trip,
+    MechanicTrip,
 )
 from app.core.security import get_current_active_mechanic
 from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
@@ -80,7 +80,9 @@ def read_mechanic(
         raise HTTPException(status_code=404, detail="Mechanic not found")
 
     trip_count = session.exec(
-        select(func.count(Trip.id)).where(Trip.mechanic_id == mechanic_id)
+        select(func.count(MechanicTrip.id)).where(
+            MechanicTrip.mechanic_id == mechanic_id
+        )
     ).one()
 
     return MechanicPublic(**mechanic.model_dump(), total_trips=trip_count)

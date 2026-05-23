@@ -6,10 +6,10 @@ from sqlalchemy.exc import NoResultFound
 
 from app.core.database import get_session
 from app.core.models import (
-    Trip,
-    TripCreate,
-    TripSafe,
-    TripReadUser,
+    TowTrip,
+    TowTripCreate,
+    TowTripSafe,
+    TowTripReadUser,
     TowTruckDriver,
     TowTripOffer,
     TripOfferPublic,
@@ -27,21 +27,19 @@ from fastapi import BackgroundTasks
 router = APIRouter(prefix="/tow-trips", tags=["Tow Trips"])
 
 
-@router.post("/book-request", response_model=TripSafe)
+@router.post("/book-request", response_model=TowTripSafe)
 def create_tow_booking_request(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-    trip_in: TripCreate,
+    trip_in: TowTripCreate,
 ):
-    trip_data = trip_in.model_dump()
+    trip_data = trip_in.model_dump(exclude_unset=True)
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"
+    trip_data.pop("hiring_type", None)  # discriminator no longer stored
 
-    if not trip_data.get("hiring_type"):
-        trip_data["hiring_type"] = "Tow Service"
-
-    db_trip = Trip.model_validate(trip_data)
+    db_trip = TowTrip.model_validate(trip_data)
 
     session.add(db_trip)
     session.commit()
@@ -61,7 +59,7 @@ def create_tow_booking_request(
     return db_trip
 
 
-@router.get("/my-bookings", response_model=List[TripReadUser])
+@router.get("/my-bookings", response_model=List[TowTripReadUser])
 def get_my_tow_bookings(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -74,20 +72,19 @@ def get_my_tow_bookings(
             return []
 
         statement = (
-            select(Trip)
-            .where(Trip.tow_truck_driver_id == driver.id)
-            .order_by(desc(Trip.booking_time))
-            .options(selectinload(Trip.user))
+            select(TowTrip)
+            .where(TowTrip.tow_truck_driver_id == driver.id)
+            .order_by(desc(TowTrip.booking_time))
+            .options(selectinload(TowTrip.user))
         )
         return session.exec(statement).all()
 
     elif current_user.role == "user":
         statement = (
-            select(Trip)
-            .where(Trip.user_id == current_user.id)
-            .where(Trip.hiring_type == "Tow Service")
-            .order_by(desc(Trip.booking_time))
-            .options(selectinload(Trip.tow_truck_driver))
+            select(TowTrip)
+            .where(TowTrip.user_id == current_user.id)
+            .order_by(desc(TowTrip.booking_time))
+            .options(selectinload(TowTrip.tow_truck_driver))
         )
         return session.exec(statement).all()
 
@@ -105,7 +102,7 @@ def cancel_tow_trip(
     """
     Cancels a Tow Trip and removes all associated offers.
     """
-    trip = session.get(Trip, trip_id)
+    trip = session.get(TowTrip, trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
@@ -185,7 +182,9 @@ def accept_tow_offer(
     # CRITICAL: Lock the Trip Row
     try:
         # This query will WAIT if another driver is currently trying to accept the same trip
-        statement = select(Trip).where(Trip.id == offer.trip_id).with_for_update()
+        statement = (
+            select(TowTrip).where(TowTrip.id == offer.trip_id).with_for_update()
+        )
         trip = session.exec(statement).one()
     except NoResultFound:
         raise HTTPException(404, "Trip not found")
@@ -241,7 +240,7 @@ def reject_tow_offer(
     session.add(offer)
     session.commit()
 
-    trip = session.get(Trip, offer.trip_id)
+    trip = session.get(TowTrip, offer.trip_id)
     if trip and trip.status == "searching":
         escalated = attempt_tow_trip_escalation(session, trip)
         if escalated:

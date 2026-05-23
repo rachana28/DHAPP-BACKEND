@@ -7,14 +7,14 @@ from pydantic import BaseModel
 
 from app.core.database import get_session
 from app.core.models import (
-    Trip,
-    TripCreate,
-    TripSafe,
+    MechanicTrip,
+    MechanicTripCreate,
+    MechanicTripSafe,
+    MechanicTripReadUser,
     Mechanic,
     MechanicOffer,
     TripOfferPublic,
     User,
-    TripReadUser,
 )
 from app.core.security import get_current_user, get_current_active_mechanic
 from app.modules.mechanic.mechanic_allocation import (
@@ -30,19 +30,19 @@ class StatusUpdate(BaseModel):
     status: str  # "available" or "offline"
 
 
-@router.post("/book-request", response_model=TripSafe)
+@router.post("/book-request", response_model=MechanicTripSafe)
 def create_mechanic_booking_request(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
-    trip_in: TripCreate,
+    trip_in: MechanicTripCreate,
 ):
-    trip_data = trip_in.model_dump()
+    trip_data = trip_in.model_dump(exclude_unset=True)
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"
-    trip_data["hiring_type"] = "Mechanic Service"
+    trip_data.pop("hiring_type", None)  # discriminator no longer stored
 
-    db_trip = Trip.model_validate(trip_data)
+    db_trip = MechanicTrip.model_validate(trip_data)
     session.add(db_trip)
     session.commit()
     session.refresh(db_trip)
@@ -61,7 +61,7 @@ def create_mechanic_booking_request(
     return db_trip
 
 
-@router.get("/my-bookings", response_model=List[TripReadUser])
+@router.get("/my-bookings", response_model=List[MechanicTripReadUser])
 def get_my_mechanic_bookings(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -79,22 +79,21 @@ def get_my_mechanic_bookings(
             return []
 
         statement = (
-            select(Trip)
-            .where(Trip.mechanic_id == mechanic.id)
-            .order_by(desc(Trip.booking_time))
-            .options(selectinload(Trip.user))
+            select(MechanicTrip)
+            .where(MechanicTrip.mechanic_id == mechanic.id)
+            .order_by(desc(MechanicTrip.booking_time))
+            .options(selectinload(MechanicTrip.user))
         )
         return session.exec(statement).all()
 
     elif current_user.role == "user":
         # If the logged-in user is a customer, fetch their mechanic requests
         statement = (
-            select(Trip)
-            .where(Trip.user_id == current_user.id)
-            .where(Trip.hiring_type == "Mechanic Service")
-            .order_by(desc(Trip.booking_time))
+            select(MechanicTrip)
+            .where(MechanicTrip.user_id == current_user.id)
+            .order_by(desc(MechanicTrip.booking_time))
             .options(
-                selectinload(Trip.mechanic)
+                selectinload(MechanicTrip.mechanic)
             )
         )
         return session.exec(statement).all()
@@ -110,7 +109,7 @@ def cancel_mechanic_trip(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    trip = session.get(Trip, trip_id)
+    trip = session.get(MechanicTrip, trip_id)
     if not trip or trip.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Trip not found")
 
@@ -181,7 +180,11 @@ def accept_mechanic_offer(
 
     try:
         # Lock the Trip Row to prevent race conditions
-        statement = select(Trip).where(Trip.id == offer.trip_id).with_for_update()
+        statement = (
+            select(MechanicTrip)
+            .where(MechanicTrip.id == offer.trip_id)
+            .with_for_update()
+        )
         trip = session.exec(statement).one()
     except NoResultFound:
         raise HTTPException(404, "Trip not found")
@@ -235,7 +238,7 @@ def reject_mechanic_offer(
     session.commit()
 
     # Immediately check if we need to escalate to the next tier
-    trip = session.get(Trip, offer.trip_id)
+    trip = session.get(MechanicTrip, offer.trip_id)
     if trip and trip.status == "searching":
         escalated = attempt_mechanic_trip_escalation(session, trip)
         if escalated:

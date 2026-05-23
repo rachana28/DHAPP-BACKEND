@@ -1,7 +1,7 @@
 from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
-from app.core.models import TowTruckDriver, Trip, TowTripOffer
+from app.core.models import TowTruckDriver, TowTrip, TowTripOffer
 from app.utils.notifications import send_push_notification
 
 
@@ -30,9 +30,9 @@ def rank_tow_drivers(session: Session) -> List[TowTruckDriver]:
     driver_scores = []
     for driver in drivers:
         last_trip = session.exec(
-            select(Trip.booking_time)
-            .where(Trip.tow_truck_driver_id == driver.id)
-            .order_by(desc(Trip.booking_time))
+            select(TowTrip.booking_time)
+            .where(TowTrip.tow_truck_driver_id == driver.id)
+            .order_by(desc(TowTrip.booking_time))
             .limit(1)
         ).first()
 
@@ -76,7 +76,7 @@ def create_tow_offers_for_tier(
         )
 
 
-def attempt_tow_trip_escalation(session: Session, trip: Trip) -> bool:
+def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
     """
     Checks if a tow trip should move to the next tier or be cancelled.
     """
@@ -161,12 +161,8 @@ def process_tow_tier_escalation(session: Session) -> int:
     """
     Background Task: Scans all searching tow trips.
     """
-    # Filter for trips that are 'searching' and have hiring_type 'Tow Service'
-    # (or check existing TowTripOffers to distinguish)
     active_trips = session.exec(
-        select(Trip).where(
-            Trip.status == "searching", Trip.hiring_type == "Tow Service"
-        )
+        select(TowTrip).where(TowTrip.status == "searching")
     ).all()
     count = 0
     for trip in active_trips:
