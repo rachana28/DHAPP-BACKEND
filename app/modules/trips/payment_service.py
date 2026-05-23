@@ -424,6 +424,7 @@ class PaymentService:
         bill_id: int,
         user_id,
         payment_method: str = "card",
+        note: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
         """User pays a daily bill via the dummy gateway.
 
@@ -457,6 +458,7 @@ class PaymentService:
                 paid_by="user_online",
                 gateway_txn_id=txn_id,
                 payment_method=payment_method,
+                note=note,
             )
             self.unpause_trip_if_clear(session, bill.trip_id)
             session.commit()

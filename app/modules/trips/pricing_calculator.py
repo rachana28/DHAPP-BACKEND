@@ -37,22 +37,50 @@ from app.utils.time_utils import now_ist
 DEFAULTS: Dict[str, float] = {
     # Common
     "pricing_tax_pct": 5.0,
-    "pricing_driver_allowance_per_day": 200.0,
     "pricing_night_start_hour": 22.0,  # 22 = 10 PM IST
     "pricing_night_end_hour": 5.0,  # before 5 AM is also "night"
     "pricing_night_surcharge_pct": 25.0,
+    # Driver allowance (per-day) — separated by hiring-type context.
+    # `pricing_driver_allowance_per_day` is OUTSTATION-only; short_term & monthly
+    # have their own keys (kept identical by default, but admin-tunable).
+    "pricing_driver_allowance_per_day": 500.0,  # outstation only
+    "pricing_short_term_driver_allowance_per_day": 200.0,
+    "pricing_monthly_driver_allowance_per_day": 200.0,
     # Daily / short-term
+    #   Base fee is per-vehicle-type via `pricing_short_term_base_fee_<veh>`.
+    #   The bare key acts as a fallback when no vehicle-specific row exists.
     "pricing_short_term_base_fee": 800.0,
+    "pricing_short_term_base_fee_sedan": 800.0,
+    "pricing_short_term_base_fee_suv": 1000.0,
+    "pricing_short_term_base_fee_hatchback": 700.0,
+    "pricing_short_term_base_fee_luxury": 2000.0,
     "pricing_short_term_hourly_rate": 150.0,
     # Monthly (recurring → cheaper per day)
     "pricing_monthly_base_fee": 5000.0,
+    "pricing_monthly_base_fee_sedan": 5000.0,
+    "pricing_monthly_base_fee_suv": 6500.0,
+    "pricing_monthly_base_fee_hatchback": 4500.0,
+    "pricing_monthly_base_fee_luxury": 12000.0,
     "pricing_monthly_daily_rate": 700.0,  # for an 8-hour shift
     "pricing_monthly_discount_pct": 10.0,  # vs short-term equivalent
-    # Outstation
-    "pricing_outstation_base_fee": 1500.0,
+    # Outstation — NO base fee, NO duration charges. Only distance + allowance + permit.
+    # Per-km rate is per-vehicle-type via `pricing_outstation_per_km_rate_<veh>`.
     "pricing_outstation_per_km_rate": 12.0,
-    "pricing_outstation_daily_rate": 1200.0,
+    "pricing_outstation_per_km_rate_sedan": 12.0,
+    "pricing_outstation_per_km_rate_suv": 16.0,
+    "pricing_outstation_per_km_rate_hatchback": 10.0,
+    "pricing_outstation_per_km_rate_luxury": 25.0,
+    "pricing_outstation_per_km_rate_tempo": 18.0,
+    "pricing_outstation_per_km_rate_minibus": 28.0,
+    "pricing_outstation_per_km_rate_bus": 40.0,
 }
+
+
+def _veh_key(vehicle_type: Optional[str]) -> str:
+    """Normalize a vehicle_type string into a system-config key suffix."""
+    if not vehicle_type:
+        return ""
+    return vehicle_type.strip().lower().replace(" ", "_").replace("-", "_")
 
 # All Indian states + UTs. Admin can change permit fees via:
 #   POST /admin/system-config?key=state_permit_<state>&value=<inr>
@@ -411,6 +439,21 @@ def calculate_fare(
     def cfg(k):
         return _get_config_value(session, redis_client, k, DEFAULTS[k])
 
+    def cfg_for_vehicle(base_key: str) -> float:
+        """
+        Look up `<base_key>_<vehicle>`; fall back to `<base_key>` if the
+        vehicle-specific row/default is absent. Keeps the calculator
+        backwards-compatible when admins haven't populated every vehicle row.
+        """
+        veh = _veh_key(vehicle_type)
+        if veh:
+            specific_key = f"{base_key}_{veh}"
+            default = DEFAULTS.get(specific_key, DEFAULTS.get(base_key, 0.0))
+            return _get_config_value(session, redis_client, specific_key, default)
+        return _get_config_value(
+            session, redis_client, base_key, DEFAULTS.get(base_key, 0.0)
+        )
+
     num_days = _num_days(htype, start_date, end_date, months, selected_days)
     hours_per_day = _parse_hours_per_day(shift_details)
     components: List[Dict[str, Any]] = []
@@ -425,14 +468,21 @@ def calculate_fare(
 
     # ── Hiring-type-specific base + duration ─────────────────────────────────
     if htype == "monthly":
-        base_fee = cfg("pricing_monthly_base_fee")
+        # num_days here already excludes off-weekdays when selected_days is set
+        # (see _num_days), so allowance + duration both use the correct working-day count.
+        base_fee = cfg_for_vehicle("pricing_monthly_base_fee")
         # daily_rate scales by hours/day relative to a baseline 8-hour shift
         per_day = cfg("pricing_monthly_daily_rate") * (hours_per_day / 8.0)
         duration_charge = round(per_day * num_days, 2)
-        components.append({"name": "Base Fee (Monthly)", "amount": round(base_fee, 2)})
         components.append(
             {
-                "name": f"Duration Charges ({num_days} days x {hours_per_day}h, monthly rate)",
+                "name": f"Base Fee (Monthly, {vehicle_type or 'default'})",
+                "amount": round(base_fee, 2),
+            }
+        )
+        components.append(
+            {
+                "name": f"Duration Charges ({num_days} working days x {hours_per_day}h, monthly rate)",
                 "amount": duration_charge,
             }
         )
@@ -451,29 +501,19 @@ def calculate_fare(
             subtotal -= discount
 
     elif htype == "outstation":
-        base_fee = cfg("pricing_outstation_base_fee")
-        per_day = cfg("pricing_outstation_daily_rate") * (hours_per_day / 8.0)
-        duration_charge = round(per_day * num_days, 2)
-        per_km = cfg("pricing_outstation_per_km_rate")
+        # Outstation: no base fee, no duration charge. Distance × per-vehicle
+        # per-km rate already captures the trip cost; allowance + permit add on.
+        per_km = cfg_for_vehicle("pricing_outstation_per_km_rate")
         effective_distance = resolved_distance_km or 0.0
         distance_charge = round(effective_distance * per_km, 2)
 
         components.append(
-            {"name": "Base Fee (Outstation)", "amount": round(base_fee, 2)}
-        )
-        components.append(
             {
-                "name": f"Duration Charges ({num_days} days x {hours_per_day}h)",
-                "amount": duration_charge,
-            }
-        )
-        components.append(
-            {
-                "name": f"Distance Charges ({effective_distance:.1f} km x ₹{per_km:.2f})",
+                "name": f"Distance Charges ({effective_distance:.1f} km x ₹{per_km:.2f}/km, {vehicle_type or 'default'})",
                 "amount": distance_charge,
             }
         )
-        subtotal += base_fee + duration_charge + distance_charge
+        subtotal += distance_charge
 
         # State permit when crossing state lines (resolved from end_location)
         if start_state_key and end_state_key and start_state_key != end_state_key:
@@ -489,11 +529,14 @@ def calculate_fare(
 
     else:
         # Default: short-term / Daily
-        base_fee = cfg("pricing_short_term_base_fee")
+        base_fee = cfg_for_vehicle("pricing_short_term_base_fee")
         hourly = cfg("pricing_short_term_hourly_rate")
         duration_charge = round(hourly * hours_per_day * num_days, 2)
         components.append(
-            {"name": "Base Fee (Short-term)", "amount": round(base_fee, 2)}
+            {
+                "name": f"Base Fee (Short-term, {vehicle_type or 'default'})",
+                "amount": round(base_fee, 2),
+            }
         )
         components.append(
             {
@@ -503,8 +546,14 @@ def calculate_fare(
         )
         subtotal += base_fee + duration_charge
 
-    # ── Driver allowance (always applies) ────────────────────────────────────
-    allowance = round(cfg("pricing_driver_allowance_per_day") * num_days, 2)
+    # ── Driver allowance (key depends on hiring type) ────────────────────────
+    if htype == "monthly":
+        allowance_key = "pricing_monthly_driver_allowance_per_day"
+    elif htype == "outstation":
+        allowance_key = "pricing_driver_allowance_per_day"
+    else:
+        allowance_key = "pricing_short_term_driver_allowance_per_day"
+    allowance = round(cfg(allowance_key) * num_days, 2)
     if allowance > 0:
         components.append(
             {
