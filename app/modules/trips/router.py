@@ -1880,6 +1880,7 @@ def list_trip_bills(
 def user_pay_bill(
     bill_id: int,
     payment_method: str = Body("card", embed=True),
+    note: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
@@ -1899,7 +1900,7 @@ def user_pay_bill(
 
     payment_service = PaymentService(redis_client)
     ok, err = payment_service.pay_bill_online(
-        session, bill_id, current_user.id, payment_method
+        session, bill_id, current_user.id, payment_method, note=note
     )
     if not ok:
         raise HTTPException(400, err or "Payment failed")
@@ -2011,11 +2012,19 @@ def driver_mark_bill_paid(
 def pay_trip_settlement(
     settlement_id: int,
     payment_method: str = Body("card", embed=True),
+    note: Optional[str] = Body(None, embed=True),
+    extra_amount: Optional[float] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """User pays the final trip settlement for advance_20 or full_payment methods."""
+    """User pays the final trip settlement for advance_20 or full_payment methods.
+
+    Outstation only: the user may add an `extra_amount` on top of `remaining_due`
+    to cover incidentals collected by the driver (toll, parking, food, etc.).
+    The combined amount becomes the user_paid total for the settlement and is
+    reflected in the trip summary.
+    """
     settlement = session.exec(
         select(TripSettlement)
         .where(TripSettlement.id == settlement_id)
@@ -2033,9 +2042,26 @@ def pay_trip_settlement(
     if settlement.remaining_due <= 0:
         raise HTTPException(400, "No remaining amount due")
 
+    trip = session.get(Trip, settlement.trip_id)
+    is_outstation = (
+        trip is not None
+        and (trip.hiring_type or "").strip().lower() == "outstation"
+    )
+
+    extra = float(extra_amount or 0.0)
+    if extra < 0:
+        raise HTTPException(400, "extra_amount must be non-negative")
+    if extra > 0 and not is_outstation:
+        raise HTTPException(
+            400,
+            "extra_amount is only allowed for outstation trip settlements",
+        )
+
+    total_charge = round(settlement.remaining_due + extra, 2)
+
     payment_service = PaymentService(redis_client)
     success, txn_id = payment_service.process_dummy_payment(
-        amount=settlement.remaining_due,
+        amount=total_charge,
         payer_id=str(current_user.id),
         payer_type="user",
         payment_method=payment_method,
@@ -2044,13 +2070,14 @@ def pay_trip_settlement(
     if not success:
         raise HTTPException(400, f"Payment failed: {txn_id}")
 
-    # Record payment transaction
+    # Record payment transaction — amount includes any outstation extra so
+    # `total_user_paid` in the trip summary reflects the full amount paid.
     payment_txn = PaymentTransaction(
         trip_id=settlement.trip_id,
         user_id=settlement.user_id,
         payer_type="user",
         payment_type="settlement",
-        amount=settlement.remaining_due,
+        amount=total_charge,
         payment_status="success",
         payment_method=payment_method,
         gateway_transaction_id=txn_id,
@@ -2060,6 +2087,12 @@ def pay_trip_settlement(
 
     settlement.user_payment_status = "paid"
     settlement.paid_at = now_ist()
+    if note:
+        settlement.payment_note = note
+    if extra > 0:
+        settlement.extra_amount_paid = round(
+            (settlement.extra_amount_paid or 0.0) + extra, 2
+        )
     session.add(settlement)
 
     # Optional backend cleanup: mark all associated unpaid daily bills as paid
@@ -2099,7 +2132,7 @@ def pay_trip_settlement(
             session=session,
             user_ids=[settlement.user_id],
             title="Settlement Paid",
-            body=f"Your final settlement of ₹{settlement.remaining_due:.2f} has been paid successfully.",
+            body=f"Your final settlement of ₹{total_charge:.2f} has been paid successfully.",
             data={"type": "settlement_paid", "trip_id": settlement.trip_id},
         )
     except Exception:
@@ -2109,5 +2142,6 @@ def pay_trip_settlement(
         "message": "Settlement paid successfully",
         "settlement_id": settlement.id,
         "trip_id": settlement.trip_id,
-        "amount_paid": settlement.remaining_due,
+        "amount_paid": total_charge,
+        "extra_amount_paid": round(extra, 2),
     }

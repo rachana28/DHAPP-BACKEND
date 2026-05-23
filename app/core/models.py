@@ -1086,6 +1086,12 @@ class TripSettlement(SQLModel, table=True):
     user_payment_status: str = "pending"  # pending, paid, refunded
     driver_payment_status: str = "pending"  # pending, paid
 
+    # Optional user note captured at settlement /pay time.
+    payment_note: Optional[str] = None
+    # Outstation only: any additional amount the user voluntarily paid
+    # on top of remaining_due (e.g. toll, parking, food reimbursements).
+    extra_amount_paid: float = 0.0
+
     settlement_date: date
     due_date: Optional[date] = None
     paid_at: Optional[datetime] = None
@@ -1218,3 +1224,5 @@ class SettlementResponse(SQLModel):
     settlement_date: date
     user_payment_status: str
     driver_payment_status: str
+    payment_note: Optional[str] = None
+    extra_amount_paid: float = 0.0

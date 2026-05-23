@@ -3,7 +3,7 @@ Trip Service for managing trip lifecycle and state machine
 """
 
 from datetime import datetime, timedelta, date
-from typing import Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 from sqlmodel import Session, select, func
 import re
 
@@ -863,6 +863,30 @@ class TripService:
             else:
                 amount_due = round(sum((b.amount_due or 0.0) for b in daily_bills), 2)
 
+            # Collect any user-supplied notes captured at payment time so the
+            # summary can show what the user wrote alongside each payment.
+            payment_notes: List[Dict[str, Any]] = []
+            for b in daily_bills:
+                if b.payment_note:
+                    payment_notes.append(
+                        {
+                            "source": "daily_bill",
+                            "bill_id": b.id,
+                            "bill_date": b.bill_date,
+                            "note": b.payment_note,
+                            "paid_at": b.paid_at,
+                        }
+                    )
+            if settlement is not None and settlement.payment_note:
+                payment_notes.append(
+                    {
+                        "source": "settlement",
+                        "settlement_id": settlement.id,
+                        "note": settlement.payment_note,
+                        "paid_at": settlement.paid_at,
+                    }
+                )
+
             result = {
                 "trip_id": trip.id,
                 "status": trip.status,
@@ -882,6 +906,7 @@ class TripService:
                 "fare": trip.fare,
                 "fare_breakdown": trip.fare_breakdown,
                 "amount_due": amount_due,
+                "payment_notes": payment_notes,
             }
 
             if trip.payment_method in ("advance_20", "full_payment"):
@@ -913,6 +938,12 @@ class TripService:
                 result["start_lng"] = trip.start_lng
                 result["end_lat"] = trip.end_lat
                 result["end_lng"] = trip.end_lng
+                # Extra amount the user voluntarily paid on top of the
+                # settlement remaining_due (toll/parking/food/etc.).
+                result["extra_amount_paid"] = round(
+                    (settlement.extra_amount_paid or 0.0) if settlement else 0.0,
+                    2,
+                )
 
             if is_driver:
                 result["total_driver_paid"] = sum(p.amount for p in driver_payments)
