@@ -19,7 +19,9 @@ from app.core.models import (
     ServiceCenterPrivate,
     Trip,
     TripOffer,
+    TowTrip,
     TowTripOffer,
+    MechanicTrip,
     UserDevice,
     TripSafe,
     SystemConfig,
@@ -88,10 +90,17 @@ def get_dashboard_stats(session: Session = Depends(get_session)):
         pending_cab + pending_tow + pending_service_centers + pending_mechanics
     )
 
-    # 6. Trips
-    completed_trips = session.exec(
+    # 6. Trips — sum across all three trip tables (rides, tow, mechanic)
+    completed_rides = session.exec(
         select(func.count(Trip.id)).where(Trip.status == "completed")
     ).one()
+    completed_tow = session.exec(
+        select(func.count(TowTrip.id)).where(TowTrip.status == "completed")
+    ).one()
+    completed_mech = session.exec(
+        select(func.count(MechanicTrip.id)).where(MechanicTrip.status == "completed")
+    ).one()
+    completed_trips = completed_rides + completed_tow + completed_mech
 
     return {
         "total_users": total_users,
@@ -425,11 +434,36 @@ def delete_user(
         # 2. Delete Support Tickets
         session.exec(delete(SupportTicket).where(SupportTicket.user_id == user_id))
 
-        # 3. Handle Trips (As a Rider)
-        # Option A: Delete all their trips (Cleaner for dev)
-        # Option B: Set user_id to NULL (Requires nullable FK in DB)
-        # We will go with Option A to ensure clean deletion.
+        # 3. Handle Trips (As a Rider) — cascade across all three trip tables.
+        # Each trip's child offers must be deleted first to satisfy FK constraints.
+        # Subquery is evaluated at delete time so a trip inserted between SELECT
+        # and DELETE can't slip through and leave an orphan offer.
+        session.exec(
+            delete(TripOffer).where(
+                TripOffer.trip_id.in_(
+                    select(Trip.id).where(Trip.user_id == user_id)
+                )
+            )
+        )
         session.exec(delete(Trip).where(Trip.user_id == user_id))
+
+        session.exec(
+            delete(TowTripOffer).where(
+                TowTripOffer.trip_id.in_(
+                    select(TowTrip.id).where(TowTrip.user_id == user_id)
+                )
+            )
+        )
+        session.exec(delete(TowTrip).where(TowTrip.user_id == user_id))
+
+        session.exec(
+            delete(MechanicOffer).where(
+                MechanicOffer.trip_id.in_(
+                    select(MechanicTrip.id).where(MechanicTrip.user_id == user_id)
+                )
+            )
+        )
+        session.exec(delete(MechanicTrip).where(MechanicTrip.user_id == user_id))
 
         # 4. Handle Driver Profile (If they are a Cab Driver)
         driver = session.exec(select(Driver).where(Driver.user_id == user_id)).first()
@@ -508,15 +542,100 @@ def delete_user(
 
 
 # --- 5. TRIP OVERSIGHT ---
+def _trip_to_safe_dict(t: Trip) -> dict:
+    return {
+        "id": t.id,
+        "hiring_type": t.hiring_type,
+        "vehicle_type": t.vehicle_type,
+        "shift_details": t.shift_details,
+        "start_date": t.start_date,
+        "end_date": t.end_date,
+        "months": t.months,
+        "selected_days": t.selected_days,
+        "start_location": t.start_location,
+        "end_location": t.end_location,
+        "reason": t.reason,
+        "status": t.status,
+        "fare": t.fare,
+        "fare_breakdown": t.fare_breakdown,
+        "start_lat": t.start_lat,
+        "start_lng": t.start_lng,
+        "end_lat": t.end_lat,
+        "end_lng": t.end_lng,
+        "distance_km": t.distance_km,
+        "booking_time": t.booking_time,
+    }
+
+
+def _mech_trip_to_safe_dict(t: MechanicTrip) -> dict:
+    return {
+        "id": t.id,
+        "hiring_type": "Mechanic Service",
+        "vehicle_type": t.vehicle_type,
+        "shift_details": None,
+        "start_date": None,
+        "end_date": None,
+        "months": None,
+        "selected_days": None,
+        "start_location": t.start_location,
+        "end_location": None,
+        "reason": t.reason,
+        "status": t.status,
+        "fare": t.fare,
+        "fare_breakdown": t.fare_breakdown,
+        "start_lat": t.start_lat,
+        "start_lng": t.start_lng,
+        "end_lat": None,
+        "end_lng": None,
+        "distance_km": None,
+        "booking_time": t.booking_time,
+    }
+
+
+def _tow_trip_to_safe_dict(t: TowTrip) -> dict:
+    return {
+        "id": t.id,
+        "hiring_type": "Tow Service",
+        "vehicle_type": t.vehicle_type,
+        "shift_details": None,
+        "start_date": None,
+        "end_date": None,
+        "months": None,
+        "selected_days": None,
+        "start_location": t.start_location,
+        "end_location": t.end_location,
+        "reason": t.reason,
+        "status": t.status,
+        "fare": t.fare,
+        "fare_breakdown": t.fare_breakdown,
+        "start_lat": t.start_lat,
+        "start_lng": t.start_lng,
+        "end_lat": t.end_lat,
+        "end_lng": t.end_lng,
+        "distance_km": t.distance_km,
+        "booking_time": t.booking_time,
+    }
+
+
 @router.get("/trips", response_model=List[TripSafe])
 def get_all_trips_admin(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     session: Session = Depends(get_session),
 ):
-    return session.exec(
-        select(Trip).order_by(desc(Trip.booking_time)).offset(skip).limit(limit)
+    rides = session.exec(select(Trip).order_by(desc(Trip.booking_time))).all()
+    tows = session.exec(select(TowTrip).order_by(desc(TowTrip.booking_time))).all()
+    mechs = session.exec(
+        select(MechanicTrip).order_by(desc(MechanicTrip.booking_time))
     ).all()
+
+    combined = (
+        [_trip_to_safe_dict(t) for t in rides]
+        + [_tow_trip_to_safe_dict(t) for t in tows]
+        + [_mech_trip_to_safe_dict(t) for t in mechs]
+    )
+    combined.sort(key=lambda r: r["booking_time"], reverse=True)
+    return combined[skip : skip + limit]
 
 
 @router.get("/users/{user_id}/trips")
@@ -526,15 +645,30 @@ def get_user_trip_history(
     current_admin: User = Depends(get_current_admin),
 ):
     """
-    Fetches ALL trips for a specific user from the single 'Trip' table.
-    Differentiates between 'Ride' and 'Tow' using 'hiring_type'.
+    Fetches ALL trips for a specific user across rides, tow, mechanic, and
+    vehicle service bookings. Each kind lives in its own table now; the
+    `service_type` discriminator is set per source table.
     """
-    # 1. Fetch Trips
-    trips = session.exec(
+    # 1. Ride trips (Daily / Monthly / Outstation)
+    rides = session.exec(
         select(Trip).where(Trip.user_id == user_id).order_by(desc(Trip.booking_time))
     ).all()
 
-    # 2. Fetch Service Requests
+    # 2. Tow trips
+    tow_trips = session.exec(
+        select(TowTrip)
+        .where(TowTrip.user_id == user_id)
+        .order_by(desc(TowTrip.booking_time))
+    ).all()
+
+    # 3. Mechanic trips
+    mech_trips = session.exec(
+        select(MechanicTrip)
+        .where(MechanicTrip.user_id == user_id)
+        .order_by(desc(MechanicTrip.booking_time))
+    ).all()
+
+    # 4. Service center bookings
     service_requests = session.exec(
         select(ServiceRequest)
         .where(ServiceRequest.user_id == user_id)
@@ -543,23 +677,53 @@ def get_user_trip_history(
 
     history = []
 
-    # Process Trips
-    for t in trips:
-        service_type = "Tow" if t.hiring_type == "Tow Service" else "Ride"
-        assigned_driver_id = (
-            t.tow_truck_driver_id if service_type == "Tow" else t.driver_id
-        )
+    # Process Ride Trips
+    for t in rides:
         history.append(
             {
-                "id": f"{service_type.upper()}-{t.id}",
+                "id": f"RIDE-{t.id}",
                 "original_id": t.id,
-                "service_type": service_type,
+                "service_type": "Ride",
                 "booking_time": t.booking_time,
                 "status": t.status,
                 "price": t.fare if t.fare else 0.0,
                 "source": t.start_location or "N/A",
                 "destination": t.end_location or "N/A",
-                "driver_or_center_id": assigned_driver_id,
+                "driver_or_center_id": t.driver_id,
+                "vehicle_type": t.vehicle_type,
+            }
+        )
+
+    # Process Tow Trips
+    for t in tow_trips:
+        history.append(
+            {
+                "id": f"TOW-{t.id}",
+                "original_id": t.id,
+                "service_type": "Tow",
+                "booking_time": t.booking_time,
+                "status": t.status,
+                "price": t.fare if t.fare else 0.0,
+                "source": t.start_location or "N/A",
+                "destination": t.end_location or "N/A",
+                "driver_or_center_id": t.tow_truck_driver_id,
+                "vehicle_type": t.vehicle_type,
+            }
+        )
+
+    # Process Mechanic Trips
+    for t in mech_trips:
+        history.append(
+            {
+                "id": f"MECHANIC-{t.id}",
+                "original_id": t.id,
+                "service_type": "Mechanic Service",
+                "booking_time": t.booking_time,
+                "status": t.status,
+                "price": t.fare if t.fare else 0.0,
+                "source": t.start_location or "N/A",
+                "destination": "N/A",
+                "driver_or_center_id": t.mechanic_id,
                 "vehicle_type": t.vehicle_type,
             }
         )

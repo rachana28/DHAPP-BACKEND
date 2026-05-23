@@ -1,7 +1,7 @@
 from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
 from typing import List
-from app.core.models import Mechanic, Trip, MechanicOffer
+from app.core.models import Mechanic, MechanicTrip, MechanicOffer
 from app.utils.notifications import send_push_notification
 
 
@@ -30,9 +30,9 @@ def rank_mechanics(session: Session) -> List[Mechanic]:
     scores = []
     for mechanic in mechanics:
         last_trip = session.exec(
-            select(Trip.booking_time)
-            .where(Trip.mechanic_id == mechanic.id)
-            .order_by(desc(Trip.booking_time))
+            select(MechanicTrip.booking_time)
+            .where(MechanicTrip.mechanic_id == mechanic.id)
+            .order_by(desc(MechanicTrip.booking_time))
             .limit(1)
         ).first()
 
@@ -71,7 +71,7 @@ def create_mechanic_offers_for_tier(
         )
 
 
-def attempt_mechanic_trip_escalation(session: Session, trip: Trip) -> bool:
+def attempt_mechanic_trip_escalation(session: Session, trip: MechanicTrip) -> bool:
     """
     Checks if a mechanic trip should move to the next tier or be cancelled.
     """
@@ -161,9 +161,7 @@ def process_mechanic_tier_escalation(session: Session) -> int:
     (This should be run periodically via a cron job or background scheduler).
     """
     active_trips = session.exec(
-        select(Trip).where(
-            Trip.status == "searching", Trip.hiring_type == "Mechanic Service"
-        )
+        select(MechanicTrip).where(MechanicTrip.status == "searching")
     ).all()
 
     count = 0
