@@ -21,6 +21,13 @@ def _now_ist_naive() -> datetime:
 
 
 # --- Base Models (Shared fields) ---
+def _coerce_none_to_empty_list(v):
+    # Old DB rows may have NULL in `verification_documents` (the JSON column
+    # was nullable before default_factory=list was added). Without this
+    # coercion, response validation 500s on those rows.
+    return [] if v is None else v
+
+
 class DriverBase(SQLModel):
     name: str
     phone_number: str
@@ -39,6 +46,10 @@ class DriverBase(SQLModel):
     )
     admin_notes: Optional[str] = None
 
+    _coerce_verification_documents = field_validator(
+        "verification_documents", mode="before"
+    )(lambda cls, v: _coerce_none_to_empty_list(v))
+
 
 class TowTruckDriverBase(SQLModel):
     name: str
@@ -52,6 +63,10 @@ class TowTruckDriverBase(SQLModel):
         default_factory=list, sa_column=Column(JSON)
     )
     admin_notes: Optional[str] = None
+
+    _coerce_verification_documents = field_validator(
+        "verification_documents", mode="before"
+    )(lambda cls, v: _coerce_none_to_empty_list(v))
 
 
 # --- MECHANIC MODELS ADDITIONS ---
@@ -69,6 +84,10 @@ class MechanicBase(SQLModel):
         default_factory=list, sa_column=Column(JSON)
     )
     admin_notes: Optional[str] = None
+
+    _coerce_verification_documents = field_validator(
+        "verification_documents", mode="before"
+    )(lambda cls, v: _coerce_none_to_empty_list(v))
 
 
 class Mechanic(MechanicBase, table=True):
@@ -167,6 +186,10 @@ class ServiceCenterBase(SQLModel):
         default_factory=list, sa_column=Column(JSON)
     )
     admin_notes: Optional[str] = None
+
+    _coerce_verification_documents = field_validator(
+        "verification_documents", mode="before"
+    )(lambda cls, v: _coerce_none_to_empty_list(v))
 
 
 class ServiceCenter(ServiceCenterBase, table=True):
@@ -743,6 +766,14 @@ class MechanicTripReadUser(MechanicTripSafe):
     mechanic: Optional[MechanicPublic] = None
 
 
+class MechanicOfferPublic(SQLModel):
+    id: int
+    status: str
+    tier: int
+    created_at: datetime
+    trip: MechanicTripSafe
+
+
 class TowTripSafe(SQLModel):
     id: int
     hiring_type: str = "Tow Service"
@@ -768,6 +799,14 @@ class TowTripSafe(SQLModel):
 
 class TowTripReadUser(TowTripSafe):
     tow_truck_driver: Optional[TowTruckDriverPublic] = None
+
+
+class TowTripOfferPublic(SQLModel):
+    id: int
+    status: str
+    tier: int
+    created_at: datetime
+    trip: TowTripSafe
 
 
 class DriverPrivate(DriverBase):

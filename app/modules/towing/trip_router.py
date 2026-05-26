@@ -12,7 +12,7 @@ from app.core.models import (
     TowTripReadUser,
     TowTruckDriver,
     TowTripOffer,
-    TripOfferPublic,
+    TowTripOfferPublic,
     User,
 )
 from app.core.security import get_current_user, get_current_active_tow_truck_driver
@@ -150,7 +150,7 @@ def cancel_tow_trip(
     return {"message": "Tow trip cancelled successfully"}
 
 
-@router.get("/driver/offers", response_model=List[TripOfferPublic])
+@router.get("/driver/offers", response_model=List[TowTripOfferPublic])
 def get_tow_driver_offers(
     session: Session = Depends(get_session),
     current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),

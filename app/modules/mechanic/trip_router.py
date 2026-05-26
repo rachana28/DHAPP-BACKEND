@@ -13,7 +13,7 @@ from app.core.models import (
     MechanicTripReadUser,
     Mechanic,
     MechanicOffer,
-    TripOfferPublic,
+    MechanicOfferPublic,
     User,
 )
 from app.core.security import get_current_user, get_current_active_mechanic
@@ -148,7 +148,7 @@ def cancel_mechanic_trip(
     return {"message": "Mechanic trip cancelled successfully"}
 
 
-@router.get("/mechanic/offers", response_model=List[TripOfferPublic])
+@router.get("/mechanic/offers", response_model=List[MechanicOfferPublic])
 def get_mechanic_offers(
     session: Session = Depends(get_session),
     current_mechanic: Mechanic = Depends(get_current_active_mechanic),
