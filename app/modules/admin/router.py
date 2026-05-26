@@ -23,7 +23,6 @@ from app.core.models import (
     TowTripOffer,
     MechanicTrip,
     UserDevice,
-    TripSafe,
     SystemConfig,
     SupportTicket,
     SupportAttachment,
@@ -563,82 +562,12 @@ def delete_user(
 
 
 # --- 5. TRIP OVERSIGHT ---
-def _trip_to_safe_dict(t: Trip) -> dict:
-    return {
-        "id": t.id,
-        "hiring_type": t.hiring_type,
-        "vehicle_type": t.vehicle_type,
-        "shift_details": t.shift_details,
-        "start_date": t.start_date,
-        "end_date": t.end_date,
-        "months": t.months,
-        "selected_days": t.selected_days,
-        "start_location": t.start_location,
-        "end_location": t.end_location,
-        "reason": t.reason,
-        "status": t.status,
-        "fare": t.fare,
-        "fare_breakdown": t.fare_breakdown,
-        "start_lat": t.start_lat,
-        "start_lng": t.start_lng,
-        "end_lat": t.end_lat,
-        "end_lng": t.end_lng,
-        "distance_km": t.distance_km,
-        "booking_time": t.booking_time,
-    }
+def _full_dump(obj) -> dict:
+    """Serialize all column fields of a SQLModel row (relationships excluded)."""
+    return obj.model_dump()
 
 
-def _mech_trip_to_safe_dict(t: MechanicTrip) -> dict:
-    return {
-        "id": t.id,
-        "hiring_type": "Mechanic Service",
-        "vehicle_type": t.vehicle_type,
-        "shift_details": None,
-        "start_date": None,
-        "end_date": None,
-        "months": None,
-        "selected_days": None,
-        "start_location": t.start_location,
-        "end_location": None,
-        "reason": t.reason,
-        "status": t.status,
-        "fare": t.fare,
-        "fare_breakdown": t.fare_breakdown,
-        "start_lat": t.start_lat,
-        "start_lng": t.start_lng,
-        "end_lat": None,
-        "end_lng": None,
-        "distance_km": None,
-        "booking_time": t.booking_time,
-    }
-
-
-def _tow_trip_to_safe_dict(t: TowTrip) -> dict:
-    return {
-        "id": t.id,
-        "hiring_type": "Tow Service",
-        "vehicle_type": t.vehicle_type,
-        "shift_details": None,
-        "start_date": None,
-        "end_date": None,
-        "months": None,
-        "selected_days": None,
-        "start_location": t.start_location,
-        "end_location": t.end_location,
-        "reason": t.reason,
-        "status": t.status,
-        "fare": t.fare,
-        "fare_breakdown": t.fare_breakdown,
-        "start_lat": t.start_lat,
-        "start_lng": t.start_lng,
-        "end_lat": t.end_lat,
-        "end_lng": t.end_lng,
-        "distance_km": t.distance_km,
-        "booking_time": t.booking_time,
-    }
-
-
-@router.get("/trips", response_model=List[TripSafe])
+@router.get("/trips")
 def get_all_trips_admin(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
@@ -649,12 +578,43 @@ def get_all_trips_admin(
     mechs = session.exec(
         select(MechanicTrip).order_by(desc(MechanicTrip.booking_time))
     ).all()
+    services = session.exec(
+        select(ServiceRequest).order_by(desc(ServiceRequest.booking_time))
+    ).all()
 
-    combined = (
-        [_trip_to_safe_dict(t) for t in rides]
-        + [_tow_trip_to_safe_dict(t) for t in tows]
-        + [_mech_trip_to_safe_dict(t) for t in mechs]
-    )
+    combined: list[dict] = []
+
+    for t in rides:
+        d = _full_dump(t)
+        d["service_type"] = "Ride"
+        d["original_id"] = t.id
+        d["id"] = f"RIDE-{t.id}"
+        combined.append(d)
+
+    for t in tows:
+        d = _full_dump(t)
+        d["service_type"] = "Tow"
+        d["hiring_type"] = "Tow Service"
+        d["original_id"] = t.id
+        d["id"] = f"TOW-{t.id}"
+        combined.append(d)
+
+    for t in mechs:
+        d = _full_dump(t)
+        d["service_type"] = "Mechanic"
+        d["hiring_type"] = "Mechanic Service"
+        d["original_id"] = t.id
+        d["id"] = f"MECHANIC-{t.id}"
+        combined.append(d)
+
+    for sr in services:
+        d = _full_dump(sr)
+        d["service_type"] = "Vehicle Service"
+        d["hiring_type"] = "Vehicle Service"
+        d["original_id"] = sr.id
+        d["id"] = f"SERVICE-{sr.id}"
+        combined.append(d)
+
     combined.sort(key=lambda r: r["booking_time"], reverse=True)
     return combined[skip : skip + limit]
 
