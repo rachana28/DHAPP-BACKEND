@@ -25,8 +25,18 @@ from app.modules.towing import (
 )
 from app.modules.pricing import router as pricing_router
 from app.modules.tracking import router as tracking_router
-from app.modules.admin import router as admin_router
-from app.modules.support import router as support_router
+from app.modules.admin import (
+    router as admin_router,
+    support_router as admin_support_router,
+)
+from app.modules.support import (
+    router as support_router,
+    ws_router as support_ws_router,
+)
+from app.modules.support.scheduler_jobs import (
+    auto_close_inactive_support_tickets,
+    cleanup_orphan_support_attachments,
+)
 from app.modules.mechanic import (
     trip_router as mechanic_router,
     profile_router as mechanic_profile_router,
@@ -110,6 +120,10 @@ async def lifespan(app: FastAPI):
     # (auto-convert to trip_day) and trip_day daily bill unpaid > 48h
     # (force-close the booking with a final settlement).
     scheduler.add_job(auto_resolve_paused_trips_scheduler, "interval", minutes=5)
+    # Auto-close service-linked support tickets after 2hrs of inactivity
+    scheduler.add_job(auto_close_inactive_support_tickets, "interval", minutes=10)
+    # Clean up attachments uploaded but never linked to a message
+    scheduler.add_job(cleanup_orphan_support_attachments, "interval", minutes=30)
     scheduler.start()
     print("🚀 Scheduler started.")
 
@@ -140,6 +154,10 @@ app.include_router(tow_trips_router.router)
 app.include_router(tracking_router.router)
 app.include_router(pricing_router.router)
 app.include_router(support_router.router)
+app.include_router(support_ws_router.router)
+# Admin-only support endpoints (tickets + FAQ CRUD) live in app.modules.admin
+app.include_router(admin_support_router.router)
+app.include_router(admin_support_router.faq_router)
 app.include_router(config_router.router)
 app.include_router(mechanic_router.router)
 app.include_router(mechanic_profile_router.router)
