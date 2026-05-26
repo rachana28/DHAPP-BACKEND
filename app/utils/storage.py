@@ -2,6 +2,7 @@ import os
 import time
 import boto3
 import asyncio
+from typing import List
 from botocore.exceptions import ClientError
 from fastapi import UploadFile, HTTPException
 
@@ -127,3 +128,25 @@ async def upload_document_to_r2(
         await file.close()
 
     return f"{R2_PUBLIC_URL}/{object_name}"
+
+
+def _delete_r2_keys_sync(keys: List[str]) -> None:
+    """Synchronous helper that batch-deletes R2 keys (up to 1000 per call)."""
+    if not keys:
+        return
+    for i in range(0, len(keys), 1000):
+        batch = keys[i : i + 1000]
+        try:
+            s3_client.delete_objects(
+                Bucket=BUCKET_NAME,
+                Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+            )
+        except ClientError as e:
+            print(f"R2 Delete Error: {e}")
+
+
+async def delete_r2_keys(keys: List[str]) -> None:
+    """Async wrapper for R2 deletions. Offloads to a thread to avoid blocking."""
+    if not keys:
+        return
+    await asyncio.to_thread(_delete_r2_keys_sync, keys)

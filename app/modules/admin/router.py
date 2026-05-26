@@ -26,7 +26,7 @@ from app.core.models import (
     TripSafe,
     SystemConfig,
     SupportTicket,
-    SupportTicketResponse,
+    SupportAttachment,
     UITheme,
     UIBanner,
     Mechanic,
@@ -36,6 +36,7 @@ from app.core.models import (
     ServiceSlot,
     ServiceCenterReview,
 )
+from app.utils.storage import _delete_r2_keys_sync
 from app.core.security import get_current_admin
 from app.utils.notifications import send_push_notification
 
@@ -431,8 +432,20 @@ def delete_user(
         # 1. Delete User Devices (Push Tokens)
         session.exec(delete(UserDevice).where(UserDevice.user_id == user_id))
 
-        # 2. Delete Support Tickets
-        session.exec(delete(SupportTicket).where(SupportTicket.user_id == user_id))
+        # 2. Delete Support Tickets — first collect R2 keys for their
+        # attachments so we can clean up storage AFTER the DB transaction
+        # succeeds. The cascade on the SupportTicket relationships removes
+        # SupportMessage + SupportAttachment rows automatically.
+        ticket_attachment_keys = session.exec(
+            select(SupportAttachment.r2_key)
+            .join(SupportTicket, SupportAttachment.ticket_id == SupportTicket.id)
+            .where(SupportTicket.user_id == user_id)
+        ).all()
+        tickets_to_delete = session.exec(
+            select(SupportTicket).where(SupportTicket.user_id == user_id)
+        ).all()
+        for t in tickets_to_delete:
+            session.delete(t)
 
         # 3. Handle Trips (As a Rider) — cascade across all three trip tables.
         # Each trip's child offers must be deleted first to satisfy FK constraints.
@@ -440,9 +453,7 @@ def delete_user(
         # and DELETE can't slip through and leave an orphan offer.
         session.exec(
             delete(TripOffer).where(
-                TripOffer.trip_id.in_(
-                    select(Trip.id).where(Trip.user_id == user_id)
-                )
+                TripOffer.trip_id.in_(select(Trip.id).where(Trip.user_id == user_id))
             )
         )
         session.exec(delete(Trip).where(Trip.user_id == user_id))
@@ -531,6 +542,16 @@ def delete_user(
         # 7. Finally, Delete the User
         session.delete(user)
         session.commit()
+
+        # Best-effort R2 cleanup for any support attachments that belonged
+        # to the deleted user. Runs after DB commit so a storage outage
+        # doesn't roll back the deletion.
+        keys = [k for k in (ticket_attachment_keys or []) if k]
+        if keys:
+            try:
+                _delete_r2_keys_sync(keys)
+            except Exception as e:
+                print(f"R2 cleanup on user delete failed: {e}")
 
         return {"message": "User and all associated data deleted successfully"}
 
@@ -750,45 +771,7 @@ def get_user_trip_history(
     return history
 
 
-# --- SUPPORT TICKET MANAGEMENT ---
-@router.get("/tickets", response_model=List[SupportTicketResponse])
-def get_all_tickets(
-    status: Optional[str] = None,
-    category: Optional[str] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
-    session: Session = Depends(get_session),
-):
-    query = select(SupportTicket).order_by(desc(SupportTicket.created_at))
-    if status:
-        query = query.where(SupportTicket.status == status)
-    if category:
-        query = query.where(SupportTicket.category == category)
-
-    return session.exec(query.offset(skip).limit(limit)).all()
-
-
-@router.patch("/tickets/{ticket_db_id}/resolve")
-def resolve_ticket(
-    ticket_db_id: int,
-    status: str = Query(..., regex="^(open|in_progress|resolved|closed)$"),
-    admin_response: str = Query(...),
-    session: Session = Depends(get_session),
-):
-    ticket = session.get(SupportTicket, ticket_db_id)
-    if not ticket:
-        raise HTTPException(404, "Ticket not found")
-
-    ticket.status = status
-    ticket.admin_response = admin_response
-    ticket.updated_at = datetime.utcnow()
-
-    session.add(ticket)
-    session.commit()
-
-    # Optional: Send Push Notification to User about update
-
-    return {"message": "Ticket updated successfully", "ticket": ticket}
+# --- SUPPORT TICKET MANAGEMENT moved to app/modules/support/admin_router.py ---
 
 
 # --- SYSTEM CONFIGURATION (PRICING & SETTINGS) ---

@@ -852,6 +852,27 @@ class SystemConfig(SQLModel, table=True):
 
 
 # --- NEW: SUPPORT TICKET SYSTEM ---
+
+# Allowed values (kept as plain strings in DB to match existing style)
+SUPPORT_SERVICE_TYPES = {"trip", "tow", "mechanic", "service_center"}
+SUPPORT_CATEGORIES = {
+    "service_issue",
+    "payment",
+    "app_bug",
+    "general",
+    "other",
+}
+SUPPORT_RAISED_ROLES = {"user", "driver", "tow_truck_driver", "mechanic"}
+SUPPORT_SENDER_ROLES = {
+    "user",
+    "driver",
+    "tow_truck_driver",
+    "mechanic",
+    "admin",
+    "system",
+}
+
+
 class SupportTicketBase(SQLModel):
     subject: str = Field(max_length=150)
     description: str = Field(max_length=2000)
@@ -872,15 +893,52 @@ class SupportTicket(SupportTicketBase, table=True):
     user_id: uuid.UUID = Field(foreign_key="user.id")
     ticket_id: str = Field(index=True)  # Unique ID like "TKT-1001" for display
     status: str = "open"  # open, in_progress, resolved, closed
-    admin_response: Optional[str] = None
+    admin_response: Optional[str] = (
+        None  # legacy single-response field (kept for back-compat)
+    )
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
+    # Polymorphic service link (exactly-one-or-none)
+    service_type: Optional[str] = Field(default=None, index=True)
+    service_ref_id: Optional[int] = Field(default=None, index=True)
+    service_snapshot: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+
+    # Chat lifecycle
+    last_message_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    closed_at: Optional[datetime] = None
+    closed_by: Optional[str] = None  # "admin" | "auto_inactivity" | "user"
+    auto_close_enabled: bool = Field(default=False)
+
+    # Who raised the ticket (user app vs driver app)
+    raised_by_role: str = Field(default="user")
+
     user: "User" = Relationship(back_populates="tickets")
+    messages: List["SupportMessage"] = Relationship(
+        back_populates="ticket",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    attachments: List["SupportAttachment"] = Relationship(
+        back_populates="ticket",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
 
 
 class SupportTicketCreate(SupportTicketBase):
-    pass
+    service_type: Optional[str] = None
+    service_ref_id: Optional[int] = None
+
+    @field_validator("service_type", mode="before")
+    def _validate_service_type(cls, v):
+        if v is None or v == "":
+            return None
+        if v not in SUPPORT_SERVICE_TYPES:
+            raise ValueError(
+                f"service_type must be one of {sorted(SUPPORT_SERVICE_TYPES)}"
+            )
+        return v
 
 
 class SupportTicketResponse(SupportTicketBase):
@@ -889,6 +947,162 @@ class SupportTicketResponse(SupportTicketBase):
     status: str
     admin_response: Optional[str]
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    service_type: Optional[str] = None
+    service_ref_id: Optional[int] = None
+    last_message_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    closed_by: Optional[str] = None
+    auto_close_enabled: bool = False
+    raised_by_role: Optional[str] = None
+
+
+# --- Support Messages (chat) ---
+class SupportMessage(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ticket_id: int = Field(foreign_key="supportticket.id", index=True)
+    sender_role: str = Field(index=True)
+    sender_id: str  # str(uuid) for customer, admin email for admin, "system" for system
+    body: Optional[str] = Field(default=None, max_length=4000)
+    is_system: bool = Field(default=False)
+    is_deleted: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+    ticket: SupportTicket = Relationship(back_populates="messages")
+    attachments: List["SupportAttachment"] = Relationship(back_populates="message")
+
+    @field_validator("body", mode="before")
+    def sanitize_body(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class SupportAttachment(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ticket_id: int = Field(foreign_key="supportticket.id", index=True)
+    message_id: Optional[int] = Field(
+        default=None, foreign_key="supportmessage.id", index=True
+    )
+    file_url: str
+    r2_key: str
+    file_name: str = Field(max_length=255)
+    file_type: str  # "image" | "document"
+    mime_type: Optional[str] = None
+    file_size: int = 0
+    uploaded_by_role: str
+    uploaded_by_id: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    ticket: SupportTicket = Relationship(back_populates="attachments")
+    message: Optional[SupportMessage] = Relationship(back_populates="attachments")
+
+
+# Response / request schemas for messages & attachments
+class SupportAttachmentResponse(SQLModel):
+    id: int
+    ticket_id: int
+    message_id: Optional[int] = None
+    file_url: str
+    file_name: str
+    file_type: str
+    mime_type: Optional[str] = None
+    file_size: int
+    uploaded_by_role: str
+    created_at: datetime
+
+
+class SupportMessageCreate(SQLModel):
+    body: Optional[str] = Field(default=None, max_length=4000)
+    attachment_ids: List[int] = Field(default_factory=list)
+
+    @field_validator("body", mode="before")
+    def sanitize_body(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class SupportMessageResponse(SQLModel):
+    id: int
+    ticket_id: int
+    sender_role: str
+    sender_id: str
+    body: Optional[str] = None
+    is_system: bool
+    is_deleted: bool
+    created_at: datetime
+    attachments: List[SupportAttachmentResponse] = Field(default_factory=list)
+
+
+class SupportTicketDetailResponse(SupportTicketResponse):
+    service_snapshot: Optional[Dict[str, Any]] = None
+    messages: List[SupportMessageResponse] = Field(default_factory=list)
+    attachments: List[SupportAttachmentResponse] = Field(default_factory=list)
+
+
+class SupportTicketStatusUpdate(SQLModel):
+    status: str
+    admin_response: Optional[str] = None
+
+    @field_validator("status")
+    def _check_status(cls, v):
+        if v not in {"open", "in_progress", "resolved", "closed"}:
+            raise ValueError("invalid status")
+        return v
+
+
+# --- Support FAQ (admin-managed pre-built solutions) ---
+class SupportFAQ(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service_type: Optional[str] = Field(default=None, index=True)
+    category: str = Field(index=True)
+    question: str = Field(max_length=200)
+    solution: str = Field(max_length=4000)
+    display_order: int = 0
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class SupportFAQCreate(SQLModel):
+    service_type: Optional[str] = None
+    category: str = Field(max_length=80)
+    question: str = Field(max_length=200)
+    solution: str = Field(max_length=4000)
+    display_order: int = 0
+    is_active: bool = True
+
+    @field_validator("service_type", mode="before")
+    def _vt(cls, v):
+        if v is None or v == "":
+            return None
+        if v not in SUPPORT_SERVICE_TYPES:
+            raise ValueError(
+                f"service_type must be one of {sorted(SUPPORT_SERVICE_TYPES)}"
+            )
+        return v
+
+
+class SupportFAQUpdate(SQLModel):
+    service_type: Optional[str] = None
+    category: Optional[str] = None
+    question: Optional[str] = None
+    solution: Optional[str] = None
+    display_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class SupportFAQResponse(SQLModel):
+    id: int
+    service_type: Optional[str]
+    category: str
+    question: str
+    solution: str
+    display_order: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 class User(UserBase, table=True):
