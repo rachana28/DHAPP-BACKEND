@@ -1,5 +1,11 @@
 """
-Trip Service for managing trip lifecycle and state machine
+Trip lifecycle state machine + per-shift bookkeeping.
+
+Holds the allowed status transitions, the driver-busy set used by allocation,
+the rolling driver-skip limit, and the attendance helpers that the router and
+schedulers call into. All status changes should flow through
+:meth:`TripService.transition_trip_state` so the optimistic ``state_version``
+bumps in lockstep and an audit event is emitted.
 """
 
 from datetime import datetime, timedelta, date
@@ -16,15 +22,17 @@ from app.core.models import (
     Driver,
 )
 from app.modules.trips.billing_service import payment_method_discount_pct
+from app.services.audit_log import emit_event as audit_emit
 from app.utils.time_utils import today_ist
 
 
 class TripService:
-    """
-    Manages trip state machine and lifecycle
+    """State machine + skip/attendance helpers for a Trip.
 
-    State Flow:
-    searching → accepted_pending_payment → active_pending_otp → active → ongoing → completed → billed
+    Happy path: searching → accepted_pending_payment → active_pending_otp →
+    active → ongoing → (completed | auto_completed) → billed → settled.
+    Cancellation, abandon, force-close, and mid-trip shortfall live as side
+    edges — see :attr:`VALID_STATES`.
     """
 
     VALID_STATES = {
@@ -38,8 +46,6 @@ class TripService:
         "payment_in_progress": ["active_pending_otp", "payment_failed"],
         "payment_failed": ["searching", "cancelled"],
         "rejected": ["searching", "cancelled"],
-        # active_pending_otp → skipped/completed lets a skipped final shift wrap the trip up;
-        # → paused holds the trip when an advance_20 / full_payment upfront is unpaid.
         "active_pending_otp": [
             "active",
             "otp_expired",
@@ -47,27 +53,39 @@ class TripService:
             "skipped",
             "completed",
             "paused",
+            "cancelled_by_driver",
         ],
         "active": ["ongoing", "skipped", "cancelled_by_user", "cancelled_by_driver"],
-        # ongoing → active_pending_otp lets multi-day trips re-arm OTP for the next shift day
-        "ongoing": ["completed", "auto_completed", "paused", "active_pending_otp"],
-        # paused → active_pending_otp re-arms the next shift's OTP after a
-        # trip_day user clears the outstanding daily bill that held the trip.
-        # paused → billed force-closes a trip whose daily bill stayed unpaid
-        # for 48 hours (final settlement covers the pending amount only).
-        "paused": ["ongoing", "completed", "active_pending_otp", "billed"],
+        "ongoing": [
+            "completed",
+            "auto_completed",
+            "paused",
+            "active_pending_otp",
+            "cancelled_by_driver",
+        ],
+        # `paused` → `billed` is the 48-h force-close path; the final
+        # settlement covers the pending portion only.
+        "paused": [
+            "ongoing",
+            "completed",
+            "active_pending_otp",
+            "billed",
+            "cancelled_by_driver",
+        ],
         "completed": ["billed", "active_pending_otp"],
         "auto_completed": ["billed", "active_pending_otp"],
         "billed": ["settled"],
         "skipped": ["billed"],
-        "cancelled_by_user": ["refund_processing"],
+        # cancelled_by_user → cancellation_pending_payment when the F6 cancel
+        # maths leave the user owing a shortfall (advance_20 covered less than
+        # served + anti-fraud). User pays via cancellation_balance bill → settled.
+        "cancelled_by_user": ["refund_processing", "cancellation_pending_payment"],
         "cancelled_by_driver": ["refund_processing"],
         "refund_processing": ["settled"],
+        "cancellation_pending_payment": ["settled"],
     }
 
-    # Trip states in which the assigned driver is still engaged on the booking
-    # and therefore cannot accept or be offered another trip. A driver is free
-    # again once the trip reaches a closed/terminal state.
+    # States in which the assigned driver cannot accept another trip.
     DRIVER_BUSY_STATES = (
         "accepted_pending_payment",
         "payment_in_progress",
@@ -104,11 +122,10 @@ class TripService:
         validate: bool = True,
         expected_version: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
+        """Row-locked, audit-emitted state change with optimistic version check."""
         try:
-            # Row-lock the trip to serialize against parallel transitions
-            # (driver end-trip vs auto-end scheduler, etc.). Without this
-            # state_version is incremented in lockstep but two transitions
-            # can still both succeed and race on side effects.
+            # Row-lock serialises parallel transitions (driver end-trip vs.
+            # auto-end scheduler, cancel vs. force-close, etc.).
             trip = session.exec(
                 select(Trip).where(Trip.id == trip_id).with_for_update()
             ).first()
@@ -127,11 +144,23 @@ class TripService:
                 if not is_valid:
                     return False, error
 
+            previous_state = current_state
             trip.status = new_state
             trip.state_version += 1
             session.add(trip)
             session.commit()
 
+            audit_emit(
+                "trip.state_transition",
+                trip_id=trip_id,
+                actor="system",
+                payload={
+                    "from": previous_state,
+                    "to": new_state,
+                    "state_version": trip.state_version,
+                    "validated": validate,
+                },
+            )
             return True, None
 
         except Exception as e:
@@ -490,16 +519,11 @@ class TripService:
                 return True, None, has_completed_shift
 
             if trip.payment_method in ("advance_20", "full_payment"):
-                # Issue 4: once at least one shift has ended (a completed/
-                # present shift) an advance_20 / full_payment trip can no
-                # longer be cancelled — it must run to its final settlement.
-                if has_completed_shift:
-                    return (
-                        False,
-                        "Cancellation not allowed after a shift has started for this payment method. "
-                        "The trip will close automatically after the final shift.",
-                        has_completed_shift,
-                    )
+                # F6: mid-trip cancellation is now allowed. The cancel
+                # endpoint computes refund = upfront − served_days × per_day
+                # − ₹50 × user_skipped_days. If positive, refund. If negative,
+                # the user owes the shortfall and the trip parks in
+                # `cancellation_pending_payment` until they pay.
                 # Issue 8: while the upfront is still unpaid the trip is paused.
                 # No proceed action (including cancel) is allowed until the user
                 # either pays the upfront or reverts the method to trip-day.
@@ -601,32 +625,23 @@ class TripService:
         except Exception as e:
             return False, f"Marking present failed: {str(e)}"
 
-    # A driver may skip at most this many shifts per calendar month on a given
-    # trip booking. The allowance is scoped to BOTH the trip and the month, so:
-    #   * a short trip running a month  -> up to 3 skips,
-    #   * a 5-month monthly booking     -> up to 3 skips in EACH of its months,
-    #   * skips on one trip never consume another trip's allowance.
-    # Users are unlimited. System-marked no-shows (skipped_by_system) never
-    # count here — only skips the driver themselves initiated.
-    DRIVER_SKIP_LIMIT_PER_TRIP_MONTH = 3
+    # Driver skip cap per booking, measured over a rolling window (calendar-
+    # month gaming → 6 skips in 72h across Nov 30 / Dec 1 / Dec 2). Users
+    # unlimited; skipped_by_system doesn't count — only driver-initiated.
+    DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW = 3
+    DRIVER_SKIP_WINDOW_DAYS = 30
 
-    def count_driver_skips_for_trip_in_month(
+    def count_driver_skips_for_trip_in_window(
         self, session: Session, trip_id: int, ref_date: date
     ) -> int:
-        """Shifts the driver has skipped (skipped_by_driver) on this trip
-        booking within ref_date's calendar month."""
-        month_start = ref_date.replace(day=1)
-        if ref_date.month == 12:
-            next_month_start = date(ref_date.year + 1, 1, 1)
-        else:
-            next_month_start = date(ref_date.year, ref_date.month + 1, 1)
-
+        """Driver-initiated skips in the 30-day window ending at ref_date."""
+        window_start = ref_date - timedelta(days=self.DRIVER_SKIP_WINDOW_DAYS - 1)
         rows = session.exec(
             select(TripAttendance.id).where(
                 TripAttendance.trip_id == trip_id,
                 TripAttendance.status == "skipped_by_driver",
-                TripAttendance.trip_date >= month_start,
-                TripAttendance.trip_date < next_month_start,
+                TripAttendance.trip_date >= window_start,
+                TripAttendance.trip_date <= ref_date,
             )
         ).all()
         return len(rows)
@@ -634,11 +649,10 @@ class TripService:
     def driver_skips_remaining(
         self, session: Session, trip_id: int, ref_date: Optional[date] = None
     ) -> int:
-        """Skips the driver has left on this trip booking for ref_date's
-        calendar month (defaults to the current month)."""
+        """Skips left in the 30-day window ending at ref_date (default: today)."""
         ref = ref_date or today_ist()
-        used = self.count_driver_skips_for_trip_in_month(session, trip_id, ref)
-        return max(0, self.DRIVER_SKIP_LIMIT_PER_TRIP_MONTH - used)
+        used = self.count_driver_skips_for_trip_in_window(session, trip_id, ref)
+        return max(0, self.DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW - used)
 
     def mark_trip_day_absent(
         self,
@@ -675,19 +689,18 @@ class TripService:
                     "Cannot skip a day that has already started. Use end-trip instead.",
                 )
 
-            # Driver-initiated skips are capped per calendar month on this trip
-            # booking; user-initiated skips remain unlimited. trip_date is the
-            # day being skipped (always today), so it scopes to the right month.
+            # Driver-initiated skips are capped per 30-day rolling window on
+            # this trip booking; user-initiated skips remain unlimited.
             if marked_by == "driver":
-                used = self.count_driver_skips_for_trip_in_month(
+                used = self.count_driver_skips_for_trip_in_window(
                     session, trip_id, trip_date
                 )
-                if used >= self.DRIVER_SKIP_LIMIT_PER_TRIP_MONTH:
+                if used >= self.DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW:
                     return (
                         False,
                         f"Skip limit reached — a driver can skip at most "
-                        f"{self.DRIVER_SKIP_LIMIT_PER_TRIP_MONTH} shifts per "
-                        f"calendar month on a trip booking.",
+                        f"{self.DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW} shifts in any "
+                        f"{self.DRIVER_SKIP_WINDOW_DAYS}-day window on a trip booking.",
                     )
 
             status = f"skipped_by_{marked_by}"
@@ -888,7 +901,7 @@ class TripService:
                 )
 
             result = {
-                "trip_id": trip.id,
+                "trip_id": trip.reference_id,
                 "status": trip.status,
                 "hiring_type": trip.hiring_type,
                 "payment_method": trip.payment_method,
@@ -964,7 +977,7 @@ class TripService:
                         select(func.count(Trip.id)).where(Trip.driver_id == driver.id)
                     ).one()
                     driver_detail = {
-                        "id": driver.id,
+                        "id": driver.reference_id,
                         "name": driver.name,
                         "rating": driver.rating,
                         "profile_picture_url": driver.profile_picture_url,

@@ -14,6 +14,7 @@ from app.core.models import (
 )
 from app.core.security import get_current_active_tow_truck_driver
 from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
+from app.utils.id_generator import get_by_reference
 
 router = APIRouter(prefix="/tow-truck-drivers", tags=["Tow Truck Drivers"])
 
@@ -72,17 +73,15 @@ async def update_profile_picture(
 
 @router.get("/{driver_id}", response_model=TowTruckDriverPublic)
 def read_tow_driver(
-    driver_id: int,
+    driver_id: str,
     session: Session = Depends(get_session),
 ):
-    driver = session.get(TowTruckDriver, driver_id)
+    driver = get_by_reference(session, TowTruckDriver, driver_id)
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     trip_count = session.exec(
-        select(func.count(TowTrip.id)).where(
-            TowTrip.tow_truck_driver_id == driver_id
-        )
+        select(func.count(TowTrip.id)).where(TowTrip.tow_truck_driver_id == driver.id)
     ).one()
 
     return TowTruckDriverPublic(**driver.model_dump(), total_trips=trip_count)
@@ -90,19 +89,19 @@ def read_tow_driver(
 
 @router.get("/{driver_id}/reviews", response_model=List[TowTruckDriverReview])
 def get_tow_driver_reviews(
-    driver_id: int,
+    driver_id: str,
     session: Session = Depends(get_session),
     page: int = Query(1, gt=0),
     limit: int = Query(5, gt=0, le=50),
 ):
-    driver = session.get(TowTruckDriver, driver_id)
+    driver = get_by_reference(session, TowTruckDriver, driver_id)
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     offset = (page - 1) * limit
     reviews = session.exec(
         select(TowTruckDriverReview)
-        .where(TowTruckDriverReview.driver_id == driver_id)
+        .where(TowTruckDriverReview.driver_id == driver.id)
         .order_by(desc(TowTruckDriverReview.created_at))
         .offset(offset)
         .limit(limit)

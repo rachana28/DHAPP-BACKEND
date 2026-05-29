@@ -10,6 +10,7 @@ from app.core.models import (
     Mechanic,
 )
 from app.core.security import get_current_user
+from app.utils.id_generator import get_by_reference
 from sqlalchemy.orm import selectinload
 import redis
 import json
@@ -32,7 +33,7 @@ def _lookup_trip_owner(session: Session, trip_id: int):
     """
     tow_trip = session.exec(
         select(TowTrip)
-        .where(TowTrip.id == trip_id)
+        .where(TowTrip.reference_id == trip_id)
         .options(selectinload(TowTrip.tow_truck_driver))
     ).first()
     if tow_trip and tow_trip.tow_truck_driver_id and tow_trip.tow_truck_driver:
@@ -40,7 +41,7 @@ def _lookup_trip_owner(session: Session, trip_id: int):
 
     mech_trip = session.exec(
         select(MechanicTrip)
-        .where(MechanicTrip.id == trip_id)
+        .where(MechanicTrip.reference_id == trip_id)
         .options(selectinload(MechanicTrip.mechanic))
     ).first()
     if mech_trip and mech_trip.mechanic_id and mech_trip.mechanic:
@@ -74,7 +75,7 @@ def update_location(
         if not driver:
             raise HTTPException(404, "Tow Driver profile not found.")
 
-        trip = session.get(TowTrip, location.trip_id)
+        trip = get_by_reference(session, TowTrip, location.trip_id)
         if not trip:
             raise HTTPException(404, "Trip not found.")
         if trip.tow_truck_driver_id != driver.id:
@@ -89,7 +90,7 @@ def update_location(
         if not mechanic:
             raise HTTPException(404, "Mechanic profile not found.")
 
-        trip = session.get(MechanicTrip, location.trip_id)
+        trip = get_by_reference(session, MechanicTrip, location.trip_id)
         if not trip:
             raise HTTPException(404, "Trip not found.")
         if trip.mechanic_id != mechanic.id:
@@ -127,7 +128,7 @@ def update_location(
 
 @router.get("/{trip_id}")
 def get_trip_location(
-    trip_id: int,
+    trip_id: str,
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
@@ -159,7 +160,7 @@ def get_trip_location(
 @router.websocket("/ws/{trip_id}")
 async def tracking_websocket(
     websocket: WebSocket,
-    trip_id: int,
+    trip_id: str,
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):

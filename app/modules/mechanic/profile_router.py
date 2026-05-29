@@ -14,6 +14,7 @@ from app.core.models import (
 )
 from app.core.security import get_current_active_mechanic
 from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
+from app.utils.id_generator import get_by_reference
 
 router = APIRouter(prefix="/mechanics", tags=["Mechanics"])
 
@@ -36,7 +37,7 @@ def update_current_mechanic_profile(
     update_data = mechanic_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(current_mechanic, key, value)
-    
+
     if current_mechanic.status == "rejected":
         current_mechanic.status = "pending_approval"
 
@@ -72,16 +73,16 @@ async def update_profile_picture(
 
 @router.get("/{mechanic_id}", response_model=MechanicPublic)
 def read_mechanic(
-    mechanic_id: int,
+    mechanic_id: str,
     session: Session = Depends(get_session),
 ):
-    mechanic = session.get(Mechanic, mechanic_id)
+    mechanic = get_by_reference(session, Mechanic, mechanic_id)
     if not mechanic:
         raise HTTPException(status_code=404, detail="Mechanic not found")
 
     trip_count = session.exec(
         select(func.count(MechanicTrip.id)).where(
-            MechanicTrip.mechanic_id == mechanic_id
+            MechanicTrip.mechanic_id == mechanic.id
         )
     ).one()
 
@@ -90,19 +91,19 @@ def read_mechanic(
 
 @router.get("/{mechanic_id}/reviews", response_model=List[MechanicReview])
 def get_mechanic_reviews(
-    mechanic_id: int,
+    mechanic_id: str,
     session: Session = Depends(get_session),
     page: int = Query(1, gt=0),
     limit: int = Query(5, gt=0, le=50),
 ):
-    mechanic = session.get(Mechanic, mechanic_id)
+    mechanic = get_by_reference(session, Mechanic, mechanic_id)
     if not mechanic:
         raise HTTPException(status_code=404, detail="Mechanic not found")
 
     offset = (page - 1) * limit
     reviews = session.exec(
         select(MechanicReview)
-        .where(MechanicReview.mechanic_id == mechanic_id)
+        .where(MechanicReview.mechanic_id == mechanic.id)
         .order_by(desc(MechanicReview.created_at))
         .offset(offset)
         .limit(limit)

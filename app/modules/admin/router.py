@@ -19,6 +19,8 @@ from app.core.models import (
     ServiceCenterPrivate,
     Trip,
     TripOffer,
+    TripBill,
+    PaymentTransaction,
     TowTrip,
     TowTripOffer,
     MechanicTrip,
@@ -29,15 +31,28 @@ from app.core.models import (
     UITheme,
     UIBanner,
     Mechanic,
+    MechanicPrivate,
     MechanicOffer,
     MechanicReview,
     ServiceRequest,
     ServiceSlot,
     ServiceCenterReview,
 )
+from fastapi import Body
+from app.services.audit_log import emit_event as audit_emit
+from app.modules.trips.trip_service import TripService
+from app.modules.trips.payment_service import PaymentService
+from app.utils.time_utils import now_ist
 from app.utils.storage import _delete_r2_keys_sync
 from app.core.security import get_current_admin
 from app.utils.notifications import send_push_notification
+from app.utils.id_generator import (
+    get_by_reference,
+    DRIVER,
+    TOW_DRIVER,
+    MECHANIC,
+    SERVICE_CENTER,
+)
 
 # Protect ENTIRE router with Admin check
 router = APIRouter(
@@ -142,7 +157,7 @@ def get_drivers_admin(
 
 @router.patch("/drivers/{driver_id}/status")
 def update_driver_status(
-    driver_id: int,
+    driver_id: str,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
     admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
@@ -151,7 +166,7 @@ def update_driver_status(
     """
     Approve or Reject a driver.
     """
-    driver = session.get(Driver, driver_id)
+    driver = get_by_reference(session, Driver, driver_id)
     if not driver:
         raise HTTPException(404, "Driver not found")
 
@@ -195,12 +210,12 @@ def get_tow_drivers_admin(
 
 @router.patch("/tow-drivers/{driver_id}/status")
 def update_tow_driver_status(
-    driver_id: int,
+    driver_id: str,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
     admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
 ):
-    driver = session.get(TowTruckDriver, driver_id)
+    driver = get_by_reference(session, TowTruckDriver, driver_id)
     if not driver:
         raise HTTPException(404, "Tow Driver not found")
 
@@ -227,7 +242,7 @@ def update_tow_driver_status(
 
 
 # --- 3.5 MECHANIC MANAGEMENT ---
-@router.get("/mechanics")
+@router.get("/mechanics", response_model=List[MechanicPrivate])
 def get_mechanics_admin(
     status: Optional[str] = None, session: Session = Depends(get_session)
 ):
@@ -239,12 +254,12 @@ def get_mechanics_admin(
 
 @router.patch("/mechanics/{mechanic_id}/status")
 def update_mechanic_status(
-    mechanic_id: int,
+    mechanic_id: str,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
     admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
 ):
-    mechanic = session.get(Mechanic, mechanic_id)
+    mechanic = get_by_reference(session, Mechanic, mechanic_id)
     if not mechanic:
         raise HTTPException(404, "Mechanic not found")
 
@@ -295,7 +310,7 @@ def get_service_centers_admin(
 
 @router.patch("/service-centers/{center_id}/status")
 def update_service_center_status(
-    center_id: int,
+    center_id: str,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
     admin_notes: Optional[str] = Query(None),
     session: Session = Depends(get_session),
@@ -305,7 +320,7 @@ def update_service_center_status(
     Approve or Reject a service center.
     Functionality: Admin approves/rejects service center signup applications
     """
-    center = session.get(ServiceCenter, center_id)
+    center = get_by_reference(session, ServiceCenter, center_id)
     if not center:
         raise HTTPException(404, "Service center not found")
 
@@ -357,20 +372,20 @@ def update_service_center_status(
 # --- VERIFICATION DETAILS ---
 @router.get("/verification-details/{role}/{profile_id}")
 def get_verification_details(
-    role: str, profile_id: int, session: Session = Depends(get_session)
+    role: str, profile_id: str, session: Session = Depends(get_session)
 ):
     """
     Fetch documents and missing fields for profile validation.
     Used by Admin to approve/reject pending registrations.
     """
     if role == "driver":
-        profile = session.get(Driver, profile_id)
+        profile = get_by_reference(session, Driver, profile_id)
     elif role == "tow_truck_driver":
-        profile = session.get(TowTruckDriver, profile_id)
+        profile = get_by_reference(session, TowTruckDriver, profile_id)
     elif role == "mechanic":
-        profile = session.get(Mechanic, profile_id)
+        profile = get_by_reference(session, Mechanic, profile_id)
     elif role == "service_center":
-        profile = session.get(ServiceCenter, profile_id)
+        profile = get_by_reference(session, ServiceCenter, profile_id)
     else:
         raise HTTPException(
             400,
@@ -381,7 +396,7 @@ def get_verification_details(
         raise HTTPException(404, f"{role} profile not found")
 
     return {
-        "profile_id": profile.id,
+        "profile_id": profile.reference_id,
         "role": role,
         "name": profile.name,
         "status": profile.status,
@@ -879,3 +894,169 @@ def delete_banner(banner_id: int, session: Session = Depends(get_session)):
     session.delete(banner)
     session.commit()
     return {"message": "Banner deleted successfully"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F13: Admin overrides — emergency state / refund / bill controls.
+# Every action emits a critical-severity audit event so the trip's true
+# history is preserved even when state machine transitions are bypassed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/trips/{trip_id}/force-state")
+def admin_force_trip_state(
+    trip_id: int,
+    target_state: str = Body(..., embed=True),
+    reason: str = Body(..., embed=True),
+    session: Session = Depends(get_session),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Force a trip into ``target_state`` bypassing the transition matrix (F13).
+
+    Use sparingly — required for recovery scenarios (stuck `paused`, orphan
+    `accepted_pending_payment`, etc.). The action is recorded in the external
+    audit log; do not use it to skip dunning or to refund without using the
+    manual-refund endpoint, which keeps payment records consistent.
+    """
+    if not reason or not reason.strip():
+        raise HTTPException(400, "reason is required")
+    trip = session.exec(
+        select(Trip).where(Trip.id == trip_id).with_for_update()
+    ).first()
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+    if target_state not in TripService.VALID_STATES and target_state not in (
+        # Targets that are terminal-only keys in the matrix (no outgoing edges).
+        "settled",
+    ):
+        raise HTTPException(400, f"Unknown target_state '{target_state}'")
+
+    previous_state = trip.status
+    trip.status = target_state
+    trip.state_version += 1
+    session.add(trip)
+    session.commit()
+
+    audit_emit(
+        "admin.force_state",
+        trip_id=trip_id,
+        actor="admin",
+        actor_id=current_admin.email or str(current_admin.id),
+        severity="critical",
+        payload={
+            "from": previous_state,
+            "to": target_state,
+            "reason": reason.strip(),
+        },
+    )
+    return {
+        "message": "Trip state forced",
+        "trip_id": trip_id,
+        "from": previous_state,
+        "to": target_state,
+    }
+
+
+@router.post("/trips/{trip_id}/manual-refund")
+def admin_manual_refund(
+    trip_id: int,
+    amount: float = Body(..., embed=True),
+    reason: str = Body(..., embed=True),
+    session: Session = Depends(get_session),
+    current_admin: User = Depends(get_current_admin),
+    redis_client: redis.Redis = Depends(get_redis),
+):
+    """Issue an ad-hoc refund on a trip (F13).
+
+    Goes through the same gateway stub + audit pipeline as automatic refunds
+    so the resulting :class:`PaymentTransaction` row is indistinguishable from
+    a system-initiated refund except for the audit event linking the admin
+    actor.
+    """
+    if amount <= 0:
+        raise HTTPException(400, "amount must be positive")
+    if not reason or not reason.strip():
+        raise HTTPException(400, "reason is required")
+    trip = session.get(Trip, trip_id)
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+
+    payment_service = PaymentService(redis_client)
+    ok, err = payment_service.process_refund(
+        session,
+        trip_id,
+        round(amount, 2),
+        reason=f"Admin manual refund: {reason.strip()}",
+    )
+    if not ok:
+        raise HTTPException(502, err or "Refund gateway error")
+
+    audit_emit(
+        "admin.manual_refund",
+        trip_id=trip_id,
+        actor="admin",
+        actor_id=current_admin.email or str(current_admin.id),
+        severity="critical",
+        payload={
+            "amount": round(amount, 2),
+            "reason": reason.strip(),
+        },
+    )
+    return {
+        "message": "Refund issued",
+        "trip_id": trip_id,
+        "amount": round(amount, 2),
+    }
+
+
+@router.post("/bills/{bill_id}/waive")
+def admin_waive_bill(
+    bill_id: int,
+    reason: str = Body(..., embed=True),
+    session: Session = Depends(get_session),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Waive an outstanding bill (F13).
+
+    Marks the bill paid with ``payment_method='admin_waive'`` and ``amount_due=0``.
+    A ``PaymentTransaction`` row is NOT created because no money moved — the
+    audit event is the only record. Use for goodwill / dispute resolution.
+    """
+    if not reason or not reason.strip():
+        raise HTTPException(400, "reason is required")
+    bill = session.exec(
+        select(TripBill).where(TripBill.id == bill_id).with_for_update()
+    ).first()
+    if not bill:
+        raise HTTPException(404, "Bill not found")
+    if bill.is_paid:
+        raise HTTPException(400, "Bill is already paid")
+
+    previous_due = bill.amount_due
+    bill.amount_paid = bill.total_amount
+    bill.amount_due = 0.0
+    bill.is_paid = True
+    bill.paid_at = now_ist()
+    bill.paid_by = "admin_waive"
+    bill.payment_note = f"Waived by admin: {reason.strip()}"
+    session.add(bill)
+    session.commit()
+
+    audit_emit(
+        "admin.bill_waive",
+        trip_id=bill.trip_id,
+        actor="admin",
+        actor_id=current_admin.email or str(current_admin.id),
+        severity="critical",
+        payload={
+            "bill_id": bill_id,
+            "bill_type": bill.bill_type,
+            "amount_due_before": previous_due,
+            "reason": reason.strip(),
+        },
+    )
+    return {
+        "message": "Bill waived",
+        "bill_id": bill_id,
+        "amount_waived": previous_due,
+    }

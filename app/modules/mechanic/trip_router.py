@@ -23,8 +23,14 @@ from app.modules.mechanic.mechanic_allocation import (
     attempt_mechanic_trip_escalation,
 )
 from app.utils.notifications import send_push_notification
+from app.utils.id_generator import (
+    generate_reference_id,
+    get_by_reference,
+    MECHANIC_TRIP,
+)
 
 router = APIRouter(prefix="/mechanic-trips", tags=["Mechanic Trips"])
+
 
 class StatusUpdate(BaseModel):
     status: str  # "available" or "offline"
@@ -43,6 +49,7 @@ def create_mechanic_booking_request(
     trip_data.pop("hiring_type", None)  # discriminator no longer stored
 
     db_trip = MechanicTrip.model_validate(trip_data)
+    db_trip.reference_id = generate_reference_id(session, MECHANIC_TRIP)
     session.add(db_trip)
     session.commit()
     session.refresh(db_trip)
@@ -92,9 +99,7 @@ def get_my_mechanic_bookings(
             select(MechanicTrip)
             .where(MechanicTrip.user_id == current_user.id)
             .order_by(desc(MechanicTrip.booking_time))
-            .options(
-                selectinload(MechanicTrip.mechanic)
-            )
+            .options(selectinload(MechanicTrip.mechanic))
         )
         return session.exec(statement).all()
 
@@ -104,12 +109,12 @@ def get_my_mechanic_bookings(
 
 @router.post("/{trip_id}/cancel")
 def cancel_mechanic_trip(
-    trip_id: int,
+    trip_id: str,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    trip = session.get(MechanicTrip, trip_id)
+    trip = get_by_reference(session, MechanicTrip, trip_id)
     if not trip or trip.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Trip not found")
 
@@ -142,7 +147,7 @@ def cancel_mechanic_trip(
             user_ids=[mechanic_user_id_to_notify],
             title="Service Cancelled ❌",
             body="The customer has cancelled this mechanic request.",
-            data={"trip_id": trip.id, "type": "cancellation"},
+            data={"trip_id": trip.reference_id, "type": "cancellation"},
         )
 
     return {"message": "Mechanic trip cancelled successfully"}
@@ -216,10 +221,10 @@ def accept_mechanic_offer(
         user_ids=[trip.user_id],
         title="Mechanic Confirmed! 🛠️",
         body=f"{current_mechanic.name} is on the way.",
-        data={"trip_id": trip.id, "screen": "tracking"},
+        data={"trip_id": trip.reference_id, "screen": "tracking"},
     )
 
-    return {"message": "Service accepted", "trip_id": trip.id}
+    return {"message": "Service accepted", "trip_id": trip.reference_id}
 
 
 @router.post("/mechanic/reject-offer/{offer_id}")
