@@ -45,6 +45,7 @@ from app.modules.service import (
     center_router as service_center_router,
     user_router as service_user_router,
 )
+from app.modules.payments import router as payments_router
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -56,6 +57,7 @@ from app.modules.trips.scheduler_jobs import (
     driver_payment_timeout_scheduler,
     daily_settlement_scheduler,
     auto_resolve_paused_trips_scheduler,
+    dunning_scheduler,
 )
 
 
@@ -120,6 +122,9 @@ async def lifespan(app: FastAPI):
     # (auto-convert to trip_day) and trip_day daily bill unpaid > 48h
     # (force-close the booking with a final settlement).
     scheduler.add_job(auto_resolve_paused_trips_scheduler, "interval", minutes=5)
+    # F8: daily 09:00 IST — advance overdue settlements down the dunning
+    # ladder, push reminders, and hand off to collections at day 30.
+    scheduler.add_job(dunning_scheduler, "cron", hour=9, minute=0)
     # Auto-close service-linked support tickets after 2hrs of inactivity
     scheduler.add_job(auto_close_inactive_support_tickets, "interval", minutes=10)
     # Clean up attachments uploaded but never linked to a message
@@ -163,6 +168,7 @@ app.include_router(mechanic_router.router)
 app.include_router(mechanic_profile_router.router)
 app.include_router(service_center_router.router)
 app.include_router(service_user_router.router)
+app.include_router(payments_router.router)
 
 
 @app.get("/")

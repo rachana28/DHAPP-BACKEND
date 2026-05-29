@@ -26,6 +26,14 @@ from app.core.security import (
     verify_refresh_token,
     get_current_user,
 )
+from app.utils.id_generator import (
+    generate_reference_id,
+    get_by_reference,
+    DRIVER,
+    TOW_DRIVER,
+    MECHANIC,
+    SERVICE_CENTER,
+)
 import requests
 import re
 from dns import resolver
@@ -232,6 +240,7 @@ def verify_otp(
                 user_id=user.id,
                 license_number=request.license_number,
                 vehicle_type=request.vehicle_type,
+                reference_id=generate_reference_id(session, DRIVER),
             )
             session.add(db_driver)
             session.commit()
@@ -241,6 +250,7 @@ def verify_otp(
                 phone_number=phone,
                 user_id=user.id,
                 vehicle_number=request.vehicle_number,
+                reference_id=generate_reference_id(session, TOW_DRIVER),
             )
             session.add(db_tow_driver)
             session.commit()
@@ -250,6 +260,7 @@ def verify_otp(
                 name=request.full_name,
                 phone_number=phone,
                 specialization=request.specialization,
+                reference_id=generate_reference_id(session, MECHANIC),
             )
             session.add(new_mechanic)
             session.commit()
@@ -262,6 +273,7 @@ def verify_otp(
                 address=request.address,
                 latitude=request.latitude,
                 longitude=request.longitude,
+                reference_id=generate_reference_id(session, SERVICE_CENTER),
             )
             session.add(new_service_center)
             session.commit()
@@ -289,20 +301,20 @@ def verify_otp(
 
 @router.get("/verification-details/{role}/{profile_id}")
 def get_verification_details(
-    role: str, profile_id: int, session: Session = Depends(get_session)
+    role: str, profile_id: str, session: Session = Depends(get_session)
 ):
     """
     Fetch documents and missing fields for profile validation.
     Used by Admin to approve/reject pending registrations.
     """
     if role == "driver":
-        profile = session.get(Driver, profile_id)
+        profile = get_by_reference(session, Driver, profile_id)
     elif role == "tow_truck_driver":
-        profile = session.get(TowTruckDriver, profile_id)
+        profile = get_by_reference(session, TowTruckDriver, profile_id)
     elif role == "mechanic":
-        profile = session.get(Mechanic, profile_id)
+        profile = get_by_reference(session, Mechanic, profile_id)
     elif role == "service_center":
-        profile = session.get(ServiceCenter, profile_id)
+        profile = get_by_reference(session, ServiceCenter, profile_id)
     else:
         raise HTTPException(
             400,
@@ -313,7 +325,7 @@ def get_verification_details(
         raise HTTPException(404, f"{role} profile not found")
 
     return {
-        "profile_id": profile.id,
+        "profile_id": profile.reference_id,
         "role": role,
         "name": profile.name,
         "status": profile.status,

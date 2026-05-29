@@ -26,6 +26,7 @@ from app.core.models import (
 )
 from app.core.security import get_current_active_service_center
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
+from app.utils.id_generator import get_by_reference
 from sqlalchemy.orm import selectinload
 
 router = APIRouter(prefix="/service-centers", tags=["Service Centers"])
@@ -136,20 +137,20 @@ async def update_profile_picture(
 
 @router.get("/{center_id}", response_model=ServiceCenterPublic)
 def read_service_center(
-    center_id: int,
+    center_id: str,
     session: Session = Depends(get_session),
 ):
     """
     Get details for a specific service center by ID.
     Functionality: Public endpoint to view service center profile with total bookings
     """
-    center = session.get(ServiceCenter, center_id)
+    center = get_by_reference(session, ServiceCenter, center_id)
     if not center:
         raise HTTPException(status_code=404, detail="Service center not found")
 
     booking_count = session.exec(
         select(func.count(ServiceRequest.id)).where(
-            ServiceRequest.service_center_id == center_id
+            ServiceRequest.service_center_id == center.id
         )
     ).one()
 
@@ -532,7 +533,7 @@ def get_center_bookings(
 
 @router.patch("/me/bookings/{booking_id}/status")
 def update_booking_status(
-    booking_id: int,
+    booking_id: str,
     new_status: str = Body(..., embed=True),
     cancellation_reason: str = Body(None, embed=True),
     *,
@@ -544,7 +545,7 @@ def update_booking_status(
     Functionality: Service center updates booking status (searching->booked->completed, etc.)
     For cancellation: Provide cancellation_reason that will be visible to the user
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -590,7 +591,7 @@ def update_booking_status(
 
 @router.post("/me/bookings/{booking_id}/checkin")
 def checkin_vehicle(
-    booking_id: int,
+    booking_id: str,
     *,
     session: Session = Depends(get_session),
     current_center: ServiceCenter = Depends(get_current_active_service_center),
@@ -599,7 +600,7 @@ def checkin_vehicle(
     Mark a vehicle as checked in for breakdown & repair service.
     Functionality: Service center checks in vehicle for manual breakdown & repair services
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -626,7 +627,7 @@ def checkin_vehicle(
 
 @router.patch("/me/bookings/{booking_id}/return-date")
 def set_expected_return_date(
-    booking_id: int,
+    booking_id: str,
     expected_return_date: date = Query(...),
     expected_return_time: str = Query(...),
     *,
@@ -637,7 +638,7 @@ def set_expected_return_date(
     Set expected return date and time for breakdown & repair service.
     Functionality: Service center manually sets expected return date/time after vehicle inspection
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -679,7 +680,7 @@ def set_expected_return_date(
 
 @router.patch("/me/bookings/{booking_id}/walk-in-price-duration")
 def update_walkin_price_and_duration(
-    booking_id: int,
+    booking_id: str,
     expected_price: float = Query(..., gt=0),
     expected_return_datetime: datetime = Query(...),
     price_components: List[Dict[str, Any]] = Body(default=[]),
@@ -693,7 +694,7 @@ def update_walkin_price_and_duration(
     After 'service_accepted' status, price is locked and only datetime can be changed.
     Functionality: Service center updates walk-in service price and expected return after inspection
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -752,7 +753,7 @@ def update_walkin_price_and_duration(
 
     return {
         "message": "Walk-in service price and duration updated successfully",
-        "booking_id": booking.id,
+        "booking_id": booking.reference_id,
         "final_price": booking.final_price,
         "price_components": booking.price_components,
         "expected_return_date": booking.expected_return_date,
@@ -763,7 +764,7 @@ def update_walkin_price_and_duration(
 
 @router.patch("/me/bookings/{booking_id}/accept-service")
 def accept_walkin_service(
-    booking_id: int,
+    booking_id: str,
     *,
     session: Session = Depends(get_session),
     current_center: ServiceCenter = Depends(get_current_active_service_center),
@@ -774,7 +775,7 @@ def accept_walkin_service(
     After this, price is locked but expected_return_datetime can still be changed.
     Functionality: Service center confirms walk-in service details and locks price
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.service_center_id != current_center.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -808,7 +809,7 @@ def accept_walkin_service(
 
     return {
         "message": "Walk-in service accepted and price locked",
-        "booking_id": booking.id,
+        "booking_id": booking.reference_id,
         "status": booking.status,
         "final_price": booking.final_price,
         "price_locked": booking.price_locked,

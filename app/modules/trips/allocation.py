@@ -1,62 +1,66 @@
-from sqlmodel import Session, select, func, desc
+"""
+Driver ranking + tier-based offer cascade for Trip bookings.
+
+Each tier offers a fresh batch of three best-ranked drivers. Earlier tiers
+stay alive when the next tier launches (F1) — the first driver to click
+accept across any live tier locks the trip via the row-lock in
+``/driver/{trip_id}/accept-and-pay``. Escalation fires on either condition:
+all offers in the current tier processed, or 10 minutes elapsed since the
+tier was created.
+"""
+
 from datetime import datetime, timedelta
 from typing import List
+
+from sqlmodel import Session, desc, func, select
+
 from app.core.models import Driver, Trip, TripOffer
 from app.modules.trips.trip_service import TripService
 from app.utils.time_utils import now_ist
+
+TIER_SIZE = 3
+TIER_ESCALATION_AFTER = timedelta(minutes=10)
 
 
 def get_driver_score(
     driver: Driver, last_trip_time: datetime, active_offers_count: int
 ) -> float:
-    """
-    Calculates a score (Intelligence Algorithm) for a driver.
+    """Composite rank: rating (0–50) + idle-recency (0–50) − offer load (×25)."""
+    score = (driver.rating or 0) * 10  # rating contributes 0–50
 
-    Factors:
-    - Rating (Weighted high)
-    - Recency (Waiting longer = Higher priority)
-    - Active Offers (Already busy = Lower priority/Penalty)
-    """
-
-    # 1. Base Score from Rating (0-50 points)
-    score = (driver.rating or 0) * 10
-
-    # 2. Recency Bonus (Up to 40 points)
     if last_trip_time:
-        hours_since_last = (now_ist() - last_trip_time).total_seconds() / 3600
-
-        if hours_since_last > 168:  # > 1 week
+        hours_idle = (now_ist() - last_trip_time).total_seconds() / 3600
+        if hours_idle > 168:
             score += 40
-        elif hours_since_last > 72:  # > 3 days
+        elif hours_idle > 72:
             score += 30
-        elif hours_since_last > 24:  # > 1 day
+        elif hours_idle > 24:
             score += 20
-        elif hours_since_last > 4:  # > 4 hours
+        elif hours_idle > 4:
             score += 10
     else:
-        # New driver or no history -> High priority to engage them
+        # No history — boost so a new driver gets engaged early.
         score += 50
 
-    # 3. Load Penalty (Fairness Logic)
-    # If driver has other pending offers, reduce score to give others a chance.
     if active_offers_count > 0:
         score -= active_offers_count * 25
-
     return score
 
 
 def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
-    """
-    Returns drivers matching the vehicle type, ranked by the algorithm.
-    """
-    # Filter by vehicle and availability
-    query = select(Driver).where(
-        Driver.vehicle_type == vehicle_type, Driver.status == "available"
-    )
-    drivers = session.exec(query).all()
+    """Available drivers for the vehicle type, ranked by :func:`get_driver_score`.
 
-    # One driver = one active trip: drivers already engaged on an in-flight
-    # booking are excluded so they are never offered (or ranked for) a second.
+    Drivers already engaged on any in-flight trip (``DRIVER_BUSY_STATES``)
+    are excluded so one driver only ever holds one booking at a time.
+    """
+    drivers = session.exec(
+        select(Driver).where(
+            Driver.vehicle_type == vehicle_type, Driver.status == "available"
+        )
+    ).all()
+    if not drivers:
+        return []
+
     busy_driver_ids = set(
         session.exec(
             select(Trip.driver_id).where(
@@ -66,78 +70,54 @@ def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
         ).all()
     )
 
-    driver_scores = []
-
+    scored: list = []
     for driver in drivers:
         if driver.id in busy_driver_ids:
             continue
-
-        # Get Last Trip Time
         last_trip = session.exec(
             select(Trip.booking_time)
             .where(Trip.driver_id == driver.id)
             .order_by(desc(Trip.booking_time))
             .limit(1)
         ).first()
-
-        # Get Current Active Offers (Pending)
         active_offers = session.exec(
             select(func.count(TripOffer.id)).where(
                 TripOffer.driver_id == driver.id, TripOffer.status == "pending"
             )
         ).one()
+        scored.append((driver, get_driver_score(driver, last_trip, active_offers)))
 
-        score = get_driver_score(driver, last_trip, active_offers)
-        driver_scores.append((driver, score))
-
-    # Sort by score descending (Higher score = Better match)
-    driver_scores.sort(key=lambda x: x[1], reverse=True)
-
-    return [d[0] for d in driver_scores]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [d for d, _ in scored]
 
 
 def create_offers_for_tier(
     session: Session, trip_id: int, drivers: List[Driver], tier: int
 ):
-    """
-    Generates TripOffer records for the specified list of drivers.
-    """
+    """Insert pending TripOffer rows for the given drivers at the given tier."""
     for driver in drivers:
-        offer = TripOffer(
-            trip_id=trip_id, driver_id=driver.id, status="pending", tier=tier
+        session.add(
+            TripOffer(trip_id=trip_id, driver_id=driver.id, status="pending", tier=tier)
         )
-        session.add(offer)
     session.commit()
 
 
 def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
-    """
-    Single Trip Escalation Logic.
-    Checks if a trip should move to the next tier or be cancelled.
-    Returns True if an action was taken (escalated or cancelled).
-    """
-    TIER_SIZE = 3
+    """Move trip to the next tier if due. Auto-cancels if no drivers remain.
 
-    # 1. Determine Current Tier
+    Returns True iff something changed (new tier created or trip cancelled).
+    """
     latest_offer = session.exec(
         select(TripOffer)
         .where(TripOffer.trip_id == trip.id)
         .order_by(desc(TripOffer.tier))
         .limit(1)
     ).first()
-
     if not latest_offer:
         return False
 
     current_tier = latest_offer.tier
-    should_escalate = False
-
-    # 2. Check Conditions
-    # Condition A: Time Threshold (10 mins)
-    if (now_ist() - latest_offer.created_at) > timedelta(minutes=10):
-        should_escalate = True
-
-    # Condition B: All rejected/processed in current tier
+    age = now_ist() - latest_offer.created_at
     pending_in_tier = session.exec(
         select(func.count(TripOffer.id)).where(
             TripOffer.trip_id == trip.id,
@@ -145,64 +125,50 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
             TripOffer.status == "pending",
         )
     ).one()
+    should_escalate = age > TIER_ESCALATION_AFTER or pending_in_tier == 0
+    if not should_escalate:
+        return False
 
-    if pending_in_tier == 0:
-        should_escalate = True
+    # If a driver already accepted, stop — the row-lock at accept time will
+    # finalise the deal, no need for another tier.
+    accepted = session.exec(
+        select(func.count(TripOffer.id)).where(
+            TripOffer.trip_id == trip.id,
+            TripOffer.tier == current_tier,
+            TripOffer.status == "accepted",
+        )
+    ).one()
+    if accepted > 0:
+        return False
 
-    # 3. Execute Escalation
-    if should_escalate:
-        # Double Check: Did anyone accept?
-        accepted_count = session.exec(
-            select(func.count(TripOffer.id)).where(
-                TripOffer.trip_id == trip.id,
-                TripOffer.tier == current_tier,
-                TripOffer.status == "accepted",
-            )
-        ).one()
-        if accepted_count > 0:
-            return False  # Trip is taken, don't escalate
+    next_tier = current_tier + 1
+    ranked = rank_drivers(session, trip.vehicle_type)
 
-        next_tier = current_tier + 1
-        all_ranked_drivers = rank_drivers(session, trip.vehicle_type)
+    # Skip drivers who already have an offer on this trip (any tier, any
+    # status). Re-ranking between tiers can re-surface the same top drivers
+    # and we don't want them to see a duplicate offer they already declined.
+    already_offered = set(
+        session.exec(
+            select(TripOffer.driver_id).where(TripOffer.trip_id == trip.id)
+        ).all()
+    )
+    next_batch = [d for d in ranked if d.id not in already_offered][:TIER_SIZE]
 
-        # Calculate Next Batch
-        start = current_tier * TIER_SIZE
-        end = start + TIER_SIZE
-        next_batch = all_ranked_drivers[start:end]
+    if next_batch:
+        # Earlier-tier pending offers stay alive — first to accept wins.
+        create_offers_for_tier(session, trip.id, next_batch, next_tier)
+        return True
 
-        if next_batch:
-            # Clean up old pending offers (if any remain)
-            old_offers = session.exec(
-                select(TripOffer).where(
-                    TripOffer.trip_id == trip.id, TripOffer.status == "pending"
-                )
-            ).all()
-            for o in old_offers:
-                session.delete(o)
-
-            create_offers_for_tier(session, trip.id, next_batch, next_tier)
-            return True
-        else:
-            # --- MISSING LOGIC FIXED HERE ---
-            # No drivers left? Auto-Cancel the trip.
-            trip.status = "cancelled"
-            session.add(trip)
-            # Optionally: Clean up offers so it doesn't clutter DB
-            all_offers = session.exec(
-                select(TripOffer).where(TripOffer.trip_id == trip.id)
-            ).all()
-            for o in all_offers:
-                session.delete(o)
-
-            return True
-
-    return False
+    # Exhausted the driver pool — cancel the trip and clean up offers.
+    trip.status = "cancelled"
+    session.add(trip)
+    for o in session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all():
+        session.delete(o)
+    return True
 
 
 def process_tier_escalation(session: Session) -> int:
-    """
-    Background Task: Scans all searching trips.
-    """
+    """Scan all `searching` trips, escalate the ones that are due. Returns count."""
     active_trips = session.exec(select(Trip).where(Trip.status == "searching")).all()
     count = 0
     for trip in active_trips:

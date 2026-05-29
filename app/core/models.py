@@ -1,7 +1,7 @@
 import uuid
 import html
 from enum import Enum
-from pydantic import EmailStr, field_validator
+from pydantic import EmailStr, field_validator, AliasChoices
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta, timezone
@@ -92,6 +92,7 @@ class MechanicBase(SQLModel):
 
 class Mechanic(MechanicBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
 
     user: "User" = Relationship(back_populates="mechanic_profile")
@@ -120,7 +121,7 @@ class MechanicUpdate(SQLModel):
 
 
 class MechanicPublic(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     name: str
     # Optional: the DB column allows NULL (MechanicBase.specialization), so the
     # public response must too — otherwise serializing a mechanic without one
@@ -135,7 +136,6 @@ class MechanicPublic(SQLModel):
 class MechanicPrivate(MechanicPublic):
     phone_number: str
     address: Optional[str] = None
-    user_id: uuid.UUID
 
 
 class MechanicReviewBase(SQLModel):
@@ -196,6 +196,7 @@ class ServiceCenter(ServiceCenterBase, table=True):
     """Service center/garage profile (e.g., for vehicle service, PPF, wash, etc.)"""
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -276,12 +277,13 @@ class ServiceSlot(SQLModel, table=True):
 
 class ServiceRequest(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     service_center_id: int = Field(foreign_key="servicecenter.id")
     center_service_id: int = Field(foreign_key="centerservice.id")
 
     booking_type: BookingType = BookingType.SLOT_BASED
-    service_name: str  # REPLACED service_type
+    service_name: str
     vehicle_type: str
     vehicle_number: Optional[str] = None
     vehicle_model: Optional[str] = None
@@ -304,6 +306,7 @@ class ServiceRequest(SQLModel, table=True):
     price_at_booking: Optional[float] = None
     final_price: Optional[float] = None
     price_locked: bool = False
+    payment_status: str = "unpaid"  # synced by the centralized payment module
     price_components: List[Dict[str, Any]] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
@@ -334,7 +337,7 @@ class ServiceCenterReview(ServiceCenterReviewBase, table=True):
 
 # --- API Response Models for Service Center ---
 class ServiceCenterPublic(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     name: str
     address: str
     latitude: float
@@ -347,8 +350,7 @@ class ServiceCenterPublic(SQLModel):
 
 
 class ServiceCenterPrivate(ServiceCenterBase):
-    id: int
-    user_id: uuid.UUID
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     created_at: datetime
 
 
@@ -435,7 +437,7 @@ class ServiceRequestBase(SQLModel):
 
 
 class ServiceRequestCreate(SQLModel):
-    service_center_id: int
+    service_center_id: str  # ServiceCenter.reference_id (e.g. SC20260001)
     center_service_id: int
     booking_type: BookingType = BookingType.SLOT_BASED
     vehicle_type: str
@@ -447,10 +449,8 @@ class ServiceRequestCreate(SQLModel):
 
 
 class ServiceRequestPublic(SQLModel):
-    id: int
-    user_id: uuid.UUID
-    service_center_id: int
-    center_service_id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    payment_status: Optional[str] = None
     booking_type: BookingType
     service_name: str
     vehicle_type: str
@@ -555,6 +555,7 @@ class TripBase(SQLModel):
 
 class Trip(TripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     driver: Optional["Driver"] = Relationship(back_populates="trips")
     user: "User" = Relationship(back_populates="trips")
     offers: List["TripOffer"] = Relationship(back_populates="trip")
@@ -598,12 +599,14 @@ class MechanicTripBase(SQLModel):
         default=None, sa_column=Column(JSON)
     )
     status: str = "searching"
+    payment_status: str = "unpaid"  # synced by the centralized payment module
     booking_time: datetime = Field(default_factory=_now_ist_naive)
     state_version: int = Field(default=1)
 
 
 class MechanicTrip(MechanicTripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     mechanic: Optional["Mechanic"] = Relationship(back_populates="mechanic_trips")
     user: "User" = Relationship(back_populates="mechanic_trips")
     offers: List["MechanicOffer"] = Relationship(back_populates="trip")
@@ -629,12 +632,14 @@ class TowTripBase(SQLModel):
         default=None, sa_column=Column(JSON)
     )
     status: str = "searching"
+    payment_status: str = "unpaid"  # synced by the centralized payment module
     booking_time: datetime = Field(default_factory=_now_ist_naive)
     state_version: int = Field(default=1)
 
 
 class TowTrip(TowTripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     tow_truck_driver: Optional["TowTruckDriver"] = Relationship(
         back_populates="tow_trips"
     )
@@ -644,7 +649,7 @@ class TowTrip(TowTripBase, table=True):
 
 # --- SAFETY LAYER: RESPONSE MODELS ---
 class TripSafe(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     hiring_type: str
     vehicle_type: str
     shift_details: Optional[str] = None
@@ -677,6 +682,7 @@ class TripOfferPublic(SQLModel):
 # --- Table Models ---
 class Driver(DriverBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     rating: float = Field(default=0.0)
 
@@ -688,6 +694,7 @@ class Driver(DriverBase, table=True):
 
 class TowTruckDriver(TowTruckDriverBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
 
     user: "User" = Relationship(back_populates="tow_truck_driver_profile")
@@ -698,7 +705,7 @@ class TowTruckDriver(TowTruckDriverBase, table=True):
 
 # --- API Response Models ---
 class DriverPublic(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     name: str
     rating: float
     profile_picture_url: Optional[str] = None
@@ -710,7 +717,7 @@ class DriverPublic(SQLModel):
 
 
 class TowTruckDriverPublic(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     name: str
     rating: float
     profile_picture_url: Optional[str] = None
@@ -740,7 +747,8 @@ class TripReadUser(TripSafe):
 # apps can keep consuming the same JSON keys (including a constant `hiring_type`
 # discriminator) without any client-side change after the table split.
 class MechanicTripSafe(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    payment_status: Optional[str] = None
     hiring_type: str = "Mechanic Service"
     vehicle_type: str
     shift_details: Optional[str] = None
@@ -775,7 +783,8 @@ class MechanicOfferPublic(SQLModel):
 
 
 class TowTripSafe(SQLModel):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    payment_status: Optional[str] = None
     hiring_type: str = "Tow Service"
     vehicle_type: str
     shift_details: Optional[str] = None
@@ -810,12 +819,12 @@ class TowTripOfferPublic(SQLModel):
 
 
 class DriverPrivate(DriverBase):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     rating: float
 
 
 class TowTruckDriverPrivate(TowTruckDriverBase):
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
 
 
 # --- Update Models ---
@@ -888,6 +897,18 @@ class SystemConfig(SQLModel, table=True):
     key: str = Field(primary_key=True)  # e.g., "bike_base_fare", "car_per_km"
     value: str  # We store as string and cast later (e.g., "450.0")
     description: Optional[str] = None
+
+
+class IdSequence(SQLModel, table=True):
+    """Per-(entity_type, year) counter backing human-readable reference IDs.
+
+    See app.utils.id_generator. Incremented under a row-level lock so the
+    visible sequence stays gap-tight and monotonic within a calendar year.
+    """
+
+    entity_type: str = Field(primary_key=True)
+    year: int = Field(primary_key=True)
+    last_value: int = 0
 
 
 # --- NEW: SUPPORT TICKET SYSTEM ---
@@ -1271,7 +1292,7 @@ class LocationUpdate(SQLModel):
     longitude: float
     heading: Optional[float] = 0.0
     speed: Optional[float] = 0.0
-    trip_id: Optional[int] = None
+    trip_id: Optional[str] = None  # TowTrip/MechanicTrip reference_id
 
 
 # Used for Send OTP API
@@ -1336,17 +1357,28 @@ class UIBanner(UIBannerBase, table=True):
 # --- OTP REGISTRY ---
 class OTPRegistry(SQLModel, table=True):
     """
-    Single OTP per trip-day (Uber-style):
+    Single OTP per shift (Uber-style):
     - User receives the OTP (push/SMS).
     - User reads it out to the driver.
     - Driver enters it in the driver app, which calls /verify-otp.
-    Uniqueness: one row per (trip_id, trip_date).
+
+    Uniqueness: one row per TripAttendance (F4). Earlier the unique key was
+    (trip_id, trip_date) which broke for cross-midnight shifts — a 22:00 Mon
+    → 06:00 Tue shift either had no clear trip_date or collided with a
+    separate Tue shift on multi-shift days. Keying off attendance_id removes
+    the ambiguity entirely. `trip_date` remains for backwards-compatible
+    queries but is no longer the uniqueness anchor.
     """
 
-    __table_args__ = (UniqueConstraint("trip_id", "trip_date", name="uq_otp_trip_day"),)
+    __table_args__ = (UniqueConstraint("attendance_id", name="uq_otp_attendance"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
     trip_id: int = Field(foreign_key="trip.id", index=True)
+    # F4: nullable on the model so a backfill migration can populate rows
+    # gradually, but new rows MUST set it. otp_service enforces non-null.
+    attendance_id: Optional[int] = Field(
+        default=None, foreign_key="tripattendance.id", index=True
+    )
     trip_date: date = Field(index=True)
     otp_hash: str  # SHA-256 hash of the plain OTP (DB fallback when Redis is down)
     verified_at: Optional[datetime] = None  # Set when driver successfully verifies
@@ -1370,15 +1402,78 @@ class PaymentTransaction(SQLModel, table=True):
     payer_type: str  # "user" or "driver"
     payment_type: str  # "trip_day", "advance_20", "full_payment", "driver_acceptance"
     amount: float
-    payment_status: str  # "pending", "success", "failed", "refunded"
+    payment_status: str  # "pending", "success", "failed", "refunded", "refund_failed"
     payment_method: str  # "card", "wallet", "upi", etc (dummy for now)
     gateway_transaction_id: Optional[str] = None
+    # Distinct from gateway_transaction_id so a refund row can reference both
+    # the original charge's gateway id and the refund call's gateway id. Set
+    # by process_refund when the gateway accepts the refund (F9).
+    gateway_refund_id: Optional[str] = None
 
     created_at: datetime = Field(default_factory=_now_ist_naive)
     completed_at: Optional[datetime] = None
     refund_at: Optional[datetime] = None
     refund_amount: Optional[float] = None
     refund_reason: Optional[str] = None
+
+
+# --- CENTRALIZED PAYMENTS (polymorphic across services) ---
+class Payment(SQLModel, table=True):
+    """One payment per booking-charge across any service type.
+
+    Polymorphic link: (service_type, service_reference_id) point at the booking
+    (tow / mechanic / service_center today; trip flows still use the legacy
+    PaymentTransaction/TripBill/TripSettlement tables). ``channel`` distinguishes
+    platform-held gateway money from direct cash/UPI collected by the provider.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+
+    service_type: str = Field(index=True)  # "tow" | "mechanic" | "service_center"
+    service_reference_id: str = Field(index=True)  # booking's reference_id
+    service_id: int  # booking's internal PK (no hard FK — polymorphic)
+
+    user_id: uuid.UUID = Field(foreign_key="user.id")  # payer
+    payee_type: str = "platform"  # "platform" | "driver"
+    payee_driver_id: Optional[int] = None  # provider PK when direct-to-driver
+
+    amount: float
+    currency: str = "INR"
+    channel: str  # "platform" | "cash" | "upi_direct"
+    status: str = "created"  # created|pending|succeeded|failed|refunded|cancelled
+
+    gateway_provider: str = "mock"
+    gateway_intent_id: Optional[str] = Field(default=None, index=True)
+    gateway_transaction_id: Optional[str] = None
+    gateway_signature: Optional[str] = None
+    idempotency_key: Optional[str] = Field(default=None, index=True)
+
+    extra: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+    completed_at: Optional[datetime] = None
+
+
+class PaymentIntentCreate(SQLModel):
+    service_type: str
+    service_reference_id: str
+    channel: str = "platform"  # "platform" | "cash" | "upi_direct"
+    amount: Optional[float] = None  # derived from the booking fare when omitted
+
+
+class PaymentPublic(SQLModel):
+    """Safe payment view — exposes the reference id, never internal/gateway ids."""
+
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    service_type: str
+    service_reference_id: str
+    amount: float
+    currency: str
+    channel: str
+    status: str
+    created_at: datetime
+    completed_at: Optional[datetime] = None
 
 
 # --- PRICING COMPONENTS (for detailed billing) ---
@@ -1495,11 +1590,25 @@ class TripSettlement(SQLModel, table=True):
     # Outstation only: any additional amount the user voluntarily paid
     # on top of remaining_due (e.g. toll, parking, food reimbursements).
     extra_amount_paid: float = 0.0
+    # Itemised breakdown of `extra_amount_paid` so we have an audit trail of
+    # what each reimbursement was for (F7). Keys are restricted to
+    # {"toll", "parking", "food", "other"} and the values must sum to
+    # extra_amount_paid — both invariants are validated at /settlement/pay time.
+    extra_amount_breakdown: Optional[Dict[str, float]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
 
     settlement_date: date
     due_date: Optional[date] = None
     paid_at: Optional[datetime] = None
     generated_at: datetime = Field(default_factory=_now_ist_naive)
+    # F8 dunning bookkeeping. `dunning_stage` advances 0 → 1 (1d past due) →
+    # 2 (3d) → 3 (7d) → 4 (14d) → 5 (28d) → 6 (collections handoff at 30d).
+    # `collections_sent_at` is set when stage 6 fires so the worker doesn't
+    # re-send the handoff event each tick.
+    dunning_stage: int = 0
+    last_reminder_at: Optional[datetime] = None
+    collections_sent_at: Optional[datetime] = None
 
 
 # ============= API REQUEST/RESPONSE MODELS =============
@@ -1548,7 +1657,7 @@ class UserPublicForDriver(SQLModel):
 class TripReadDriver(SQLModel):
     """Trip rows exposed to the driver app. Excludes user UUID and internal flags."""
 
-    id: int
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     hiring_type: str
     vehicle_type: str
     shift_details: Optional[str] = None
@@ -1630,3 +1739,4 @@ class SettlementResponse(SQLModel):
     driver_payment_status: str
     payment_note: Optional[str] = None
     extra_amount_paid: float = 0.0
+    extra_amount_breakdown: Optional[Dict[str, float]] = None

@@ -1,5 +1,10 @@
 """
-Billing and Settlement Service for Trip Management
+Daily-bill generation and final settlement for trips.
+
+Daily bills exist only for ``trip_day``; advance/full-payment settle through
+upfront credit pools and the final settlement row. The payment-method
+discount is baked into the daily bill total so the user-visible amount is
+the actual amount due, not gross.
 """
 
 from datetime import date
@@ -40,9 +45,7 @@ def payment_method_discount_pct(
 
 
 class BillingService:
-    """
-    Handles bill generation and final settlement
-    """
+    """Generate per-day bills (trip_day) and the final settlement row."""
 
     def calculate_daily_bill_components(
         self, session: Session, trip_id: int, trip_date: date

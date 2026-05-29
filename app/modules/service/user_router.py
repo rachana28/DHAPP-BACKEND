@@ -21,6 +21,11 @@ from app.core.models import (
 )
 from app.core.security import get_current_user
 from app.utils.notifications import send_push_notification
+from app.utils.id_generator import (
+    generate_reference_id,
+    get_by_reference,
+    SERVICE_REQUEST,
+)
 import math
 
 router = APIRouter(prefix="/services", tags=["User Services"])
@@ -114,13 +119,13 @@ def list_service_centers(
 
 @router.get("/centers/{center_id}", response_model=ServiceCenterPublic)
 def get_service_center_details(
-    center_id: int,
+    center_id: str,
     session: Session = Depends(get_session),
 ):
     """
     Get detailed information about a specific service center.
     """
-    center = session.get(ServiceCenter, center_id)
+    center = get_by_reference(session, ServiceCenter, center_id)
     if not center:
         raise HTTPException(status_code=404, detail="Service center not found")
 
@@ -129,7 +134,7 @@ def get_service_center_details(
 
     booking_count = session.exec(
         select(func.count(ServiceRequest.id)).where(
-            ServiceRequest.service_center_id == center_id
+            ServiceRequest.service_center_id == center.id
         )
     ).one()
 
@@ -141,7 +146,7 @@ def get_service_center_details(
 
 @router.get("/centers/{center_id}/services", response_model=List[CenterServicePublic])
 def list_center_services(
-    center_id: int,
+    center_id: str,
     session: Session = Depends(get_session),
     vehicle_type: str = Query(None),
 ):
@@ -149,11 +154,11 @@ def list_center_services(
     Get all services offered by a specific service center.
     Optionally filter by vehicle type.
     """
-    center = session.get(ServiceCenter, center_id)
+    center = get_by_reference(session, ServiceCenter, center_id)
     if not center:
         raise HTTPException(status_code=404, detail="Service center not found")
 
-    query = select(CenterService).where(CenterService.service_center_id == center_id)
+    query = select(CenterService).where(CenterService.service_center_id == center.id)
 
     # Filter by vehicle type if provided
     if vehicle_type:
@@ -174,7 +179,7 @@ def list_center_services(
     response_model=List[Dict[str, Any]],
 )
 def get_available_times(
-    center_id: int,
+    center_id: str,
     service_id: int,
     target_date: date = Query(...),
     session: Session = Depends(get_session),
@@ -183,8 +188,9 @@ def get_available_times(
     Dynamically generates available start times for a given day based on service rules
     and existing bookings.
     """
+    center = get_by_reference(session, ServiceCenter, center_id)
     service = session.get(CenterService, service_id)
-    if not service or service.service_center_id != center_id:
+    if not center or not service or service.service_center_id != center.id:
         raise HTTPException(status_code=404, detail="Service not found")
 
     if service.booking_type == BookingType.WALK_IN:
@@ -250,15 +256,16 @@ def get_available_times(
 
 @router.get("/centers/{center_id}/services/{service_id}/walk-in-availability")
 def check_walk_in_availability(
-    center_id: int,
+    center_id: str,
     service_id: int,
     session: Session = Depends(get_session),
 ):
     """
     Check availability for walk-in services.
     """
+    center = get_by_reference(session, ServiceCenter, center_id)
     service = session.get(CenterService, service_id)
-    if not service or service.service_center_id != center_id:
+    if not center or not service or service.service_center_id != center.id:
         raise HTTPException(status_code=404, detail="Service not found")
 
     if service.booking_type != BookingType.WALK_IN or not service.is_walk_in_allowed:
@@ -297,13 +304,13 @@ def book_service(
         raise HTTPException(status_code=403, detail="Only users can book services")
 
     # Verify service center exists and is available
-    center = session.get(ServiceCenter, booking_data.service_center_id)
+    center = get_by_reference(session, ServiceCenter, booking_data.service_center_id)
     if not center or center.status != "available":
         raise HTTPException(status_code=404, detail="Service center not available")
 
     # Verify service exists at center
     service = session.get(CenterService, booking_data.center_service_id)
-    if not service or service.service_center_id != booking_data.service_center_id:
+    if not service or service.service_center_id != center.id:
         raise HTTPException(status_code=404, detail="Service not found at this center")
 
     # Verify vehicle type is in allowed types
@@ -421,7 +428,8 @@ def book_service(
     # Create booking with auto-accept status
     new_booking = ServiceRequest(
         user_id=current_user.id,
-        service_center_id=booking_data.service_center_id,
+        reference_id=generate_reference_id(session, SERVICE_REQUEST),
+        service_center_id=center.id,
         center_service_id=booking_data.center_service_id,
         booking_type=booking_data.booking_type,
         service_name=service.service_name,
@@ -453,7 +461,7 @@ def book_service(
         user_ids=[center.user_id],
         title="New Booking 📅",
         body=f"New {booking_type_label} booking for {service.service_name}",
-        data={"booking_id": new_booking.id, "type": "new_booking"},
+        data={"booking_id": new_booking.reference_id, "type": "new_booking"},
     )
 
     return ServiceRequestPublic(**new_booking.model_dump())
@@ -492,7 +500,7 @@ def get_my_service_bookings(
 
 @router.patch("/my-bookings/{booking_id}/cancel")
 def cancel_service_booking(
-    booking_id: int,
+    booking_id: str,
     cancellation_reason: str = Body(None, embed=True),
     *,
     background_tasks: BackgroundTasks,
@@ -503,7 +511,7 @@ def cancel_service_booking(
     Cancel a service booking and free up the slot.
     User can optionally provide cancellation reason for reference.
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -540,7 +548,7 @@ def cancel_service_booking(
             user_ids=[center.user_id],
             title="Booking Cancelled ❌",
             body="A customer cancelled their service booking",
-            data={"booking_id": booking.id, "type": "cancellation"},
+            data={"booking_id": booking.reference_id, "type": "cancellation"},
         )
 
     return {"message": "Booking cancelled successfully"}
@@ -548,7 +556,7 @@ def cancel_service_booking(
 
 @router.patch("/my-bookings/{booking_id}", response_model=ServiceRequestPublic)
 def update_service_booking(
-    booking_id: int,
+    booking_id: str,
     vehicle_number: str = Body(None, embed=True),
     vehicle_model: str = Body(None, embed=True),
     *,
@@ -560,7 +568,7 @@ def update_service_booking(
     Functionality: User can edit vehicle details before service is completed.
     Only allows editing if booking hasn't been completed or cancelled.
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -589,7 +597,7 @@ def update_service_booking(
 
 @router.post("/my-bookings/{booking_id}/review")
 def submit_service_review(
-    booking_id: int,
+    booking_id: str,
     rating: int = Query(..., ge=1, le=5),
     comment: str = Query(None),
     *,
@@ -599,7 +607,7 @@ def submit_service_review(
     """
     Submit a review for a completed service.
     """
-    booking = session.get(ServiceRequest, booking_id)
+    booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -612,7 +620,7 @@ def submit_service_review(
     existing_review = session.exec(
         select(ServiceCenterReview).where(
             ServiceCenterReview.user_id == current_user.id,
-            ServiceCenterReview.service_request_id == booking_id,
+            ServiceCenterReview.service_request_id == booking.id,
         )
     ).first()
 
@@ -625,7 +633,7 @@ def submit_service_review(
     review = ServiceCenterReview(
         service_center_id=booking.service_center_id,
         user_id=current_user.id,
-        service_request_id=booking_id,
+        service_request_id=booking.id,
         rating=rating,
         comment=comment,
     )
@@ -656,7 +664,7 @@ def submit_service_review(
 
 @router.get("/centers/{center_id}/reviews")
 def get_service_center_reviews(
-    center_id: int,
+    center_id: str,
     session: Session = Depends(get_session),
     page: int = Query(1, gt=0),
     limit: int = Query(10, gt=0, le=50),
@@ -664,14 +672,14 @@ def get_service_center_reviews(
     """
     Get all reviews for a service center.
     """
-    center = session.get(ServiceCenter, center_id)
+    center = get_by_reference(session, ServiceCenter, center_id)
     if not center:
         raise HTTPException(status_code=404, detail="Service center not found")
 
     offset = (page - 1) * limit
     reviews = session.exec(
         select(ServiceCenterReview)
-        .where(ServiceCenterReview.service_center_id == center_id)
+        .where(ServiceCenterReview.service_center_id == center.id)
         .order_by(desc(ServiceCenterReview.created_at))
         .offset(offset)
         .limit(limit)

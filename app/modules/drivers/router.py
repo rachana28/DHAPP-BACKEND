@@ -16,6 +16,7 @@ from app.core.models import (
 )
 from app.core.security import get_current_active_driver
 from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
+from app.utils.id_generator import get_by_reference
 
 router = APIRouter(prefix="/drivers", tags=["Drivers"])
 
@@ -119,7 +120,7 @@ def read_drivers(
 
 @router.get("/{driver_id}", response_model=DriverPublic)
 def read_driver(
-    driver_id: int,
+    driver_id: str,
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):
@@ -131,12 +132,12 @@ def read_driver(
         if cached_driver:
             return json.loads(cached_driver)
 
-    driver = session.get(Driver, driver_id)
+    driver = get_by_reference(session, Driver, driver_id)
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     trip_count = session.exec(
-        select(func.count(Trip.id)).where(Trip.driver_id == driver_id)
+        select(func.count(Trip.id)).where(Trip.driver_id == driver.id)
     ).one()
 
     public_driver = DriverPublic(**driver.model_dump(), total_trips=trip_count)
@@ -151,7 +152,7 @@ def read_driver(
 
 @router.get("/{driver_id}/reviews", response_model=List[DriverReview])
 def get_driver_reviews(
-    driver_id: int,
+    driver_id: str,
     session: Session = Depends(get_session),
     page: int = Query(1, gt=0),
     limit: int = Query(5, gt=0, le=50),
@@ -159,14 +160,14 @@ def get_driver_reviews(
     """
     Get reviews for a specific driver with pagination.
     """
-    driver = session.get(Driver, driver_id)
+    driver = get_by_reference(session, Driver, driver_id)
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     offset = (page - 1) * limit
     reviews = session.exec(
         select(DriverReview)
-        .where(DriverReview.driver_id == driver_id)
+        .where(DriverReview.driver_id == driver.id)
         .order_by(desc(DriverReview.created_at))
         .offset(offset)
         .limit(limit)

@@ -839,3 +839,101 @@ async def auto_resolve_paused_trips_scheduler():
                     pass
     except Exception as e:
         logger.error(f"Paused-trip resolver scheduler failed: {str(e)}")
+
+
+# Dunning ladder (F8). Day offsets are measured from settlement.due_date
+# (falling back to settlement_date if due_date is unset). Each entry is the
+# stage marker we set on advance, plus the push title/body shown to the user.
+# Stage 6 is the collections handoff and skips the push because the SupportTicket
+# adapter handles that side.
+_DUNNING_LADDER = [
+    (1, 1, "Payment reminder", "Your trip settlement is due. Please clear it today."),
+    (3, 2, "Payment reminder", "Your trip settlement is 3 days overdue."),
+    (
+        7,
+        3,
+        "Action required",
+        "Your trip settlement is a week overdue. Please pay to keep your account active.",
+    ),
+    (
+        14,
+        4,
+        "Final reminder",
+        "Your trip settlement is two weeks overdue. Pay before this is escalated.",
+    ),
+    (
+        28,
+        5,
+        "Pre-collections notice",
+        "Your settlement will be sent to collections in 2 days if unpaid.",
+    ),
+    (30, 6, None, None),  # collections handoff
+]
+
+
+async def dunning_scheduler():
+    """Run nightly (~09:00 IST). Advance overdue settlements down the dunning
+    ladder, push reminders to the user, and hand off to collections at 30 days.
+    """
+    try:
+        with Session(engine) as session:
+            today = today_ist()
+            unpaid = session.exec(
+                select(TripSettlement).where(
+                    TripSettlement.user_payment_status != "paid",
+                    TripSettlement.remaining_due > 0,
+                )
+            ).all()
+
+            from app.services.collections import send_to_collections
+
+            for settlement in unpaid:
+                reference = settlement.due_date or settlement.settlement_date
+                if reference is None:
+                    continue
+                days_overdue = (today - reference).days
+                if days_overdue <= 0:
+                    continue
+
+                # Pick the latest ladder entry the settlement has reached but
+                # not yet been advanced past. Iterate in order — the loop
+                # advances at most one stage per nightly run so push fatigue
+                # stays bounded.
+                target_stage = None
+                for threshold_days, stage, title, body in _DUNNING_LADDER:
+                    if days_overdue < threshold_days:
+                        break
+                    if stage <= settlement.dunning_stage:
+                        continue
+                    target_stage = (threshold_days, stage, title, body)
+                    break
+
+                if not target_stage:
+                    continue
+                threshold_days, stage, title, body = target_stage
+
+                if stage == 6:
+                    send_to_collections(session, settlement, days_overdue)
+                else:
+                    try:
+                        send_push_notification(
+                            session=session,
+                            user_ids=[settlement.user_id],
+                            title=title,
+                            body=body,
+                            data={
+                                "type": "settlement_overdue",
+                                "trip_id": settlement.trip_id,
+                                "settlement_id": settlement.id,
+                                "days_overdue": days_overdue,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                settlement.dunning_stage = stage
+                settlement.last_reminder_at = now_ist()
+                session.add(settlement)
+                session.commit()
+    except Exception as e:
+        logger.error(f"Dunning scheduler failed: {str(e)}")

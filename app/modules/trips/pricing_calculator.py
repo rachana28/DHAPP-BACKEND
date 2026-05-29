@@ -11,7 +11,8 @@ actual charge cannot diverge.
 Pricing factors:
   - Hiring type (Daily / Monthly / Outstation) — different base + duration model
   - No. of days + hours/day (parsed from shift_details)
-  - Night surcharge if booking_time falls in the configured night window
+  - Night surcharge if the SHIFT start time falls in the configured night window
+    (falls back to booking_time only when shift_details has no clock bracket)
   - Driver allowance (per-day)
   - Distance (Outstation only)
   - State permit (Outstation only, when start_state != end_state)
@@ -81,6 +82,7 @@ def _veh_key(vehicle_type: Optional[str]) -> str:
     if not vehicle_type:
         return ""
     return vehicle_type.strip().lower().replace(" ", "_").replace("-", "_")
+
 
 # All Indian states + UTs. Admin can change permit fees via:
 #   POST /admin/system-config?key=state_permit_<state>&value=<inr>
@@ -204,6 +206,79 @@ def extract_state_from_location(location: Optional[str]) -> Optional[str]:
     return None
 
 
+def _reverse_geocode_state(
+    lat: Optional[float], lng: Optional[float], timeout_sec: float = 3.0
+) -> Optional[str]:
+    """Best-effort reverse geocode via OpenStreetMap Nominatim (F10).
+
+    Used as a fallback when the free-form ``end_location`` text doesn't contain
+    a recognizable Indian state/UT name. Returns a normalised state key (e.g.
+    ``"karnataka"``) or None if the network call fails / Nominatim returns
+    nothing usable. The caller is responsible for short timeouts — we keep the
+    request synchronous because fare calculation is already inside a request
+    path and a 3-second worst case is preferable to silently mis-billing.
+    """
+    if lat is None or lng is None:
+        return None
+    try:
+        import requests
+
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={
+                "lat": lat,
+                "lon": lng,
+                "format": "json",
+                "zoom": 5,
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": "dhapp-backend/state-resolver"},
+            timeout=timeout_sec,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json() or {}
+        state_name = (data.get("address") or {}).get("state")
+        if not state_name:
+            return None
+        # Run the result through the same word-boundary matcher so we end up
+        # with a canonical key (or None if Nominatim returned something we
+        # don't have a permit row for).
+        return extract_state_from_location(state_name)
+    except Exception:
+        return None
+
+
+def resolve_end_state(
+    end_location: Optional[str],
+    end_lat: Optional[float],
+    end_lng: Optional[float],
+    session: Optional[Session] = None,
+    redis_client: Optional[redis.Redis] = None,
+) -> Optional[str]:
+    """Resolve the end-state key for permit calculation (F10).
+
+    Priority:
+      1. Text parse of ``end_location`` (cheap, offline).
+      2. Reverse-geocode the ``end_lat`` / ``end_lng`` via Nominatim — gated
+         behind SystemConfig flag ``enable_reverse_geocode`` (default ON).
+      3. None — caller falls back to the default permit fee.
+
+    The flag exists so ops can disable the network hop in case Nominatim is
+    rate-limiting us, without redeploying.
+    """
+    key = extract_state_from_location(end_location)
+    if key:
+        return key
+    if session is not None:
+        enabled = _get_config_value(
+            session, redis_client, "enable_reverse_geocode", 1.0
+        )
+        if enabled <= 0:
+            return None
+    return _reverse_geocode_state(end_lat, end_lng)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config lookup
 # ──────────────────────────────────────────────────────────────────────────────
@@ -323,6 +398,30 @@ def _parse_hours_per_day(shift_details: Optional[str]) -> int:
     return 8
 
 
+_SHIFT_START_RE = re.compile(r"\((\d{1,2}):(\d{2})\)")
+
+
+def _parse_shift_start_hour(shift_details: Optional[str]) -> Optional[int]:
+    """Parse the bracketed clock time in shift_details: '8 Hours (15:00)' → 15.
+
+    Returns None if absent / unparseable so callers can fall back to a default.
+    Used by the night-surcharge check so the surcharge keys off when the SHIFT
+    actually runs, not when the customer happened to tap 'book'.
+    """
+    if not shift_details:
+        return None
+    m = _SHIFT_START_RE.search(shift_details)
+    if not m:
+        return None
+    try:
+        h = int(m.group(1))
+        if 0 <= h <= 23:
+            return h
+    except ValueError:
+        pass
+    return None
+
+
 def _num_days(
     hiring_type: str,
     start_date: Optional[date],
@@ -385,12 +484,11 @@ def _num_days(
     return max(count, 1)
 
 
-def _is_night(booking_time: datetime, night_start: int, night_end: int) -> bool:
+def _is_night_hour(hour: int, night_start: int, night_end: int) -> bool:
     """Wraps midnight: 'night' = [night_start, 24) ∪ [0, night_end)."""
-    h = booking_time.hour
     if night_start <= night_end:
-        return night_start <= h < night_end
-    return h >= night_start or h < night_end
+        return night_start <= hour < night_end
+    return hour >= night_start or hour < night_end
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -464,7 +562,13 @@ def calculate_fare(
         distance_km, start_lat, start_lng, end_lat, end_lng
     )
     start_state_key = extract_state_from_location(start_location)
-    end_state_key = extract_state_from_location(end_location)
+    # End state drives the permit fee; use reverse-geocode as fallback when
+    # the text doesn't contain a recognisable state name (F10). Start state is
+    # text-only — start_lat/lng usually points at the user's pickup which is
+    # less ambiguous and we don't want two network hops per estimate.
+    end_state_key = resolve_end_state(
+        end_location, end_lat, end_lng, session=session, redis_client=redis_client
+    )
 
     # ── Hiring-type-specific base + duration ─────────────────────────────────
     if htype == "monthly":
@@ -563,17 +667,26 @@ def calculate_fare(
         )
         subtotal += allowance
 
-    # ── Night surcharge (booking falls in night window) ──────────────────────
+    # ── Night surcharge ──────────────────────────────────────────────────────
+    # Pricing keys off when the SHIFT runs, not when the customer tapped 'book'.
+    # A 14:00 booking for a 23:00 shift should still pay the night surcharge.
+    # Source of truth: the "(HH:MM)" bracket inside shift_details (e.g.
+    # "8 Hours (15:00)"). Outstation has no shift_details — we then fall back
+    # to booking_time.hour so legacy fare quotes keep their behaviour.
     night_start = int(cfg("pricing_night_start_hour"))
     night_end = int(cfg("pricing_night_end_hour"))
-    is_night = _is_night(booking_time, night_start, night_end)
+    shift_start_hour = _parse_shift_start_hour(shift_details)
+    surcharge_hour = (
+        shift_start_hour if shift_start_hour is not None else booking_time.hour
+    )
+    is_night = _is_night_hour(surcharge_hour, night_start, night_end)
     if is_night:
         pct = cfg("pricing_night_surcharge_pct")
         surcharge = round(subtotal * (pct / 100.0), 2)
         if surcharge > 0:
             components.append(
                 {
-                    "name": f"Night Surcharge ({pct:.0f}% — booked after {night_start:02d}:00)",
+                    "name": f"Night Surcharge ({pct:.0f}% — shift starts after {night_start:02d}:00)",
                     "amount": surcharge,
                 }
             )

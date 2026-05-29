@@ -22,6 +22,7 @@ from app.modules.towing.tow_allocation import (
     attempt_tow_trip_escalation,
 )
 from app.utils.notifications import send_push_notification
+from app.utils.id_generator import generate_reference_id, get_by_reference, TOW_TRIP
 from fastapi import BackgroundTasks
 
 router = APIRouter(prefix="/tow-trips", tags=["Tow Trips"])
@@ -40,6 +41,7 @@ def create_tow_booking_request(
     trip_data.pop("hiring_type", None)  # discriminator no longer stored
 
     db_trip = TowTrip.model_validate(trip_data)
+    db_trip.reference_id = generate_reference_id(session, TOW_TRIP)
 
     session.add(db_trip)
     session.commit()
@@ -94,7 +96,7 @@ def get_my_tow_bookings(
 
 @router.post("/{trip_id}/cancel")
 def cancel_tow_trip(
-    trip_id: int,
+    trip_id: str,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
@@ -102,7 +104,7 @@ def cancel_tow_trip(
     """
     Cancels a Tow Trip and removes all associated offers.
     """
-    trip = session.get(TowTrip, trip_id)
+    trip = get_by_reference(session, TowTrip, trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
@@ -144,7 +146,7 @@ def cancel_tow_trip(
             user_ids=[driver_user_id_to_notify],
             title="Trip Cancelled ❌",
             body="The customer has cancelled this request.",
-            data={"trip_id": trip.id, "type": "cancellation"},
+            data={"trip_id": trip.reference_id, "type": "cancellation"},
         )
 
     return {"message": "Tow trip cancelled successfully"}
@@ -182,16 +184,14 @@ def accept_tow_offer(
     # CRITICAL: Lock the Trip Row
     try:
         # This query will WAIT if another driver is currently trying to accept the same trip
-        statement = (
-            select(TowTrip).where(TowTrip.id == offer.trip_id).with_for_update()
-        )
+        statement = select(TowTrip).where(TowTrip.id == offer.trip_id).with_for_update()
         trip = session.exec(statement).one()
     except NoResultFound:
         raise HTTPException(404, "Trip not found")
 
     # Safe Status Check (Guaranteed by Lock)
     if trip.status != "searching":
-        session.rollback() # Release lock immediately
+        session.rollback()  # Release lock immediately
         raise HTTPException(400, "Trip already taken by another driver")
 
     trip.tow_truck_driver_id = current_driver.id
@@ -218,12 +218,12 @@ def accept_tow_offer(
             user_ids=[trip.user_id],  # Pass as list
             title="Tow Truck Confirmed! 🚛",
             body=f"{current_driver.name} is on the way.",
-            data={"trip_id": trip.id, "screen": "tracking"},
+            data={"trip_id": trip.reference_id, "screen": "tracking"},
         )
     except Exception as e:
         print(f"Notification error: {e}")
 
-    return {"message": "Trip accepted", "trip_id": trip.id}
+    return {"message": "Trip accepted", "trip_id": trip.reference_id}
 
 
 @router.post("/driver/reject-offer/{offer_id}")
