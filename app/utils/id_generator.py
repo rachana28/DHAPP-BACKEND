@@ -34,6 +34,9 @@ TOW_DRIVER = "tow_driver"
 MECHANIC = "mechanic"
 SERVICE_CENTER = "service_center"
 PAYMENT = "payment"
+ADDRESS = "address"
+CARD = "card"
+WALLET_TXN = "wallet_txn"
 
 # entity -> (prefix, zero-pad width)
 _SCHEME = {
@@ -46,6 +49,9 @@ _SCHEME = {
     MECHANIC: ("MN", 4),
     SERVICE_CENTER: ("SC", 4),
     PAYMENT: ("PAY", 6),
+    ADDRESS: ("ADR", 4),
+    CARD: ("CRD", 4),
+    WALLET_TXN: ("WTX", 6),
 }
 
 # Trip hiring_type -> subtype segment

@@ -15,6 +15,7 @@ from app.core.models import (
     TowTripOfferPublic,
     User,
 )
+from app.modules.payments.service import refund_booking_payments
 from app.core.security import get_current_user, get_current_active_tow_truck_driver
 from app.modules.towing.tow_allocation import (
     rank_tow_drivers,
@@ -138,6 +139,15 @@ def cancel_tow_trip(
         session.delete(offer)
 
     session.commit()
+
+    refund_booking_payments(
+        session,
+        "tow",
+        trip.reference_id,
+        reason="Booking cancelled by user",
+        actor="user",
+        actor_id=str(current_user.id),
+    )
 
     if driver_user_id_to_notify:
         background_tasks.add_task(

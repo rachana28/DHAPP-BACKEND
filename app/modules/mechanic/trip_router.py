@@ -28,6 +28,7 @@ from app.utils.id_generator import (
     get_by_reference,
     MECHANIC_TRIP,
 )
+from app.modules.payments.service import refund_booking_payments
 
 router = APIRouter(prefix="/mechanic-trips", tags=["Mechanic Trips"])
 
@@ -139,6 +140,15 @@ def cancel_mechanic_trip(
         session.delete(offer)
 
     session.commit()
+
+    refund_booking_payments(
+        session,
+        "mechanic",
+        trip.reference_id,
+        reason="Booking cancelled by user",
+        actor="user",
+        actor_id=str(current_user.id),
+    )
 
     if mechanic_user_id_to_notify:
         background_tasks.add_task(

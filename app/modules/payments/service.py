@@ -24,6 +24,7 @@ from sqlmodel import Session, select
 from app.core.models import (
     Payment,
     PaymentIntentCreate,
+    SavedCard,
     TowTrip,
     MechanicTrip,
     ServiceRequest,
@@ -32,6 +33,7 @@ from app.core.models import (
     Mechanic,
     User,
 )
+from app.modules.wallet import service as wallet_service
 from app.modules.payments import gateway
 from app.services.audit_log import emit_event as audit_emit
 from app.utils.id_generator import (
@@ -45,7 +47,8 @@ from app.utils.id_generator import (
 from app.utils.time_utils import now_ist
 
 DIRECT_CHANNELS = {"cash", "upi_direct"}
-ALL_CHANNELS = {"platform"} | DIRECT_CHANNELS
+
+ALL_CHANNELS = {"platform", "wallet"} | DIRECT_CHANNELS
 
 # service_type -> how to resolve the booking, its amount, and its provider.
 _SERVICE_MAP: Dict[str, Dict[str, Any]] = {
@@ -93,6 +96,14 @@ def _derive_amount(booking, cfg: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _validate_card_reference(session: Session, user: User, card_reference: str) -> str:
+    """Ensure a saved-card reference belongs to the payer and is active."""
+    card = get_by_reference(session, SavedCard, card_reference)
+    if not card or card.user_id != user.id or not card.is_active:
+        raise HTTPException(400, "Invalid card reference")
+    return card_reference
+
+
 def create_payment_intent(
     session: Session,
     user: User,
@@ -123,7 +134,7 @@ def create_payment_intent(
 
     provider_attr = cfg["provider_attr"]
     payee_driver_id = getattr(booking, provider_attr, None) if provider_attr else None
-    payee_type = "platform" if data.channel == "platform" else "provider"
+    payee_type = "platform" if data.channel in ("platform", "wallet") else "provider"
 
     payment = Payment(
         reference_id=generate_reference_id(session, PAYMENT),
@@ -152,7 +163,28 @@ def create_payment_intent(
         payment.gateway_intent_id = intent["intent_id"]
         payment.status = "pending"
         client_secret = intent["client_secret"]
-        payment.extra = {"client_secret": client_secret}
+        extra: Dict[str, Any] = {"client_secret": client_secret}
+        card_ref = getattr(data, "card_reference_id", None)
+        if card_ref:
+            extra["card_reference"] = _validate_card_reference(session, user, card_ref)
+        payment.extra = extra
+    elif data.channel == "wallet":
+        if getattr(booking, "payment_status", None) == "paid":
+            raise HTTPException(400, "Booking is already paid")
+
+        wallet_amount = _derive_amount(booking, cfg)
+        if not wallet_amount or wallet_amount <= 0:
+            raise HTTPException(400, "Could not determine a positive payment amount")
+        wallet_amount = round(float(wallet_amount), 2)
+        payment.amount = wallet_amount
+
+        wallet_txn = wallet_service.debit_for_payment(
+            session, user, wallet_amount, payment
+        )
+        payment.status = "succeeded"
+        payment.completed_at = now_ist()
+        payment.extra = {"wallet_txn_reference": wallet_txn.reference_id}
+        _sync_booking(session, payment)
     else:
         # Direct cash/UPI: awaits provider confirmation via mark-paid.
         payment.status = "created"
@@ -160,6 +192,20 @@ def create_payment_intent(
     session.add(payment)
     session.commit()
     session.refresh(payment)
+
+    if data.channel == "wallet":
+        audit_emit(
+            "payment.wallet_debited",
+            trip_id=None,
+            actor="user",
+            actor_id=str(user.id),
+            payload={
+                "payment_reference": payment.reference_id,
+                "service_type": data.service_type,
+                "service_reference_id": data.service_reference_id,
+                "amount": payment.amount,
+            },
+        )
 
     audit_emit(
         "payment.intent_created",
@@ -197,6 +243,8 @@ def handle_webhook(
         select(Payment).where(Payment.gateway_intent_id == intent_id).with_for_update()
     ).first()
     if not payment:
+        if wallet_service.confirm_topup(session, intent_id):
+            return {"status": "ok", "kind": "wallet_topup"}
         raise HTTPException(404, "Unknown payment intent")
 
     if payment.status == "succeeded":
@@ -326,3 +374,126 @@ def _sync_booking(session: Session, payment: Payment) -> None:
             "payment_reference": payment.reference_id,
         },
     )
+
+
+def refund_payment(
+    session: Session,
+    payment: Payment,
+    reason: Optional[str] = None,
+    *,
+    actor: str = "admin",
+    actor_id: Optional[str] = None,
+) -> Payment:
+    """Refund a succeeded payment.
+
+    Routing (per product decision): a payment made FROM the wallet is refunded
+    back INTO the wallet; gateway (platform) refunds go to the original source;
+    cash/upi_direct are settled offline by the provider. Idempotent on an
+    already-refunded payment.
+    """
+    if payment.status == "refunded":
+        return payment
+    if payment.status != "succeeded":
+        raise HTTPException(400, "Only succeeded payments can be refunded")
+
+    if payment.channel == "wallet":
+        payer = session.get(User, payment.user_id)
+        if not payer:
+            raise HTTPException(404, "Payer not found for wallet refund")
+        from app.modules.wallet import service as wallet_service
+
+        wallet_service.credit(
+            session,
+            payer,
+            payment.amount,
+            source="refund",
+            note=reason or "Booking refund",
+            payment_reference=payment.reference_id,
+            related_service_type=payment.service_type,
+            related_service_reference_id=payment.service_reference_id,
+            enforce_cap=False,
+            allow_inactive=True,
+        )
+    elif payment.channel == "platform":
+        payment.gateway_transaction_id = (
+            payment.gateway_transaction_id or f"REFUND_{payment.reference_id}"
+        )
+    # cash / upi_direct: money never flowed through us; provider returns it.
+
+    payment.status = "refunded"
+    payment.updated_at = now_ist()
+    payment.extra = {**(payment.extra or {}), "refund_reason": reason}
+    session.add(payment)
+
+    # Reflect the reversal on the linked booking.
+    cfg = _cfg(payment.service_type)
+    booking = session.get(cfg["model"], payment.service_id)
+    if booking:
+        booking.payment_status = "refunded"
+        session.add(booking)
+
+    session.commit()
+    session.refresh(payment)
+
+    audit_emit(
+        "payment.refunded",
+        trip_id=None,
+        actor=actor,
+        actor_id=actor_id,
+        payload={
+            "payment_reference": payment.reference_id,
+            "channel": payment.channel,
+            "amount": payment.amount,
+            "reason": reason,
+        },
+    )
+    return payment
+
+
+def refund_booking_payments(
+    session: Session,
+    service_type: str,
+    service_reference_id: str,
+    reason: Optional[str] = None,
+    *,
+    actor: str = "user",
+    actor_id: Optional[str] = None,
+    channels: Optional[set] = None,
+) -> list:
+    """Best-effort refund of a cancelled booking's succeeded payments.
+
+    Called from the tow / mechanic / service cancellation endpoints. By default
+    (``channels={"wallet"}``) only wallet-paid charges are auto-refunded — they
+    return to the wallet instantly — while gateway/cash refunds stay a manual
+    admin action (unchanged behaviour). A refund failure NEVER blocks the
+    cancellation: it is logged and skipped. Returns the refunded references.
+    """
+    if channels is None:
+        channels = {"wallet"}
+
+    payments = session.exec(
+        select(Payment).where(
+            Payment.service_type == service_type,
+            Payment.service_reference_id == service_reference_id,
+            Payment.status == "succeeded",
+        )
+    ).all()
+
+    refunded = []
+    for p in payments:
+        if p.channel not in channels:
+            continue
+        try:
+            refund_payment(session, p, reason, actor=actor, actor_id=actor_id)
+            refunded.append(p.reference_id)
+        except Exception:
+            session.rollback()
+            audit_emit(
+                "payment.refund_failed",
+                trip_id=None,
+                actor=actor,
+                actor_id=actor_id,
+                payload={"payment_reference": p.reference_id, "reason": reason},
+                severity="warning",
+            )
+    return refunded
