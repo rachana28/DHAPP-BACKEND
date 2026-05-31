@@ -16,6 +16,7 @@ import json
 import os
 import uuid
 from typing import Any, Dict, Optional, Tuple
+from app.utils import card_utils
 
 # In production set PAYMENT_GATEWAY_WEBHOOK_SECRET to the provider's signing key.
 _SECRET = os.environ.get("PAYMENT_GATEWAY_WEBHOOK_SECRET", "mock_dev_secret")
@@ -35,6 +36,34 @@ def create_intent(
         "currency": currency,
         "status": "requires_confirmation",
         "metadata": metadata or {},
+    }
+
+
+def tokenize_card(
+    card_number: str,
+    exp_month: int,
+    exp_year: int,
+    cvv: str,
+    holder_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Mock tokenization vault — mimics a real gateway's card-vault call.
+
+    Returns ONLY the safe handle (token + fingerprint + last4 + brand). The raw
+    PAN and CVV are consumed here and never returned, stored, or logged.
+
+    The ``fingerprint`` is a stable, non-reversible hash of the PAN so the same
+    physical card can be de-duplicated without storing the number. In real
+    production, tokenization should happen client-side via the provider SDK so
+    the PAN never reaches our server; this mirrors that contract for the mock.
+    """
+
+    digits = "".join(ch for ch in card_number if ch.isdigit())
+    fingerprint = hashlib.sha256(f"{_SECRET}:{digits}".encode()).hexdigest()[:24]
+    return {
+        "card_token": f"tok_mock_{uuid.uuid4().hex[:24]}",
+        "fingerprint": fingerprint,
+        "last4": card_utils.last4(digits),
+        "brand": card_utils.detect_brand(digits),
     }
 
 

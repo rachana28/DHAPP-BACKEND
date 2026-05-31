@@ -1,27 +1,50 @@
 """
-Payment service for trip flow.
+Trip payment service — a thin, trip-aware wrapper over the centralized Payment
+ledger (app.modules.payments.service).
 
-Wraps the (dummy) payment gateway with the rules that make trip billing safe:
-row-level locks on bills + settlements, gateway-style refund accounting,
-audit emission on every money-touching commit, and a single funnel through
-which both user and driver transactions flow.
+Each trip charge becomes one ``Payment`` row carrying a ``purpose`` and a
+``payer_type``; the gateway call, wallet debit, and refunds are all owned by the
+central service. This module keeps the trip-specific concerns: resolving the
+driver's User for the driver-paid acceptance fee, the cancel/abandon refund
+maths, the outstanding-dues gates, and the OTP-pause logic. The post-payment
+side effects (settling a TripBill, unblocking OTP, generating the schedule,
+closing a settlement) live in app.modules.trips.payment_orchestrator and fire
+identically on the sync (wallet/cash) and async (platform webhook) paths.
 """
 
-from app.utils.time_utils import now_ist
 from typing import Optional, Tuple
 from sqlmodel import Session, select
+from fastapi import HTTPException
 import redis
-import uuid
 
 from app.core.models import (
     Trip,
-    PaymentTransaction,
+    Payment,
     TripAttendance,
     TripBill,
     TripSettlement,
     SystemConfig,
+    Driver,
+    User,
 )
 from app.services.audit_log import emit_event as audit_emit
+
+# A trip charge counts as paid-in while succeeded or partially refunded.
+_PAID_IN_STATES = ["succeeded", "partially_refunded"]
+
+
+def _resolve_driver_user(session: Session, driver_id: int) -> Optional[User]:
+    """The User account behind a Driver PK (driver-paid charges debit/refund it)."""
+    return session.exec(
+        select(User).join(Driver, Driver.user_id == User.id).where(Driver.id == driver_id)
+    ).first()
+
+
+def _bill_purpose(bill: TripBill) -> str:
+    """Map a bill's type to the Payment.purpose the orchestrator dispatches on."""
+    if bill.bill_type in ("daily_bill", "cancellation_balance", "schedule_diff"):
+        return bill.bill_type
+    return "daily_bill"
 
 # Key in SystemConfig table (admin-editable via /admin/system-config).
 DRIVER_ACCEPTANCE_FEE_KEY = "driver_acceptance_fee"
@@ -70,164 +93,109 @@ class PaymentService:
     def __init__(self, redis_client: Optional[redis.Redis] = None):
         self.redis = redis_client
 
-    def process_dummy_payment(
-        self,
-        amount: float,
-        payer_id: str,
-        payer_type: str,  # "user" or "driver"
-        payment_method: str = "card",
-    ) -> Tuple[bool, str]:
-        """Mock payment gateway. Replace with Razorpay/Stripe behind the same shape.
-
-        Returns ``(success, transaction_id_or_error)``. Non-positive amounts
-        are rejected so a misconfigured caller surfaces fast.
-        """
-        if amount <= 0:
-            return False, "Invalid amount"
-        transaction_id = f"TXN_{payer_type}_{payer_id}_{uuid.uuid4().hex[:8]}"
-        return True, transaction_id
-
-    def process_dummy_refund(
-        self,
-        original_gateway_transaction_id: Optional[str],
-        amount: float,
-        payer_type: str,
-    ) -> Tuple[bool, Optional[str]]:
-        """Mock the gateway refund API call (F9).
-
-        Real gateways (Razorpay/Stripe) accept the original charge id + amount
-        and return a refund id. We mirror that shape so the caller code is
-        gateway-agnostic. Today every non-zero refund succeeds with a synthetic
-        id; tomorrow this gets swapped for the real client without changing
-        :meth:`process_refund` or :meth:`refund_driver_acceptance_fee`.
-
-        Returns ``(success, gateway_refund_id_or_error)``.
-        """
-        if amount <= 0:
-            return False, "Invalid refund amount"
-        # When the original charge has no gateway id we still issue a refund id
-        # so the audit trail records the attempt; a real adapter would 4xx here.
-        suffix = uuid.uuid4().hex[:10]
-        refund_id = f"RFND_{payer_type}_{suffix}"
-        if original_gateway_transaction_id:
-            refund_id = f"{refund_id}_for_{original_gateway_transaction_id[:18]}"
-        return True, refund_id
-
     def driver_accept_payment(
-        self, session: Session, trip_id: int, driver_id: int
-    ) -> Tuple[bool, Optional[str]]:
-        """Driver pays the acceptance fee to lock the trip."""
+        self,
+        session: Session,
+        trip_id: int,
+        driver_id: int,
+        *,
+        channel: str = "platform",
+        card_reference_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
+        """Charge the driver acceptance fee on the central ledger.
+
+        Returns ``(payment, client_secret, error)``. For wallet/cash the fee
+        settles synchronously and the orchestrator flips driver_payment_status
+        to "paid" + arms the trip; for platform it stays pending until the
+        gateway webhook fires that same hook. ``client_secret`` is set only for
+        platform charges."""
+        from app.modules.payments import service as central
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
-                return False, "Trip not found"
-
+                return None, None, "Trip not found"
             if trip.driver_id != driver_id:
-                return False, "Driver not matched to this trip"
-
+                return None, None, "Driver not matched to this trip"
             if trip.driver_payment_status != "unpaid":
-                return False, f"Driver payment already {trip.driver_payment_status}"
+                return None, None, f"Driver payment already {trip.driver_payment_status}"
+
+            driver_user = _resolve_driver_user(session, driver_id)
+            if not driver_user:
+                return None, None, "Driver account not found"
 
             fee = get_driver_acceptance_fee(session, self.redis)
-
-            success, txn_id = self.process_dummy_payment(
+            payment, client_secret = central.create_trip_payment_intent(
+                session,
+                trip=trip,
+                purpose="driver_acceptance",
                 amount=fee,
-                payer_id=str(driver_id),
                 payer_type="driver",
+                payer_user=driver_user,
+                payer_driver_id=driver_id,
+                channel=channel,
+                card_reference_id=card_reference_id,
+                idempotency_key=idempotency_key,
             )
-            if not success:
-                return False, f"Payment failed: {txn_id}"
-
-            payment_txn = PaymentTransaction(
-                trip_id=trip_id,
-                driver_id=driver_id,
-                payer_type="driver",
-                payment_type="driver_acceptance",
-                amount=fee,
-                payment_status="success",
-                payment_method="card",
-                gateway_transaction_id=txn_id,
-                completed_at=now_ist(),
-            )
-            session.add(payment_txn)
-
-            trip.driver_payment_status = "paid"
-            trip.driver_payment_amount = fee
-            session.add(trip)
-            session.commit()
-
-            audit_emit(
-                "payment.driver_acceptance",
-                trip_id=trip_id,
-                actor="driver",
-                actor_id=str(driver_id),
-                payload={
-                    "amount": fee,
-                    "gateway_transaction_id": txn_id,
-                    "payment_method": "card",
-                },
-            )
-            return True, None
-
+            return payment, client_secret, None
+        except HTTPException as e:
+            return None, None, e.detail
         except Exception as e:
-            return False, f"Driver payment processing failed: {str(e)}"
+            return None, None, f"Driver payment processing failed: {str(e)}"
 
     def user_make_payment(
         self,
         session: Session,
-        trip_id: int,
-        user_id: str,
+        trip: Trip,
+        user: User,
         amount: float,
-        payment_method: str = "card",
-    ) -> Tuple[bool, Optional[str]]:
-        """User upfront / advance / settlement payment."""
+        *,
+        channel: str = "platform",
+        card_reference_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
+        """User upfront (advance_20 / full_payment) charge on the central ledger.
+
+        Returns ``(payment, client_secret, error)``. For wallet the upfront
+        settles synchronously and the orchestrator un-blocks the trip; for
+        platform it stays pending until the webhook fires that hook."""
+        from app.modules.payments import service as central
         try:
-            trip = session.get(Trip, trip_id)
-            if not trip:
-                return False, "Trip not found"
-
-            if str(trip.user_id) != user_id:
-                return False, "User not matched to this trip"
-
-            success, txn_id = self.process_dummy_payment(
+            if amount is None or amount <= 0:
+                return None, None, "Invalid amount"
+            if trip.user_id != user.id:
+                return None, None, "User not matched to this trip"
+            payment, client_secret = central.create_trip_payment_intent(
+                session,
+                trip=trip,
+                purpose="user_upfront",
                 amount=amount,
-                payer_id=user_id,
                 payer_type="user",
-                payment_method=payment_method,
+                payer_user=user,
+                channel=channel,
+                card_reference_id=card_reference_id,
+                idempotency_key=idempotency_key,
             )
-            if not success:
-                return False, f"Payment failed: {txn_id}"
-
-            payment_txn = PaymentTransaction(
-                trip_id=trip_id,
-                user_id=trip.user_id,
-                payer_type="user",
-                payment_type=trip.payment_method or "trip_day",
-                amount=amount,
-                payment_status="success",
-                payment_method=payment_method,
-                gateway_transaction_id=txn_id,
-                completed_at=now_ist(),
-            )
-            session.add(payment_txn)
-            session.commit()
-
-            audit_emit(
-                "payment.user_upfront",
-                trip_id=trip_id,
-                actor="user",
-                actor_id=str(user_id),
-                payload={
-                    "amount": amount,
-                    "payment_type": trip.payment_method or "trip_day",
-                    "payment_method": payment_method,
-                    "gateway_transaction_id": txn_id,
-                },
-            )
-            return True, None
-
+            return payment, client_secret, None
+        except HTTPException as e:
+            return None, None, e.detail
         except Exception as e:
-            return False, f"User payment processing failed: {str(e)}"
+            return None, None, f"User payment processing failed: {str(e)}"
+
+    def _user_paid_total(self, session: Session, trip_id: int) -> float:
+        """Gross successful USER charges on a trip (matches the legacy sum of
+        success rows; a partial refund leaves the charge amount intact)."""
+        return sum(
+            p.amount
+            for p in session.exec(
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "user",
+                    Payment.status.in_(_PAID_IN_STATES),
+                )
+            ).all()
+        )
 
     def calculate_driver_fee_refund(
         self, session: Session, trip_id: int, driver_id: Optional[int]
@@ -236,27 +204,20 @@ class PaymentService:
         if not driver_id:
             return 0.0
         paid = session.exec(
-            select(PaymentTransaction).where(
-                PaymentTransaction.trip_id == trip_id,
-                PaymentTransaction.driver_id == driver_id,
-                PaymentTransaction.payer_type == "driver",
-                PaymentTransaction.payment_type == "driver_acceptance",
-                PaymentTransaction.payment_status == "success",
+            select(Payment).where(
+                Payment.service_type == "trip",
+                Payment.service_id == trip_id,
+                Payment.payer_driver_id == driver_id,
+                Payment.payer_type == "driver",
+                Payment.purpose == "driver_acceptance",
+                Payment.status.in_(_PAID_IN_STATES),
             )
         ).first()
+        # A fully refunded fee has status "refunded" (excluded above) → 0; a
+        # partial leaves the refundable remainder.
         if not paid:
             return 0.0
-        already = session.exec(
-            select(PaymentTransaction).where(
-                PaymentTransaction.trip_id == trip_id,
-                PaymentTransaction.driver_id == driver_id,
-                PaymentTransaction.payer_type == "driver",
-                PaymentTransaction.payment_status == "refunded",
-            )
-        ).first()
-        if already:
-            return 0.0
-        return float(paid.amount)
+        return round(max(0.0, paid.amount - (paid.refunded_amount or 0.0)), 2)
 
     def calculate_user_cancel_settlement(self, session: Session, trip_id: int) -> dict:
         """Final refund/shortfall maths for an advance_20 / full_payment cancel (F6).
@@ -309,16 +270,7 @@ class PaymentService:
             if a.status in ("skipped_by_user", "skipped_by_system")
         )
 
-        upfront_paid = sum(
-            txn.amount
-            for txn in session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
-                )
-            ).all()
-        )
+        upfront_paid = self._user_paid_total(session, trip_id)
 
         per_day_rate = float(trip.fare or 0.0) / total_days
         served_charge = round(per_day_rate * served_days, 2)
@@ -359,16 +311,7 @@ class PaymentService:
         per_day = float(trip.fare or 0.0) / total_days
         gross_refund = per_day * unused_days
 
-        total_paid = sum(
-            txn.amount
-            for txn in session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
-                )
-            ).all()
-        )
+        total_paid = self._user_paid_total(session, trip_id)
         return round(min(gross_refund, total_paid), 2)
 
     def calculate_refund_amount(
@@ -383,16 +326,7 @@ class PaymentService:
             if not trip:
                 return 0.0, "Trip not found"
 
-            total_paid = sum(
-                txn.amount
-                for txn in session.exec(
-                    select(PaymentTransaction).where(
-                        PaymentTransaction.trip_id == trip_id,
-                        PaymentTransaction.payer_type == "user",
-                        PaymentTransaction.payment_status == "success",
-                    )
-                ).all()
-            )
+            total_paid = self._user_paid_total(session, trip_id)
 
             if trip.payment_method == "trip_day":
                 return (total_paid if trip.actual_start_time is None else 0.0), None
@@ -432,170 +366,97 @@ class PaymentService:
         driver_id: int,
         reason: str = "Driver rejected post-payment",
     ) -> Tuple[bool, Optional[str]]:
-        """Refund the acceptance fee. No-ops if never paid or already refunded."""
+        """Refund the acceptance fee via the central ledger (wallet→wallet,
+        platform→source). No-ops if never paid or already fully refunded."""
+        from app.modules.payments import service as central
+
         try:
             paid = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.driver_id == driver_id,
-                    PaymentTransaction.payer_type == "driver",
-                    PaymentTransaction.payment_type == "driver_acceptance",
-                    PaymentTransaction.payment_status == "success",
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_driver_id == driver_id,
+                    Payment.payer_type == "driver",
+                    Payment.purpose == "driver_acceptance",
+                    Payment.status.in_(_PAID_IN_STATES),
                 )
             ).first()
+            # None ⇒ never paid, or already fully refunded (status "refunded").
             if not paid:
                 return True, None
 
-            already = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.driver_id == driver_id,
-                    PaymentTransaction.payment_status == "refunded",
-                )
-            ).first()
-            if already:
-                return True, None
-
-            gateway_ok, gateway_refund_id = self.process_dummy_refund(
-                original_gateway_transaction_id=paid.gateway_transaction_id,
-                amount=paid.amount,
-                payer_type="driver",
+            central.refund_payment(
+                session, paid, reason, actor="system", actor_id=str(driver_id)
             )
-            refund_txn = PaymentTransaction(
-                trip_id=trip_id,
-                driver_id=driver_id,
-                payer_type="driver",
-                payment_type="driver_acceptance",
-                amount=paid.amount,
-                payment_status="refunded" if gateway_ok else "refund_failed",
-                payment_method="refund",
-                gateway_transaction_id=paid.gateway_transaction_id,
-                gateway_refund_id=gateway_refund_id if gateway_ok else None,
-                refund_reason=(
-                    reason
-                    if gateway_ok
-                    else f"{reason} (gateway error: {gateway_refund_id})"
-                ),
-                refund_at=now_ist(),
-                refund_amount=paid.amount,
-            )
-            session.add(refund_txn)
-            session.commit()
             audit_emit(
                 "refund.driver_acceptance",
                 trip_id=trip_id,
                 actor="system",
                 actor_id=str(driver_id),
-                severity="info" if gateway_ok else "warning",
-                payload={
-                    "amount": paid.amount,
-                    "reason": reason,
-                    "gateway_refund_id": gateway_refund_id if gateway_ok else None,
-                    "gateway_status": "success" if gateway_ok else "failed",
-                },
+                payload={"amount": paid.amount, "reason": reason},
             )
-            if not gateway_ok:
-                return False, f"Gateway refund failed: {gateway_refund_id}"
             return True, None
+        except HTTPException as e:
+            session.rollback()
+            return False, e.detail
         except Exception as e:
             session.rollback()
             return False, f"Driver fee refund failed: {e}"
-
-    def _settle_bill_row(
-        self,
-        session: Session,
-        bill: TripBill,
-        paid_by: str,  # "user_online" | "driver_offline"
-        paid_by_driver_id: Optional[int] = None,
-        gateway_txn_id: Optional[str] = None,
-        payment_method: str = "card",
-        note: Optional[str] = None,
-    ) -> None:
-        bill.amount_paid = bill.total_amount
-        bill.amount_due = 0.0
-        bill.is_paid = True
-        bill.paid_at = now_ist()
-        bill.paid_by = paid_by
-        bill.paid_by_driver_id = paid_by_driver_id
-        if note:
-            bill.payment_note = note
-        session.add(bill)
-
-        session.add(
-            PaymentTransaction(
-                trip_id=bill.trip_id,
-                user_id=bill.user_id,
-                payer_type="user",
-                payment_type="trip_day_bill",
-                amount=bill.total_amount,
-                payment_status="success",
-                payment_method=payment_method if paid_by == "user_online" else "cash",
-                gateway_transaction_id=gateway_txn_id,
-                completed_at=now_ist(),
-            )
-        )
-        audit_emit(
-            "payment.daily_bill",
-            trip_id=bill.trip_id,
-            actor="user" if paid_by == "user_online" else "driver",
-            actor_id=str(bill.user_id)
-            if paid_by == "user_online"
-            else str(paid_by_driver_id),
-            payload={
-                "bill_id": bill.id,
-                "amount": bill.total_amount,
-                "paid_by": paid_by,
-                "payment_method": payment_method
-                if paid_by == "user_online"
-                else "cash",
-                "gateway_transaction_id": gateway_txn_id,
-            },
-        )
 
     def pay_bill_online(
         self,
         session: Session,
         bill_id: int,
-        user_id,
-        payment_method: str = "card",
+        user: User,
+        *,
+        channel: str = "platform",
+        card_reference_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         note: Optional[str] = None,
-    ) -> Tuple[bool, Optional[str]]:
-        """User pays a bill via the (dummy) gateway. Row-locked for safety."""
+    ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
+        """User pays a daily / cancellation_balance / schedule_diff bill online.
+
+        Row-locks the bill, then charges it on the central ledger. For wallet
+        the bill settles synchronously (the orchestrator marks it paid and
+        unpauses the trip); for platform it stays open until the webhook fires
+        that same hook. Returns ``(payment, client_secret, error)``."""
+        from app.modules.payments import service as central
         try:
             bill = session.exec(
                 select(TripBill).where(TripBill.id == bill_id).with_for_update()
             ).first()
-
             if not bill:
-                return False, "Bill not found"
-            if str(bill.user_id) != str(user_id):
-                return False, "Not authorized for this bill"
+                return None, None, "Bill not found"
+            if str(bill.user_id) != str(user.id):
+                return None, None, "Not authorized for this bill"
             if bill.is_paid:
-                return False, "Bill already paid"
+                return None, None, "Bill already paid"
+            trip = session.get(Trip, bill.trip_id)
+            if not trip:
+                return None, None, "Trip not found"
 
-            success, txn_id = self.process_dummy_payment(
-                amount=bill.total_amount,
-                payer_id=str(user_id),
-                payer_type="user",
-                payment_method=payment_method,
-            )
-            if not success:
-                return False, f"Payment failed: {txn_id}"
-
-            self._settle_bill_row(
+            extra = {"bill_id": bill.id}
+            if note:
+                extra["note"] = note
+            payment, client_secret = central.create_trip_payment_intent(
                 session,
-                bill,
-                paid_by="user_online",
-                gateway_txn_id=txn_id,
-                payment_method=payment_method,
-                note=note,
+                trip=trip,
+                purpose=_bill_purpose(bill),
+                amount=bill.total_amount,
+                payer_type="user",
+                payer_user=user,
+                channel=channel,
+                card_reference_id=card_reference_id,
+                idempotency_key=idempotency_key,
+                extra=extra,
             )
-            self.unpause_trip_if_clear(session, bill.trip_id)
-            session.commit()
-            return True, None
+            return payment, client_secret, None
+        except HTTPException as e:
+            session.rollback()
+            return None, None, e.detail
         except Exception as e:
             session.rollback()
-            return False, f"Bill payment failed: {e}"
+            return None, None, f"Bill payment failed: {e}"
 
     def mark_bill_paid_offline(
         self,
@@ -604,30 +465,43 @@ class PaymentService:
         driver_id: int,
         note: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """Driver confirms cash collected from user. Row-locked for safety."""
+        """Driver confirms cash collected from the user. Settles immediately on
+        the central ledger (cash collected offline → succeeded right away)."""
+        from app.modules.payments import service as central
         try:
             bill = session.exec(
                 select(TripBill).where(TripBill.id == bill_id).with_for_update()
             ).first()
-
             if not bill:
                 return False, "Bill not found"
             if bill.driver_id != driver_id:
                 return False, "Not authorized for this bill"
             if bill.is_paid:
                 return False, "Bill already paid"
+            trip = session.get(Trip, bill.trip_id)
+            if not trip:
+                return False, "Trip not found"
+            payer_user = session.get(User, bill.user_id)
+            if not payer_user:
+                return False, "Bill user not found"
 
-            self._settle_bill_row(
+            extra = {"bill_id": bill.id}
+            if note:
+                extra["note"] = note
+            central.create_trip_payment_intent(
                 session,
-                bill,
-                paid_by="driver_offline",
-                paid_by_driver_id=driver_id,
-                payment_method="cash",
-                note=note,
+                trip=trip,
+                purpose=_bill_purpose(bill),
+                amount=bill.total_amount,
+                payer_type="user",
+                payer_user=payer_user,
+                channel="cash",
+                extra=extra,
             )
-            self.unpause_trip_if_clear(session, bill.trip_id)
-            session.commit()
             return True, None
+        except HTTPException as e:
+            session.rollback()
+            return False, e.detail
         except Exception as e:
             session.rollback()
             return False, f"Mark-paid failed: {e}"
@@ -736,10 +610,11 @@ class PaymentService:
         refund_amount: float,
         reason: str = "Trip cancelled",
     ) -> Tuple[bool, Optional[str]]:
-        """Refund the user via the gateway. Stores a ``refunded`` (or
-        ``refund_failed``) PaymentTransaction row + emits an audit event.
-        Caller commits trip status after; this method commits the refund row.
-        """
+        """Refund the user a computed amount, allocated across their succeeded
+        trip charges via the central partial-refund path (wallet→wallet,
+        platform→source). The caller commits the trip status afterwards."""
+        from app.modules.trips import payment_orchestrator
+
         try:
             if refund_amount <= 0:
                 return True, None
@@ -748,67 +623,18 @@ class PaymentService:
             if not trip:
                 return False, "Trip not found"
 
-            # Most gateway refund APIs need the original charge id to anchor the
-            # refund — pick the most recent successful user payment for that.
-            original_charge = session.exec(
-                select(PaymentTransaction)
-                .where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
-                )
-                .order_by(PaymentTransaction.id.desc())
-            ).first()
-
-            gateway_ok, gateway_refund_id = self.process_dummy_refund(
-                original_gateway_transaction_id=(
-                    original_charge.gateway_transaction_id if original_charge else None
-                ),
-                amount=refund_amount,
-                payer_type="user",
-            )
-
-            refund_txn = PaymentTransaction(
-                trip_id=trip_id,
-                user_id=trip.user_id,
-                payer_type="user",
-                payment_type=trip.payment_method or "trip_day",
-                amount=refund_amount,
-                payment_status="refunded" if gateway_ok else "refund_failed",
-                payment_method="refund",
-                gateway_transaction_id=(
-                    original_charge.gateway_transaction_id if original_charge else None
-                ),
-                gateway_refund_id=gateway_refund_id if gateway_ok else None,
-                refund_reason=(
-                    reason
-                    if gateway_ok
-                    else f"{reason} (gateway error: {gateway_refund_id})"
-                ),
-                refund_at=now_ist(),
-                refund_amount=refund_amount,
-            )
-            session.add(refund_txn)
-            session.commit()
-
-            audit_emit(
-                "refund.user",
-                trip_id=trip_id,
+            payment_orchestrator.refund_trip_amount(
+                session,
+                trip_id,
+                round(refund_amount, 2),
+                reason,
                 actor="system",
                 actor_id=str(trip.user_id),
-                severity="info" if gateway_ok else "warning",
-                payload={
-                    "amount": refund_amount,
-                    "reason": reason,
-                    "payment_method": trip.payment_method or "trip_day",
-                    "gateway_refund_id": gateway_refund_id if gateway_ok else None,
-                    "gateway_status": "success" if gateway_ok else "failed",
-                },
             )
-            if not gateway_ok:
-                # Failed row left in place for ops retry / reconciliation.
-                return False, f"Gateway refund failed: {gateway_refund_id}"
             return True, None
-
+        except HTTPException as e:
+            session.rollback()
+            return False, e.detail
         except Exception as e:
+            session.rollback()
             return False, f"Refund processing failed: {str(e)}"

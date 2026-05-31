@@ -12,7 +12,7 @@ from app.core.models import (
     Trip,
     TripOffer,
     OTPRegistry,
-    PaymentTransaction,
+    Payment,
     TripAttendance,
     TripBill,
     TripSettlement,
@@ -516,11 +516,16 @@ async def driver_payment_timeout_scheduler():
                 if not locked_trip or locked_trip.status != "accepted_pending_payment":
                     continue
 
+                # A pending platform intent counts as "payment in progress" too:
+                # the gateway charge may settle on its webhook any moment, so we
+                # must NOT yank the trip back to searching and orphan a charge.
                 payment_check = session.exec(
-                    select(PaymentTransaction).where(
-                        PaymentTransaction.trip_id == locked_trip.id,
-                        PaymentTransaction.driver_id == locked_trip.driver_id,
-                        PaymentTransaction.payment_status == "success",
+                    select(Payment).where(
+                        Payment.service_type == "trip",
+                        Payment.service_id == locked_trip.id,
+                        Payment.payer_driver_id == locked_trip.driver_id,
+                        Payment.purpose == "driver_acceptance",
+                        Payment.status.in_(["pending", "succeeded"]),
                     )
                 ).first()
 

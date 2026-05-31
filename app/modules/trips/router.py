@@ -1,6 +1,6 @@
 import redis
 from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Header
 from sqlmodel import Session, select, desc
 from typing import List, Optional
 from sqlalchemy.orm import selectinload
@@ -23,8 +23,9 @@ from app.core.models import (
     TripBill,
     TripSettlement,
     TripDaySkipRequest,
-    PaymentTransaction,
+    Payment,
 )
+from app.modules.payments import service as central_payments
 from app.core.security import get_current_user
 from app.modules.trips.allocation import (
     rank_drivers,
@@ -50,11 +51,35 @@ from app.utils.id_generator import (
     get_by_reference,
     trip_subtype,
     TRIP,
+    PAYMENT,
 )
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
 
 TIER_SIZE = 3
+
+# Channels a user/driver may use for an ONLINE trip charge. Physical cash on a
+# daily bill is recorded separately via /bill/{id}/mark-paid-by-driver.
+_ONLINE_PAY_CHANNELS = ("platform", "wallet")
+
+
+def _validate_online_channel(channel: str) -> None:
+    if channel not in _ONLINE_PAY_CHANNELS:
+        raise HTTPException(400, f"channel must be one of {list(_ONLINE_PAY_CHANNELS)}")
+
+
+def _maybe_schedule_platform_settlement(background_tasks, payment) -> None:
+    """For a pending platform charge, deliver the mock gateway webhook shortly
+    after (a real gateway calls /payments/webhook out of band). No-op for the
+    synchronous wallet/cash channels, which already settled inline."""
+    if (
+        payment is not None
+        and payment.channel == "platform"
+        and payment.status == "pending"
+    ):
+        background_tasks.add_task(
+            central_payments.simulate_webhook_delivery, payment.reference_id
+        )
 
 
 @router.post("/estimate-fare")
@@ -814,22 +839,30 @@ def modify_trip_schedule(
         session.flush()
         diff_bill_id = bill.id
     elif fare_diff < 0:
-        # User is owed a credit; recorded as a ledger transaction so the
-        # final settlement maths (total_paid_upfront vs. total_earned) picks
-        # it up naturally — reduces remaining_due at settlement time without
-        # needing a separate refund flow today.
+        # User is owed a credit (fare reduced). Recorded on the central ledger
+        # as a succeeded "credit"-channel Payment so the settlement maths (which
+        # sums the user's succeeded charges into total_paid_upfront) picks it up
+        # and reduces remaining_due — no separate refund flow needed today. The
+        # "credit" channel marks it as a ledger adjustment (no real money in),
+        # so it is never itself refunded by the cancel/abandon flow.
         session.add(
-            PaymentTransaction(
-                trip_id=trip_id,
+            Payment(
+                reference_id=generate_reference_id(session, PAYMENT),
+                service_type="trip",
+                service_reference_id=trip.reference_id,
+                service_id=trip.id,
                 user_id=trip.user_id,
                 payer_type="user",
-                payment_type="schedule_diff_credit",
+                purpose="schedule_diff",
                 amount=abs(fare_diff),
-                payment_status="success",
-                payment_method="credit",
-                refund_reason=f"Schedule modified, fare reduced by ₹{abs(fare_diff):.2f}",
-                refund_at=now_ist(),
+                channel="credit",
+                status="succeeded",
                 completed_at=now_ist(),
+                extra={
+                    "reason": (
+                        f"Schedule modified, fare reduced by ₹{abs(fare_diff):.2f}"
+                    )
+                },
             )
         )
 
@@ -1044,10 +1077,15 @@ def select_payment_method(
 @router.post("/{trip_id}/pay-upfront")
 def user_pay_upfront(
     trip_id: str,
-    payment_method: str = Body("card", embed=True),
+    background_tasks: BackgroundTasks,
+    channel: str = Body("platform", embed=True),
+    card_reference_id: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
+    idempotency_key: Optional[str] = Header(
+        default=None, alias="Idempotency-Key", convert_underscores=False
+    ),
     idem: IdempotencyGuard = Depends(idempotent("upfront.pay")),
 ):
     """User upfront payment for an advance_20 / full_payment trip.
@@ -1057,16 +1095,20 @@ def user_pay_upfront(
       * a fresh booking pays 20% / 95% of the whole fare, and
       * a mid-trip switch pays only for what is left, crediting whatever the
         user already paid.
-    Once paid, any unpaid completed-shift bills are settled under the new
-    method and the trip is un-blocked / un-paused so it can continue.
-    trip_day has no upfront step (collected per day via /bill/{id}/pay).
+
+    ``channel`` is "wallet" (settles instantly) or "platform" (gateway card;
+    returns a client_secret and settles on the webhook). On success the
+    centralized orchestrator settles any unpaid completed-shift bills under the
+    new method and un-blocks / un-pauses the trip — for platform that happens
+    when the gateway confirms. trip_day has no upfront step (collected per day
+    via /bill/{id}/pay).
     """
     if idem.cached_response is not None:
         return idem.cached_response
+    _validate_online_channel(channel)
     trip = session.exec(
         select(Trip).where(Trip.reference_id == trip_id).with_for_update()
     ).first()
-    trip_id = trip.id if trip else trip_id
     if not trip:
         raise HTTPException(404, "Trip not found")
     if trip.user_id != current_user.id:
@@ -1092,107 +1134,46 @@ def user_pay_upfront(
     payment_service = PaymentService(redis_client)
 
     if amount > 0:
-        ok, err = payment_service.user_make_payment(
-            session, trip_id, str(current_user.id), amount, payment_method
+        payment, client_secret, err = payment_service.user_make_payment(
+            session,
+            trip,
+            current_user,
+            amount,
+            channel=channel,
+            card_reference_id=card_reference_id,
+            idempotency_key=idempotency_key,
         )
-        if not ok:
-            raise HTTPException(400, err or "Upfront payment failed")
+        if err:
+            raise HTTPException(400, err)
+        if client_secret:
+            # Platform charge: bill-settlement + un-block run on the gateway
+            # webhook via the orchestrator hook, not synchronously here.
+            _maybe_schedule_platform_settlement(background_tasks, payment)
+            response = {
+                "message": "Upfront payment initiated. Confirm with the client "
+                "secret; the trip unlocks once the gateway confirms.",
+                "trip_id": trip.reference_id,
+                "amount": amount,
+                "payment_method": trip.payment_method,
+                "channel": channel,
+                "status": "pending",
+                "payment_reference": payment.reference_id,
+                "client_secret": client_secret,
+            }
+            idem.store(response)
+            return response
+        # Wallet: settled synchronously; the orchestrator already settled the
+        # bills + un-blocked the trip inside the payment commit.
+    else:
+        # Nothing left to charge (mid-trip switch where the user already
+        # overpaid): still settle outstanding bills under the new method and
+        # un-block the trip.
+        from app.modules.trips import payment_orchestrator
 
-    # Settle any already-generated daily bills that still carry a balance,
-    # under the new payment method. The credit pool (advance/full upfront
-    # payments) is drawn down in shift-date order; trip_day cash that cleared
-    # earlier days is excluded so the maths matches generate_daily_bill.
-    discount_pct = payment_method_discount_pct(trip.hiring_type, trip.payment_method)
-    per_day = portion["per_day"]
+        payment_orchestrator.apply_user_upfront_settlement(session, trip)
+        session.commit()
 
-    total_upfront = sum(
-        p.amount
-        for p in session.exec(
-            select(PaymentTransaction).where(
-                PaymentTransaction.trip_id == trip_id,
-                PaymentTransaction.payer_type == "user",
-                PaymentTransaction.payment_status == "success",
-                PaymentTransaction.payment_type.notin_(["trip_day_bill", "settlement"]),
-            )
-        ).all()
-    )
-    trip_day_cash = sum(
-        p.amount
-        for p in session.exec(
-            select(PaymentTransaction).where(
-                PaymentTransaction.trip_id == trip_id,
-                PaymentTransaction.payer_type == "user",
-                PaymentTransaction.payment_status == "success",
-                PaymentTransaction.payment_type == "trip_day_bill",
-            )
-        ).all()
-    )
-
-    daily_bills = session.exec(
-        select(TripBill)
-        .where(
-            TripBill.trip_id == trip_id,
-            TripBill.bill_type == "daily_bill",
-        )
-        .order_by(TripBill.bill_date)
-        .with_for_update()
-    ).all()
-
-    running_paid = 0.0
-    now = now_ist()
-    for bill in daily_bills:
-        if (bill.amount_due or 0.0) > 0:
-            disc = round(per_day * discount_pct / 100.0, 2)
-            net = round(per_day - disc, 2)
-            credit_available = max(
-                0.0, total_upfront - max(0.0, running_paid - trip_day_cash)
-            )
-            paid = min(net, credit_available)
-            bill.discount_percentage = discount_pct or None
-            bill.discount_amount = disc
-            bill.total_amount = net
-            bill.amount_paid = paid
-            bill.amount_due = max(0.0, round(net - paid, 2))
-            bill.is_paid = bill.amount_due <= 0
-            if bill.is_paid:
-                bill.paid_at = now
-                bill.paid_by = "user_online"
-            if disc > 0 and isinstance(bill.components, list):
-                bill.components = bill.components + [
-                    {
-                        "name": f"Payment Discount ({discount_pct:.0f}%)",
-                        "amount": -disc,
-                        "percentage": -discount_pct,
-                    }
-                ]
-            session.add(bill)
-        running_paid += bill.amount_paid or 0.0
-
-    # Un-block and re-arm: a mid-trip switch is done from a `paused` (unpaid
-    # bill) or `active_pending_otp` state — clear the block, flip any
-    # payment-paused shift back to scheduled, and move a paused trip to
-    # active_pending_otp so the next shift's OTP can be requested.
-    trip.is_payment_blocked = False
-    for att in session.exec(
-        select(TripAttendance).where(
-            TripAttendance.trip_id == trip_id,
-            TripAttendance.status == "paused_payment",
-        )
-    ).all():
-        att.status = "scheduled"
-        att.skip_reason = None
-        att.marked_by = "system"
-        session.add(att)
-    if trip.status == "paused":
-        trip.status = (
-            "active_pending_otp"
-            if trip_service.has_pending_shifts(session, trip_id)
-            else "completed"
-        )
-    trip.state_version += 1
-    session.add(trip)
-    session.commit()
-
+    session.refresh(trip)
     response = {
         "message": "Upfront payment successful",
         "trip_id": trip.reference_id,
@@ -1357,122 +1338,95 @@ def driver_accept_and_initiate_payment(
 @router.post("/driver/{trip_id}/process-payment")
 def driver_process_payment(
     trip_id: str,
-    payment_method: str = Body("card", embed=True),
+    background_tasks: BackgroundTasks,
+    channel: str = Body("platform", embed=True),
+    card_reference_id: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
+    idempotency_key: Optional[str] = Header(
+        default=None, alias="Idempotency-Key", convert_underscores=False
+    ),
     idem: IdempotencyGuard = Depends(idempotent("driver.process_payment")),
 ):
+    """Driver pays the acceptance fee to lock the trip.
+
+    ``channel`` is "wallet" (settles instantly) or "platform" (gateway card;
+    returns a client_secret). On success the centralized orchestrator arms the
+    trip — generates the shift schedule and moves it to active_pending_otp (or
+    `paused` for advance_20/full_payment until the user pays upfront). For
+    platform that arming happens when the gateway confirms, so the trip stays
+    ``accepted_pending_payment`` until then (the payment-timeout scheduler skips
+    a trip with a pending fee, so it won't be auto-rejected meanwhile).
+    """
     if idem.cached_response is not None:
         return idem.cached_response
-    # payment_method accepted for forward-compat with future gateways; the
-    # acceptance fee charge is server-controlled via driver_accept_payment.
-    _ = payment_method
+    _validate_online_channel(channel)
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
     if not driver:
         raise HTTPException(403, "Only drivers can perform this action")
 
-    # Row-lock the trip so this finalize-payment path can't interleave with
-    # driver_payment_timeout_scheduler auto-rejecting the trip back to
-    # `searching` between our status check and our state mutation.
+    # Row-lock the trip so this path can't interleave with the payment-timeout
+    # scheduler between our status check and our state mutation.
     trip = session.exec(
         select(Trip).where(Trip.reference_id == trip_id).with_for_update()
     ).first()
-    trip_id = trip.id if trip else trip_id
     if not trip:
         raise HTTPException(404, "Trip not found")
-
     if trip.driver_id != driver.id:
         raise HTTPException(403, "Not authorized")
-
     if trip.status != "accepted_pending_payment":
         raise HTTPException(
             400, f"Trip status is {trip.status}, cannot process payment now"
         )
 
-    # Payment method is optional at booking time. Now that the driver has
-    # accepted (by paying the acceptance fee), default it to trip-day billing
-    # so the trip can proceed without waiting on the user — the user can still
-    # switch to advance_20 / full_payment later via /select-payment-method.
+    # Payment method is optional at booking time. Default it to trip-day so the
+    # trip can proceed without waiting on the user — the user can still switch
+    # to advance_20 / full_payment later via /select-payment-method.
     if not trip.payment_method:
         trip.payment_method = "trip_day"
         session.add(trip)
+        session.flush()
 
     payment_service = PaymentService(redis_client)
-    success, error = payment_service.driver_accept_payment(session, trip_id, driver.id)
-
-    if not success:
+    payment, client_secret, error = payment_service.driver_accept_payment(
+        session,
+        trip.id,
+        driver.id,
+        channel=channel,
+        card_reference_id=card_reference_id,
+        idempotency_key=idempotency_key,
+    )
+    if error:
         raise HTTPException(400, f"Payment failed: {error}")
 
-    trip_service = TripService()
+    if client_secret:
+        # Platform: the fee settles on the gateway webhook, which then arms the
+        # trip via the orchestrator (finalize_driver_acceptance).
+        _maybe_schedule_platform_settlement(background_tasks, payment)
+        response = {
+            "message": "Driver payment initiated. Confirm with the client "
+            "secret; the trip arms once the gateway confirms.",
+            "trip_id": trip.reference_id,
+            "trip_status": trip.status,
+            "channel": channel,
+            "status": "pending",
+            "payment_reference": payment.reference_id,
+            "client_secret": client_secret,
+            "next_step": "confirm_gateway",
+        }
+        idem.store(response)
+        return response
 
-    # Generate schedules upon successful driver payment
-    if trip.start_date:
-        duration_hours = (
-            trip_service.get_trip_duration_hours(trip.shift_details)
-            or trip.trip_duration_hours
-            or 8
-        )
-
-        parsed_time = trip_service.get_trip_start_time(
-            trip.shift_details, trip.start_date
-        )
-
-        effective_start_dt = (
-            parsed_time
-            or trip.scheduled_start_time
-            or datetime.combine(trip.start_date, datetime.min.time())
-        )
-
-        if parsed_time and not trip.scheduled_start_time:
-            trip.scheduled_start_time = parsed_time
-            trip.scheduled_end_time = parsed_time + timedelta(hours=duration_hours)
-            trip.trip_duration_hours = duration_hours
-
-        is_outstation = (trip.hiring_type or "").strip().lower() == "outstation"
-        end_date_for_attendance = trip.end_date or trip.start_date
-        att_ok, att_err = trip_service.create_trip_attendance_records(
-            session,
-            trip_id,
-            trip.start_date,
-            end_date_for_attendance,
-            effective_start_dt,
-            duration_hours,
-            selected_days=trip.selected_days,
-            single_shift=is_outstation,
-        )
-        if not att_ok:
-            raise HTTPException(400, att_err)
-
-        if is_outstation:
-            single_att = session.exec(
-                select(TripAttendance).where(TripAttendance.trip_id == trip_id)
-            ).first()
-            if single_att:
-                trip.scheduled_start_time = single_att.scheduled_start
-                trip.scheduled_end_time = single_att.scheduled_end
-                session.add(trip)
-
-    success, error = trip_service.transition_trip_state(
-        session, trip_id, "active_pending_otp", validate=True
-    )
-
-    if not success:
-        raise HTTPException(400, f"Status update failed: {error}")
-
-    redis_key = f"driver_payment_timer:{trip_id}:{driver.id}"
-    redis_client.delete(redis_key)
-
+    # Wallet: settled synchronously; the orchestrator already armed the trip.
+    try:
+        redis_client.delete(f"driver_payment_timer:{trip.id}:{driver.id}")
+    except Exception:
+        pass
+    session.refresh(trip)
     if trip.payment_method in ("advance_20", "full_payment"):
-        # Hold the trip in `paused` until /pay-upfront clears (or the 1-h
-        # auto-convert-to-trip_day scheduler fires).
-        trip.status = "paused"
-        trip.is_payment_blocked = True
-        trip.state_version += 1
-        session.add(trip)
-        session.commit()
         response = {
             "message": "Driver payment successful. Awaiting user upfront payment before OTP can be requested.",
             "trip_id": trip.reference_id,
@@ -1733,7 +1687,7 @@ def driver_abandon_trip(
         )
         if not refund_ok:
             # Refund failure leaves the trip in cancelled_by_driver so ops can
-            # reconcile via the audit log + the refund_failed PaymentTransaction.
+            # reconcile via the audit log + the Payment ledger.
             raise HTTPException(502, refund_err or "Refund gateway error")
 
         # Bump trip into the refund-processing → settled terminal chain so the
@@ -2430,15 +2384,21 @@ def list_trip_bills(
 @router.post("/bill/{bill_id}/pay")
 def user_pay_bill(
     bill_id: int,
-    payment_method: str = Body("card", embed=True),
+    background_tasks: BackgroundTasks,
+    channel: str = Body("platform", embed=True),
+    card_reference_id: Optional[str] = Body(None, embed=True),
     note: Optional[str] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
+    idempotency_key: Optional[str] = Header(
+        default=None, alias="Idempotency-Key", convert_underscores=False
+    ),
     idem: IdempotencyGuard = Depends(idempotent("bill.pay")),
 ):
     if idem.cached_response is not None:
         return idem.cached_response
+    _validate_online_channel(channel)
     bill = session.get(TripBill, bill_id)
     if not bill:
         raise HTTPException(404, "Bill not found")
@@ -2458,30 +2418,46 @@ def user_pay_bill(
             f"Daily bills cannot be paid individually for the '{trip.payment_method}' payment method. Please pay the final settlement at the end of the trip.",
         )
 
+    bill_amount = bill.total_amount
     payment_service = PaymentService(redis_client)
-    ok, err = payment_service.pay_bill_online(
-        session, bill_id, current_user.id, payment_method, note=note
+    payment, client_secret, err = payment_service.pay_bill_online(
+        session,
+        bill_id,
+        current_user,
+        channel=channel,
+        card_reference_id=card_reference_id,
+        idempotency_key=idempotency_key,
+        note=note,
     )
-    if not ok:
-        raise HTTPException(400, err or "Payment failed")
+    if err:
+        raise HTTPException(400, err)
 
-    # F6: clear the cancellation-pending state once the shortfall is paid.
-    if (
-        trip
-        and trip.status == "cancellation_pending_payment"
-        and bill.bill_type == "cancellation_balance"
-    ):
-        trip_service_inst = TripService()
-        trip_service_inst.transition_trip_state(
-            session, trip.id, "settled", validate=False
-        )
+    if client_secret:
+        # Platform: the bill clears (and any cancellation_pending → settled
+        # transition) on the gateway webhook via the orchestrator hook.
+        _maybe_schedule_platform_settlement(background_tasks, payment)
+        response = {
+            "message": "Bill payment initiated. Confirm with the client secret; "
+            "the bill clears once the gateway confirms.",
+            "bill_id": bill_id,
+            "trip_id": (trip.reference_id if trip else None),
+            "amount": bill_amount,
+            "channel": channel,
+            "status": "pending",
+            "payment_reference": payment.reference_id,
+            "client_secret": client_secret,
+        }
+        idem.store(response)
+        return response
 
+    # Wallet: settled synchronously; the orchestrator already settled the bill
+    # and ran any cancellation_pending → settled transition.
     try:
         send_push_notification(
             session=session,
             user_ids=[bill.user_id],
             title="Bill paid",
-            body=f"Bill #{bill_id} of ₹{bill.total_amount:.2f} settled. Thank you!",
+            body=f"Bill #{bill_id} of ₹{bill_amount:.2f} settled. Thank you!",
             data={
                 "type": "bill_paid",
                 "bill_id": bill_id,
@@ -2498,7 +2474,7 @@ def user_pay_bill(
                 session=session,
                 user_ids=[driver_user.id],
                 title="Payment received",
-                body=f"Bill #{bill_id} of ₹{bill.total_amount:.2f} paid by user.",
+                body=f"Bill #{bill_id} of ₹{bill_amount:.2f} paid by user.",
                 data={
                     "type": "bill_paid",
                     "bill_id": bill_id,
@@ -2512,7 +2488,7 @@ def user_pay_bill(
         "message": "Bill paid successfully",
         "bill_id": bill_id,
         "trip_id": (trip.reference_id if trip else None),
-        "amount": bill.total_amount,
+        "amount": bill_amount,
     }
     idem.store(response)
     return response
@@ -2600,16 +2576,26 @@ _ALLOWED_EXTRA_KEYS = {"toll", "parking", "food", "other"}
 @router.post("/settlement/{settlement_id}/pay")
 def pay_trip_settlement(
     settlement_id: int,
-    payment_method: str = Body("card", embed=True),
+    background_tasks: BackgroundTasks,
+    channel: str = Body("platform", embed=True),
+    card_reference_id: Optional[str] = Body(None, embed=True),
     note: Optional[str] = Body(None, embed=True),
     extra_amount: Optional[float] = Body(None, embed=True),
     extra_amount_breakdown: Optional[dict] = Body(None, embed=True),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
+    idempotency_key: Optional[str] = Header(
+        default=None, alias="Idempotency-Key", convert_underscores=False
+    ),
     idem: IdempotencyGuard = Depends(idempotent("settlement.pay")),
 ):
     """User pays the final trip settlement for advance_20 or full_payment methods.
+
+    ``channel`` is "wallet" (settles instantly) or "platform" (gateway card;
+    returns a client_secret and clears on the webhook). On success the
+    centralized orchestrator marks the settlement paid, clears any remaining
+    unpaid bills, lifts pauses, and closes a force-billed trip.
 
     Outstation only: the user may add an ``extra_amount`` on top of
     ``remaining_due`` for incidentals (toll, parking, food, other). When
@@ -2621,6 +2607,7 @@ def pay_trip_settlement(
     """
     if idem.cached_response is not None:
         return idem.cached_response
+    _validate_online_channel(channel)
     settlement = session.exec(
         select(TripSettlement)
         .where(TripSettlement.id == settlement_id)
@@ -2695,77 +2682,53 @@ def pay_trip_settlement(
 
     total_charge = round(settlement.remaining_due + extra, 2)
 
-    payment_service = PaymentService(redis_client)
-    success, txn_id = payment_service.process_dummy_payment(
-        amount=total_charge,
-        payer_id=str(current_user.id),
-        payer_type="user",
-        payment_method=payment_method,
-    )
+    if not trip:
+        raise HTTPException(404, "Trip not found for settlement")
 
-    if not success:
-        raise HTTPException(400, f"Payment failed: {txn_id}")
-
-    # Record payment transaction — amount includes any outstation extra so
-    # `total_user_paid` in the trip summary reflects the full amount paid.
-    payment_txn = PaymentTransaction(
-        trip_id=settlement.trip_id,
-        user_id=settlement.user_id,
-        payer_type="user",
-        payment_type="settlement",
-        amount=total_charge,
-        payment_status="success",
-        payment_method=payment_method,
-        gateway_transaction_id=txn_id,
-        completed_at=now_ist(),
-    )
-    session.add(payment_txn)
-
-    settlement.user_payment_status = "paid"
-    settlement.paid_at = now_ist()
+    # Carry the note + validated outstation extras on the Payment so the
+    # orchestrator persists them on the settlement when the charge succeeds.
+    extra_meta: dict = {"settlement_id": settlement.id}
     if note:
-        settlement.payment_note = note
+        extra_meta["note"] = note
     if extra > 0:
-        settlement.extra_amount_paid = round(
-            (settlement.extra_amount_paid or 0.0) + extra, 2
-        )
-        # Merge into any existing breakdown rather than overwriting — supports
-        # multi-pay settlements (rare today but cheap to handle).
-        merged = dict(settlement.extra_amount_breakdown or {})
-        for k, v in (validated_breakdown or {}).items():
-            merged[k] = round(float(merged.get(k, 0.0)) + v, 2)
-        settlement.extra_amount_breakdown = merged
-    session.add(settlement)
+        extra_meta["extra_amount"] = round(extra, 2)
+        extra_meta["extra_amount_breakdown"] = validated_breakdown or {}
 
-    # Optional backend cleanup: mark all associated unpaid daily bills as paid
-    unpaid_bills = session.exec(
-        select(TripBill).where(
-            TripBill.trip_id == settlement.trip_id,
-            TripBill.is_paid == False,  # noqa: E712 (SQL boolean cmp)
-        )
-    ).all()
-    paid_at_now = now_ist()
-    for bill in unpaid_bills:
-        bill.is_paid = True
-        bill.amount_paid = bill.total_amount
-        bill.amount_due = 0.0
-        bill.paid_at = paid_at_now
-        bill.paid_by = "user_online"
-        session.add(bill)
+    payment, client_secret = central_payments.create_trip_payment_intent(
+        session,
+        trip=trip,
+        purpose="settlement",
+        amount=total_charge,
+        payer_type="user",
+        payer_user=current_user,
+        channel=channel,
+        card_reference_id=card_reference_id,
+        idempotency_key=idempotency_key,
+        extra=extra_meta,
+    )
 
-    # Lift any payment-block state that was tied to the cleared bills, so a
-    # paused trip can resume. Without this, a paused trip remains paused
-    # even after the user pays the final settlement.
-    payment_service.unpause_trip_if_clear(session, settlement.trip_id)
+    if client_secret:
+        # Platform: the settlement is marked paid, bills cleared, and the trip
+        # closed on the gateway webhook via the orchestrator hook.
+        _maybe_schedule_platform_settlement(background_tasks, payment)
+        response = {
+            "message": "Settlement payment initiated. Confirm with the client "
+            "secret; it clears once the gateway confirms.",
+            "settlement_id": settlement.id,
+            "trip_id": trip.reference_id,
+            "amount_paid": total_charge,
+            "extra_amount_paid": round(extra, 2),
+            "channel": channel,
+            "status": "pending",
+            "payment_reference": payment.reference_id,
+            "client_secret": client_secret,
+        }
+        idem.store(response)
+        return response
 
-    # Paying a settlement on a force-closed (`billed`) trip wraps it up.
-    settled_trip = session.get(Trip, settlement.trip_id)
-    if settled_trip and settled_trip.status == "billed":
-        settled_trip.status = "settled"
-        settled_trip.state_version += 1
-        session.add(settled_trip)
-
-    session.commit()
+    # Wallet: settled synchronously; the orchestrator marked the settlement
+    # paid, cleared remaining bills, unpaused, and closed a billed trip.
+    session.refresh(settlement)
 
     try:
         send_push_notification(
@@ -2775,7 +2738,7 @@ def pay_trip_settlement(
             body=f"Your final settlement of ₹{total_charge:.2f} has been paid successfully.",
             data={
                 "type": "settlement_paid",
-                "trip_id": (trip.reference_id if trip else None),
+                "trip_id": trip.reference_id,
             },
         )
     except Exception:
@@ -2784,7 +2747,7 @@ def pay_trip_settlement(
     response = {
         "message": "Settlement paid successfully",
         "settlement_id": settlement.id,
-        "trip_id": (trip.reference_id if trip else None),
+        "trip_id": trip.reference_id,
         "amount_paid": total_charge,
         "extra_amount_paid": round(extra, 2),
         "extra_amount_breakdown": settlement.extra_amount_breakdown,

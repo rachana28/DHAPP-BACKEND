@@ -11,13 +11,21 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Request,
+)
 from sqlmodel import Session
 
 from app.core.database import get_session
 from app.core.idempotency import IdempotencyGuard, idempotent
 from app.core.models import Payment, PaymentIntentCreate, PaymentPublic, User
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_admin
 from app.modules.payments import service as payment_service
 from app.utils.id_generator import get_by_reference
 
@@ -81,6 +89,23 @@ def mark_paid(
     if not payment:
         raise HTTPException(404, "Payment not found")
     return payment_service.mark_direct_paid(session, payment, current_user)
+
+
+@router.post("/{payment_ref}/refund", response_model=PaymentPublic)
+def refund_payment(
+    payment_ref: str,
+    reason: str = Body(default=None, embed=True),
+    session: Session = Depends(get_session),
+    admin: User = Depends(get_current_admin),
+):
+    """Admin-initiated refund. Wallet-paid bookings refund to the wallet; gateway
+    payments refund to source; cash/UPI-direct are returned offline by the provider."""
+    payment = get_by_reference(session, Payment, payment_ref)
+    if not payment:
+        raise HTTPException(404, "Payment not found")
+    return payment_service.refund_payment(
+        session, payment, reason, actor="admin", actor_id=str(admin.id)
+    )
 
 
 @router.get("/{payment_ref}", response_model=PaymentPublic)

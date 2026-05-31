@@ -20,7 +20,6 @@ from app.core.models import (
     Trip,
     TripOffer,
     TripBill,
-    PaymentTransaction,
     TowTrip,
     TowTripOffer,
     MechanicTrip,
@@ -968,10 +967,10 @@ def admin_manual_refund(
 ):
     """Issue an ad-hoc refund on a trip (F13).
 
-    Goes through the same gateway stub + audit pipeline as automatic refunds
-    so the resulting :class:`PaymentTransaction` row is indistinguishable from
-    a system-initiated refund except for the audit event linking the admin
-    actor.
+    Goes through the same centralized refund pipeline as automatic refunds
+    (refund_trip_amount → Payment.refunded_amount, wallet→wallet / platform→
+    source) so the ledger result is indistinguishable from a system-initiated
+    refund except for the audit event linking the admin actor.
     """
     if amount <= 0:
         raise HTTPException(400, "amount must be positive")
@@ -1019,8 +1018,8 @@ def admin_waive_bill(
     """Waive an outstanding bill (F13).
 
     Marks the bill paid with ``payment_method='admin_waive'`` and ``amount_due=0``.
-    A ``PaymentTransaction`` row is NOT created because no money moved — the
-    audit event is the only record. Use for goodwill / dispute resolution.
+    No ``Payment`` ledger row is created because no money moved — the audit
+    event is the only record. Use for goodwill / dispute resolution.
     """
     if not reason or not reason.strip():
         raise HTTPException(400, "reason is required")

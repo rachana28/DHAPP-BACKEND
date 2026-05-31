@@ -14,7 +14,7 @@ def _now_ist_naive() -> datetime:
     """Current wall-clock time in IST as a naive datetime.
 
     Used as default_factory for trip-related models (Trip.booking_time,
-    OTPRegistry, PaymentTransaction, TripBill, TripAttendance, TripSettlement,
+    OTPRegistry, TripBill, TripAttendance, TripSettlement,
     PricingComponentBreakdown, TripOffer). Other models are unaffected.
     """
     return datetime.now(_IST).replace(tzinfo=None)
@@ -873,13 +873,37 @@ class TowTruckDriverReview(DriverReviewBase, table=True):
 
 
 # --- User Models ---
+class Gender(str, Enum):
+    MALE = "male"
+    FEMALE = "female"
+    OTHER = "other"
+    PREFER_NOT_TO_SAY = "prefer_not_to_say"
+
+
+def _normalize_gender(v):
+    if v in (None, ""):
+        return None
+    v = str(v).strip().lower()
+    allowed = {g.value for g in Gender}
+    if v not in allowed:
+        raise ValueError(f"gender must be one of {sorted(allowed)}")
+    return v
+
+
 class UserBase(SQLModel):
     phone_number: str = Field(index=True)
     email: Optional[EmailStr] = Field(default=None, unique=True, index=True)
     full_name: Optional[str] = None
+    gender: Optional[str] = Field(
+        default=None, description="One of: male | female | other | prefer_not_to_say"
+    )
     provider: str = "local"
     avatar_url: Optional[str] = None
     role: str = "user"
+
+    _validate_gender = field_validator("gender", mode="before")(
+        lambda cls, v: _normalize_gender(v)
+    )
 
 
 class UserDevice(SQLModel, table=True):
@@ -1184,6 +1208,9 @@ class User(UserBase, table=True):
         back_populates="user"
     )
     service_bookings: List["ServiceRequest"] = Relationship(back_populates="user")
+    addresses: List["UserAddress"] = Relationship(back_populates="user")
+    saved_cards: List["SavedCard"] = Relationship(back_populates="user")
+    wallet: Optional["Wallet"] = Relationship(back_populates="user")
 
 
 class UserPublic(SQLModel):
@@ -1201,6 +1228,11 @@ class UserPrivate(UserBase):
 class UserUpdate(SQLModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    gender: Optional[str] = None
+
+    _validate_gender = field_validator("gender", mode="before")(
+        lambda cls, v: _normalize_gender(v)
+    )
 
 
 class UserCreate(SQLModel):
@@ -1235,6 +1267,270 @@ class Token(SQLModel):
     refresh_token: str
     token_type: str
     user: dict
+
+
+# ======================================================================
+# USER ACCOUNT: ADDRESSES / SAVED CARDS / WALLET
+# ======================================================================
+
+
+# --- Addresses ---
+class AddressLabel(str, Enum):
+    HOME = "home"
+    WORK = "work"
+    OTHER = "other"
+
+
+class UserAddressBase(SQLModel):
+    label: str = "home"  # home | work | other
+    address_line: str = Field(max_length=500)  # full string address
+    # {"lat": <float>, "lng": <float>} — coordinates stored as JSON per address.
+    location: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    is_default: bool = False
+
+    @field_validator("address_line", mode="before")
+    def _sanitize_address(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class UserAddress(UserAddressBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+    is_active: bool = Field(default=True, index=True)  # soft-delete flag
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+
+    user: "User" = Relationship(back_populates="addresses")
+
+
+class UserAddressCreate(SQLModel):
+    label: str = "home"
+    address_line: str = Field(max_length=500)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    is_default: bool = False
+
+    @field_validator("label", mode="before")
+    def _validate_label(cls, v):
+        if v in (None, ""):
+            return "home"
+        if v not in {x.value for x in AddressLabel}:
+            raise ValueError(f"label must be one of {[x.value for x in AddressLabel]}")
+        return v
+
+    @field_validator("lat")
+    def _validate_lat(cls, v):
+        if v is not None and not (-90 <= v <= 90):
+            raise ValueError("lat must be between -90 and 90")
+        return v
+
+    @field_validator("lng")
+    def _validate_lng(cls, v):
+        if v is not None and not (-180 <= v <= 180):
+            raise ValueError("lng must be between -180 and 180")
+        return v
+
+    @field_validator("address_line", mode="before")
+    def _sanitize_address(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class UserAddressUpdate(SQLModel):
+    label: Optional[str] = None
+    address_line: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    is_default: Optional[bool] = None
+
+    @field_validator("label", mode="before")
+    def _validate_label(cls, v):
+        if v is None:
+            return v
+        if v not in {x.value for x in AddressLabel}:
+            raise ValueError(f"label must be one of {[x.value for x in AddressLabel]}")
+        return v
+
+    @field_validator("lat")
+    def _validate_lat(cls, v):
+        if v is not None and not (-90 <= v <= 90):
+            raise ValueError("lat must be between -90 and 90")
+        return v
+
+    @field_validator("lng")
+    def _validate_lng(cls, v):
+        if v is not None and not (-180 <= v <= 180):
+            raise ValueError("lng must be between -180 and 180")
+        return v
+
+    @field_validator("address_line", mode="before")
+    def _sanitize_address(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class UserAddressPublic(SQLModel):
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    label: str
+    address_line: str
+    location: Dict[str, Any] = Field(default_factory=dict)
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+# --- Saved Cards (tokenized — raw PAN/CVV are NEVER persisted) ---
+class SavedCardBase(SQLModel):
+    brand: str = "unknown"  # visa|mastercard|amex|rupay|diners|discover|unknown
+    last4: str
+    expiry_month: int
+    expiry_year: int
+    card_holder_name: Optional[str] = None
+    nickname: Optional[str] = None
+    is_default: bool = False
+
+
+class SavedCard(SavedCardBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+    # Gateway vault token + a fingerprint to dedupe the same physical card.
+    # The raw card number / CVV are never stored here.
+    card_token: str
+    card_fingerprint: Optional[str] = Field(default=None, index=True)
+    is_active: bool = Field(default=True, index=True)  # soft-delete flag
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+
+    user: "User" = Relationship(back_populates="saved_cards")
+
+
+class SavedCardCreate(SQLModel):
+    card_number: str  # raw PAN — tokenized then discarded, never stored/logged
+    expiry_month: int
+    expiry_year: int
+    cvv: str  # used for tokenization only, never stored/logged
+    card_holder_name: Optional[str] = None
+    nickname: Optional[str] = None
+    is_default: bool = False
+
+    @field_validator("card_number", "cvv", mode="before")
+    def _strip_sensitive(cls, v):
+        if isinstance(v, str):
+            return v.replace(" ", "").replace("-", "").strip()
+        return v
+
+    @field_validator("card_holder_name", "nickname", mode="before")
+    def _sanitize(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class SavedCardUpdate(SQLModel):
+    card_holder_name: Optional[str] = None
+    nickname: Optional[str] = None
+    is_default: Optional[bool] = None
+
+    @field_validator("card_holder_name", "nickname", mode="before")
+    def _sanitize(cls, v):
+        if isinstance(v, str):
+            return html.escape(v.strip())
+        return v
+
+
+class SavedCardPublic(SQLModel):
+    """Safe card view — exposes brand/last4/expiry only, NEVER the token."""
+
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    brand: str
+    last4: str
+    expiry_month: int
+    expiry_year: int
+    card_holder_name: Optional[str] = None
+    nickname: Optional[str] = None
+    is_default: bool
+    created_at: datetime
+
+
+# --- Wallet ---
+class Wallet(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", unique=True, index=True)
+    balance: float = 0.0
+    currency: str = "INR"
+    is_active: bool = True  # freeze/block flag
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+
+    user: "User" = Relationship(back_populates="wallet")
+
+
+class WalletTransaction(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    wallet_id: int = Field(foreign_key="wallet.id", index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+
+    type: str  # "credit" | "debit"
+    source: str  # topup | payment | refund | admin_credit | promo | reversal
+    amount: float  # always positive
+    balance_after: float = 0.0
+    status: str = "success"  # pending | success | failed
+
+    # Linkage / provenance
+    payment_reference: Optional[str] = Field(default=None, index=True)
+    related_service_type: Optional[str] = None
+    related_service_reference_id: Optional[str] = None
+    gateway_intent_id: Optional[str] = Field(default=None, index=True)
+    idempotency_key: Optional[str] = Field(default=None, index=True)
+    note: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+
+
+class WalletPublic(SQLModel):
+    balance: float
+    currency: str
+    is_active: bool
+    updated_at: datetime
+
+
+class WalletTransactionPublic(SQLModel):
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    type: str
+    source: str
+    amount: float
+    balance_after: float
+    status: str
+    payment_reference: Optional[str] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+
+class WalletTopupRequest(SQLModel):
+    amount: float
+
+
+class WalletAdminCreditRequest(SQLModel):
+    user_reference: str  # target user's reference (phone_number)
+    amount: float
+    source: str = "admin_credit"  # admin_credit | promo
+    note: Optional[str] = None
+
+    @field_validator("source", mode="before")
+    def _validate_source(cls, v):
+        if v in (None, ""):
+            return "admin_credit"
+        if v not in {"admin_credit", "promo"}:
+            raise ValueError("source must be 'admin_credit' or 'promo'")
+        return v
 
 
 # --- Trip API Models ---
@@ -1390,31 +1686,11 @@ class OTPRegistry(SQLModel, table=True):
     max_attempts: int = 3
 
 
-# --- PAYMENT TRANSACTIONS ---
-class PaymentTransaction(SQLModel, table=True):
-    """Tracks all payment transactions (user and driver)"""
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    trip_id: int = Field(foreign_key="trip.id")
-    user_id: Optional[uuid.UUID] = Field(default=None, foreign_key="user.id")
-    driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
-
-    payer_type: str  # "user" or "driver"
-    payment_type: str  # "trip_day", "advance_20", "full_payment", "driver_acceptance"
-    amount: float
-    payment_status: str  # "pending", "success", "failed", "refunded", "refund_failed"
-    payment_method: str  # "card", "wallet", "upi", etc (dummy for now)
-    gateway_transaction_id: Optional[str] = None
-    # Distinct from gateway_transaction_id so a refund row can reference both
-    # the original charge's gateway id and the refund call's gateway id. Set
-    # by process_refund when the gateway accepts the refund (F9).
-    gateway_refund_id: Optional[str] = None
-
-    created_at: datetime = Field(default_factory=_now_ist_naive)
-    completed_at: Optional[datetime] = None
-    refund_at: Optional[datetime] = None
-    refund_amount: Optional[float] = None
-    refund_reason: Optional[str] = None
+# NOTE: The legacy trip-only ``PaymentTransaction`` table was removed. Trip
+# payments (driver acceptance fee, user upfront, daily bills, settlement,
+# cancellation balance) now live on the centralized ``Payment`` table below,
+# discriminated by ``purpose`` + ``payer_type``. See app.modules.trips.
+# payment_orchestrator for the post-payment side effects.
 
 
 # --- CENTRALIZED PAYMENTS (polymorphic across services) ---
@@ -1422,26 +1698,43 @@ class Payment(SQLModel, table=True):
     """One payment per booking-charge across any service type.
 
     Polymorphic link: (service_type, service_reference_id) point at the booking
-    (tow / mechanic / service_center today; trip flows still use the legacy
-    PaymentTransaction/TripBill/TripSettlement tables). ``channel`` distinguishes
-    platform-held gateway money from direct cash/UPI collected by the provider.
+    (tow / mechanic / service_center / trip). ``channel`` distinguishes
+    platform-held gateway money, prepaid wallet, and direct cash/UPI collected
+    by the provider.
+
+    Trip flows make MANY charges per booking, so ``purpose`` discriminates them
+    (driver_acceptance / user_upfront / daily_bill / settlement /
+    cancellation_balance / schedule_diff) and ``payer_type`` records whether a
+    user or a driver paid (the driver acceptance fee is paid by the driver).
+    For non-trip services ``purpose`` is None and ``payer_type`` is "user".
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
 
-    service_type: str = Field(index=True)  # "tow" | "mechanic" | "service_center"
+    service_type: str = Field(index=True)  # "tow"|"mechanic"|"service_center"|"trip"
     service_reference_id: str = Field(index=True)  # booking's reference_id
     service_id: int  # booking's internal PK (no hard FK — polymorphic)
 
-    user_id: uuid.UUID = Field(foreign_key="user.id")  # payer
+    user_id: uuid.UUID = Field(foreign_key="user.id")  # payer's user account
     payee_type: str = "platform"  # "platform" | "driver"
     payee_driver_id: Optional[int] = None  # provider PK when direct-to-driver
 
+    # Who actually pays. For trip driver-acceptance fees this is "driver" and
+    # payer_driver_id is the Driver PK (user_id still holds the driver's own
+    # User id so wallet refund routing keeps working). Defaults keep every
+    # existing tow/mechanic/service row unchanged.
+    payer_type: str = "user"  # "user" | "driver"
+    payer_driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+
+    # Trip charge discriminator (None for tow/mechanic/service).
+    purpose: Optional[str] = Field(default=None, index=True)
+
     amount: float
     currency: str = "INR"
-    channel: str  # "platform" | "cash" | "upi_direct"
-    status: str = "created"  # created|pending|succeeded|failed|refunded|cancelled
+    channel: str  # "platform" | "wallet" | "cash" | "upi_direct"
+    status: str = "created"  # created|pending|succeeded|failed|refunded|partially_refunded|cancelled
+    refunded_amount: float = 0.0  # cumulative refunded (enables partial refunds)
 
     gateway_provider: str = "mock"
     gateway_intent_id: Optional[str] = Field(default=None, index=True)
@@ -1458,8 +1751,9 @@ class Payment(SQLModel, table=True):
 class PaymentIntentCreate(SQLModel):
     service_type: str
     service_reference_id: str
-    channel: str = "platform"  # "platform" | "cash" | "upi_direct"
+    channel: str = "platform"  # "platform" | "wallet" | "cash" | "upi_direct"
     amount: Optional[float] = None  # derived from the booking fare when omitted
+    card_reference_id: Optional[str] = None
 
 
 class PaymentPublic(SQLModel):
@@ -1468,10 +1762,12 @@ class PaymentPublic(SQLModel):
     id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     service_type: str
     service_reference_id: str
+    purpose: Optional[str] = None
     amount: float
     currency: str
     channel: str
     status: str
+    refunded_amount: float = 0.0
     created_at: datetime
     completed_at: Optional[datetime] = None
 

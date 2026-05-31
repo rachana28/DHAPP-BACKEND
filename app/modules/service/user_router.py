@@ -19,6 +19,7 @@ from app.core.models import (
     BookingType,
     ServiceStatus,
 )
+from app.modules.payments.service import refund_booking_payments
 from app.core.security import get_current_user
 from app.utils.notifications import send_push_notification
 from app.utils.id_generator import (
@@ -538,6 +539,15 @@ def cancel_service_booking(
 
     session.add(booking)
     session.commit()
+
+    refund_booking_payments(
+        session,
+        "service_center",
+        booking.reference_id,
+        reason=cancellation_reason or "Booking cancelled by user",
+        actor="user",
+        actor_id=str(current_user.id),
+    )
 
     # Notify service center
     center = session.get(ServiceCenter, booking.service_center_id)

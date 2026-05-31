@@ -17,11 +17,15 @@ from app.core.models import (
     Trip,
     Driver,
     TripAttendance,
-    PaymentTransaction,
+    Payment,
     TripBill,
     TripSettlement,
     PricingComponentBreakdown,
 )
+
+# Trip charges count as "paid in" while succeeded or partially refunded — a
+# partial refund leaves the original charge amount intact on the ledger.
+_PAID_IN_STATES = ["succeeded", "partially_refunded"]
 
 
 def payment_method_discount_pct(
@@ -188,13 +192,12 @@ class BillingService:
             total_amount = round(gross_amount - discount_amount, 2)
 
             upfront_payments = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
-                    PaymentTransaction.payment_type.notin_(
-                        ["trip_day_bill", "settlement"]
-                    ),
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "user",
+                    Payment.status.in_(_PAID_IN_STATES),
+                    Payment.purpose.notin_(["daily_bill", "settlement"]),
                 )
             ).all()
             total_upfront = sum(p.amount for p in upfront_payments)
@@ -212,11 +215,12 @@ class BillingService:
             trip_day_cash = sum(
                 p.amount
                 for p in session.exec(
-                    select(PaymentTransaction).where(
-                        PaymentTransaction.trip_id == trip_id,
-                        PaymentTransaction.payer_type == "user",
-                        PaymentTransaction.payment_status == "success",
-                        PaymentTransaction.payment_type == "trip_day_bill",
+                    select(Payment).where(
+                        Payment.service_type == "trip",
+                        Payment.service_id == trip_id,
+                        Payment.payer_type == "user",
+                        Payment.status.in_(_PAID_IN_STATES),
+                        Payment.purpose == "daily_bill",
                     )
                 ).all()
             )
@@ -365,18 +369,20 @@ class BillingService:
 
             # Calculate payments
             user_payments = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "user",
+                    Payment.status.in_(_PAID_IN_STATES),
                 )
             ).all()
 
             driver_payments = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "driver",
-                    PaymentTransaction.payment_status == "success",
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "driver",
+                    Payment.status.in_(_PAID_IN_STATES),
                 )
             ).all()
 

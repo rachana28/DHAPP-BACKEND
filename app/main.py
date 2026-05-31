@@ -46,6 +46,9 @@ from app.modules.service import (
     user_router as service_user_router,
 )
 from app.modules.payments import router as payments_router
+from app.modules.addresses import router as addresses_router
+from app.modules.cards import router as cards_router
+from app.modules.wallet import router as wallet_router
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -169,6 +172,9 @@ app.include_router(mechanic_profile_router.router)
 app.include_router(service_center_router.router)
 app.include_router(service_user_router.router)
 app.include_router(payments_router.router)
+app.include_router(addresses_router.router)
+app.include_router(cards_router.router)
+app.include_router(wallet_router.router)
 
 
 @app.get("/")

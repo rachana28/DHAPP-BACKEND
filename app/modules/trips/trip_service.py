@@ -16,7 +16,7 @@ import re
 from app.core.models import (
     Trip,
     TripAttendance,
-    PaymentTransaction,
+    Payment,
     TripBill,
     TripSettlement,
     Driver,
@@ -121,8 +121,13 @@ class TripService:
         new_state: str,
         validate: bool = True,
         expected_version: Optional[int] = None,
+        commit: bool = True,
     ) -> Tuple[bool, Optional[str]]:
-        """Row-locked, audit-emitted state change with optimistic version check."""
+        """Row-locked, audit-emitted state change with optimistic version check.
+
+        ``commit=False`` lets a caller that already owns an open transaction
+        (e.g. the trip payment orchestrator running inside a payment commit)
+        fold this transition into its own atomic commit."""
         try:
             # Row-lock serialises parallel transitions (driver end-trip vs.
             # auto-end scheduler, cancel vs. force-close, etc.).
@@ -148,7 +153,10 @@ class TripService:
             trip.status = new_state
             trip.state_version += 1
             session.add(trip)
-            session.commit()
+            if commit:
+                session.commit()
+            else:
+                session.flush()
 
             audit_emit(
                 "trip.state_transition",
@@ -248,10 +256,11 @@ class TripService:
         user_paid = sum(
             p.amount
             for p in session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip.id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip.id,
+                    Payment.payer_type == "user",
+                    Payment.status.in_(["succeeded", "partially_refunded"]),
                 )
             ).all()
         )
@@ -348,6 +357,7 @@ class TripService:
         trip_duration_hours: int,
         selected_days: Optional[str] = None,
         single_shift: bool = False,
+        commit: bool = True,
     ) -> Tuple[bool, Optional[str]]:
         try:
             start_hour = trip_start_dt.hour
@@ -374,7 +384,10 @@ class TripService:
                         scheduled_end=scheduled_end,
                     )
                 )
-                session.commit()
+                if commit:
+                    session.commit()
+                else:
+                    session.flush()
                 return True, None
 
             day_filter = self.parse_selected_days(selected_days)
@@ -408,12 +421,15 @@ class TripService:
 
                 current_date = current_date + timedelta(days=1)
 
-            session.commit()
             if created == 0:
                 return (
                     False,
                     "No attendance days created (selected_days may not match range)",
                 )
+            if commit:
+                session.commit()
+            else:
+                session.flush()
             return True, None
 
         except Exception as e:
@@ -817,19 +833,26 @@ class TripService:
                     trip.shift_details, trip.start_date
                 ) or datetime.combine(trip.start_date, datetime.min.time())
 
+            # Include refunded/partially_refunded here so total_user_paid stays
+            # the GROSS amount paid (matching the legacy success-row sum, which
+            # was never reduced by a refund) and total_amount_refunded can be
+            # derived from each charge's refunded_amount below.
+            _paid_states = ["succeeded", "partially_refunded", "refunded"]
             user_payments = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "user",
-                    PaymentTransaction.payment_status == "success",
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "user",
+                    Payment.status.in_(_paid_states),
                 )
             ).all()
 
             driver_payments = session.exec(
-                select(PaymentTransaction).where(
-                    PaymentTransaction.trip_id == trip_id,
-                    PaymentTransaction.payer_type == "driver",
-                    PaymentTransaction.payment_status == "success",
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "driver",
+                    Payment.status.in_(_paid_states),
                 )
             ).all()
 
@@ -926,20 +949,12 @@ class TripService:
                 result["upfront_amount_due"] = upfront_amount_due
 
             # Total refunded to the user — surfaced only for a cancelled trip.
-            # Refunds are recorded as PaymentTransaction rows with
-            # payer_type="user" and payment_status="refunded" (see
-            # PaymentService.process_refund); driver-fee refunds carry
-            # payer_type="driver" and are deliberately excluded here.
+            # On the centralized ledger a refund is the ``refunded_amount`` on
+            # the user's original charge (full or partial), not a separate row;
+            # driver-fee refunds carry payer_type="driver" and are excluded here.
             if (trip.status or "").startswith("cancel"):
-                user_refund_txns = session.exec(
-                    select(PaymentTransaction).where(
-                        PaymentTransaction.trip_id == trip_id,
-                        PaymentTransaction.payer_type == "user",
-                        PaymentTransaction.payment_status == "refunded",
-                    )
-                ).all()
                 result["total_amount_refunded"] = round(
-                    sum(p.amount for p in user_refund_txns), 2
+                    sum(p.refunded_amount or 0.0 for p in user_payments), 2
                 )
 
             # Outstation trips are point-to-point, so the booked route
@@ -968,7 +983,7 @@ class TripService:
             # so the driver block reliably appears in the summary.
             driver_detail: Dict[str, Any] = {}
             driver_paid_acceptance = trip.driver_payment_status == "paid" or any(
-                p.payment_type == "driver_acceptance" for p in driver_payments
+                p.purpose == "driver_acceptance" for p in driver_payments
             )
             if trip.driver_id is not None and driver_paid_acceptance:
                 driver = session.get(Driver, trip.driver_id)
