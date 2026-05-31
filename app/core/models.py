@@ -14,7 +14,7 @@ def _now_ist_naive() -> datetime:
     """Current wall-clock time in IST as a naive datetime.
 
     Used as default_factory for trip-related models (Trip.booking_time,
-    OTPRegistry, PaymentTransaction, TripBill, TripAttendance, TripSettlement,
+    OTPRegistry, TripBill, TripAttendance, TripSettlement,
     PricingComponentBreakdown, TripOffer). Other models are unaffected.
     """
     return datetime.now(_IST).replace(tzinfo=None)
@@ -1686,31 +1686,11 @@ class OTPRegistry(SQLModel, table=True):
     max_attempts: int = 3
 
 
-# --- PAYMENT TRANSACTIONS ---
-class PaymentTransaction(SQLModel, table=True):
-    """Tracks all payment transactions (user and driver)"""
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    trip_id: int = Field(foreign_key="trip.id")
-    user_id: Optional[uuid.UUID] = Field(default=None, foreign_key="user.id")
-    driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
-
-    payer_type: str  # "user" or "driver"
-    payment_type: str  # "trip_day", "advance_20", "full_payment", "driver_acceptance"
-    amount: float
-    payment_status: str  # "pending", "success", "failed", "refunded", "refund_failed"
-    payment_method: str  # "card", "wallet", "upi", etc (dummy for now)
-    gateway_transaction_id: Optional[str] = None
-    # Distinct from gateway_transaction_id so a refund row can reference both
-    # the original charge's gateway id and the refund call's gateway id. Set
-    # by process_refund when the gateway accepts the refund (F9).
-    gateway_refund_id: Optional[str] = None
-
-    created_at: datetime = Field(default_factory=_now_ist_naive)
-    completed_at: Optional[datetime] = None
-    refund_at: Optional[datetime] = None
-    refund_amount: Optional[float] = None
-    refund_reason: Optional[str] = None
+# NOTE: The legacy trip-only ``PaymentTransaction`` table was removed. Trip
+# payments (driver acceptance fee, user upfront, daily bills, settlement,
+# cancellation balance) now live on the centralized ``Payment`` table below,
+# discriminated by ``purpose`` + ``payer_type``. See app.modules.trips.
+# payment_orchestrator for the post-payment side effects.
 
 
 # --- CENTRALIZED PAYMENTS (polymorphic across services) ---
@@ -1718,26 +1698,43 @@ class Payment(SQLModel, table=True):
     """One payment per booking-charge across any service type.
 
     Polymorphic link: (service_type, service_reference_id) point at the booking
-    (tow / mechanic / service_center today; trip flows still use the legacy
-    PaymentTransaction/TripBill/TripSettlement tables). ``channel`` distinguishes
-    platform-held gateway money from direct cash/UPI collected by the provider.
+    (tow / mechanic / service_center / trip). ``channel`` distinguishes
+    platform-held gateway money, prepaid wallet, and direct cash/UPI collected
+    by the provider.
+
+    Trip flows make MANY charges per booking, so ``purpose`` discriminates them
+    (driver_acceptance / user_upfront / daily_bill / settlement /
+    cancellation_balance / schedule_diff) and ``payer_type`` records whether a
+    user or a driver paid (the driver acceptance fee is paid by the driver).
+    For non-trip services ``purpose`` is None and ``payer_type`` is "user".
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
 
-    service_type: str = Field(index=True)  # "tow" | "mechanic" | "service_center"
+    service_type: str = Field(index=True)  # "tow"|"mechanic"|"service_center"|"trip"
     service_reference_id: str = Field(index=True)  # booking's reference_id
     service_id: int  # booking's internal PK (no hard FK — polymorphic)
 
-    user_id: uuid.UUID = Field(foreign_key="user.id")  # payer
+    user_id: uuid.UUID = Field(foreign_key="user.id")  # payer's user account
     payee_type: str = "platform"  # "platform" | "driver"
     payee_driver_id: Optional[int] = None  # provider PK when direct-to-driver
 
+    # Who actually pays. For trip driver-acceptance fees this is "driver" and
+    # payer_driver_id is the Driver PK (user_id still holds the driver's own
+    # User id so wallet refund routing keeps working). Defaults keep every
+    # existing tow/mechanic/service row unchanged.
+    payer_type: str = "user"  # "user" | "driver"
+    payer_driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+
+    # Trip charge discriminator (None for tow/mechanic/service).
+    purpose: Optional[str] = Field(default=None, index=True)
+
     amount: float
     currency: str = "INR"
-    channel: str  # "platform" | "cash" | "upi_direct"
-    status: str = "created"  # created|pending|succeeded|failed|refunded|cancelled
+    channel: str  # "platform" | "wallet" | "cash" | "upi_direct"
+    status: str = "created"  # created|pending|succeeded|failed|refunded|partially_refunded|cancelled
+    refunded_amount: float = 0.0  # cumulative refunded (enables partial refunds)
 
     gateway_provider: str = "mock"
     gateway_intent_id: Optional[str] = Field(default=None, index=True)
@@ -1765,10 +1762,12 @@ class PaymentPublic(SQLModel):
     id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     service_type: str
     service_reference_id: str
+    purpose: Optional[str] = None
     amount: float
     currency: str
     channel: str
     status: str
+    refunded_amount: float = 0.0
     created_at: datetime
     completed_at: Optional[datetime] = None
 

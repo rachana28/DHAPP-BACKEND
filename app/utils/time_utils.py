@@ -2,7 +2,7 @@
 IST timezone helpers — shared utility for any module that needs IST-naive datetimes.
 
 Originally introduced for the trip-management module (booking_time,
-scheduled_*_time, OTPRegistry, TripBill, TripAttendance, PaymentTransaction,
+scheduled_*_time, OTPRegistry, TripBill, TripAttendance, Payment,
 scheduler jobs, fare engine). Lives in `app.utils` so other modules can adopt
 the same convention without re-implementing it.
 
