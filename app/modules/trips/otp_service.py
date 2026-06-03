@@ -252,7 +252,7 @@ class OTPService:
                     self.redis.expire(attempts_key, 900)
                 except redis.RedisError:
                     pass
-            remaining = max(0, self.MAX_ATTEMPTS - attempts - 1)
+            remaining = max(0, max_db_attempts - db_row.verification_attempts)
             return False, f"Invalid OTP. Attempts remaining: {remaining}"
 
         db_row.verified_at = now

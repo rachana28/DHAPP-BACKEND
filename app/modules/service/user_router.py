@@ -18,8 +18,10 @@ from app.core.models import (
     User,
     BookingType,
     ServiceStatus,
+    SystemConfig,
 )
 from app.modules.payments.service import refund_booking_payments
+from app.services.dues import raise_if_unpaid_past_due
 from app.core.security import get_current_user
 from app.utils.notifications import send_push_notification
 from app.utils.id_generator import (
@@ -30,6 +32,35 @@ from app.utils.id_generator import (
 import math
 
 router = APIRouter(prefix="/services", tags=["User Services"])
+
+
+SERVICE_CENTER_ADVANCE_PCT_KEY = "service_center_advance_pct"
+DEFAULT_SERVICE_CENTER_ADVANCE_PCT = 0.20
+
+SERVICE_CENTER_LATE_CANCEL_HOURS_KEY = "service_center_late_cancel_hours"
+DEFAULT_SERVICE_CENTER_LATE_CANCEL_HOURS = 6.0
+
+
+def _service_center_advance_pct(session: Session) -> float:
+    cfg = session.get(SystemConfig, SERVICE_CENTER_ADVANCE_PCT_KEY)
+    if cfg and cfg.value:
+        try:
+            v = float(cfg.value)
+            if 0.0 <= v <= 1.0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_SERVICE_CENTER_ADVANCE_PCT
+
+
+def _service_center_late_cancel_hours(session: Session) -> float:
+    cfg = session.get(SystemConfig, SERVICE_CENTER_LATE_CANCEL_HOURS_KEY)
+    if cfg and cfg.value:
+        try:
+            return float(cfg.value)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_SERVICE_CENTER_LATE_CANCEL_HOURS
 
 
 # --- SERVICE CENTER DISCOVERY ---
@@ -304,6 +335,8 @@ def book_service(
     if current_user.role != "user":
         raise HTTPException(status_code=403, detail="Only users can book services")
 
+    raise_if_unpaid_past_due(session, current_user.id)
+
     # Verify service center exists and is available
     center = get_by_reference(session, ServiceCenter, booking_data.service_center_id)
     if not center or center.status != "available":
@@ -333,6 +366,7 @@ def book_service(
     price_at_booking = None
     price_components = []
     slot_id = None
+    advance_amount = None
 
     # --- SLOT-BASED BOOKING ---
     if service.booking_type == BookingType.SLOT_BASED:
@@ -360,7 +394,13 @@ def book_service(
 
         end_time = start_time + timedelta(hours=service.service_duration_hours)
 
-        # Check overlaps
+        session.exec(
+            select(CenterService)
+            .where(CenterService.id == service.id)
+            .with_for_update()
+        ).first()
+
+        # Check overlaps (now under the lock, so the count is consistent).
         overlap_count = session.exec(
             select(func.count(ServiceSlot.id)).where(
                 ServiceSlot.center_service_id == service.id,
@@ -369,10 +409,10 @@ def book_service(
             )
         ).one()
 
-        if overlap_count >= service.max_concurrent_bookings:
-            raise HTTPException(
-                status_code=400, detail="This time slot is no longer available."
-            )
+        # At/over capacity no longer hard-rejects (D10). The booking is held in
+        # `pending_confirmation` for the center to accept or decline; within
+        # capacity it auto-confirms to `booked` as before.
+        over_capacity = overlap_count >= service.max_concurrent_bookings
 
         # Create the physical locked slot
         locked_slot = ServiceSlot(
@@ -404,10 +444,17 @@ def book_service(
         expected_return_date = expected_return_datetime.date()
         expected_return_time = expected_return_datetime.strftime("%H:%M")
 
-        # Price is locked for slot-based bookings
         price_at_booking = service.price
         price_components = service.pricing_components or []
-        booking_status = ServiceStatus.BOOKED
+        advance_pct = _service_center_advance_pct(session)
+        advance_amount = (
+            round((service.price or 0.0) * advance_pct, 2) if service.price else None
+        )
+        booking_status = (
+            ServiceStatus.PENDING_CONFIRMATION
+            if over_capacity
+            else ServiceStatus.BOOKED
+        )
 
     # --- WALK-IN BOOKING ---
     elif service.booking_type == BookingType.WALK_IN:
@@ -448,6 +495,8 @@ def book_service(
         final_price=price_at_booking,
         price_locked=service.booking_type == BookingType.SLOT_BASED,
         price_components=price_components,
+        advance_amount=advance_amount,
+        amount_paid=0.0,
     )
 
     session.add(new_booking)
@@ -522,32 +571,47 @@ def cancel_service_booking(
             detail="Cannot cancel a completed or already cancelled booking",
         )
 
-    # Free up slot capacity if slot-based
+    slot_start = None
     if booking.slot_id:
         try:
             slot = session.get(ServiceSlot, booking.slot_id)
             if slot:
+                slot_start = slot.start_time
                 session.delete(slot)
         except NoResultFound:
             pass
+
+    late_cancel = False
+    if slot_start is not None:
+        cutoff = slot_start - timedelta(
+            hours=_service_center_late_cancel_hours(session)
+        )
+        late_cancel = datetime.utcnow() >= cutoff
 
     booking.status = ServiceStatus.CANCELLED.value
     booking.cancellation_time = datetime.utcnow()
     # Store user's cancellation reason if provided
     if cancellation_reason:
         booking.cancellation_reason = cancellation_reason
+    if late_cancel:
+        booking.cancellation_reason = (
+            (cancellation_reason + " " if cancellation_reason else "")
+            + "(advance forfeited — cancelled within the late-cancellation window)"
+        ).strip()
 
     session.add(booking)
     session.commit()
 
-    refund_booking_payments(
-        session,
-        "service_center",
-        booking.reference_id,
-        reason=cancellation_reason or "Booking cancelled by user",
-        actor="user",
-        actor_id=str(current_user.id),
-    )
+    refunded = []
+    if not late_cancel:
+        refunded = refund_booking_payments(
+            session,
+            "service_center",
+            booking.reference_id,
+            reason=cancellation_reason or "Booking cancelled by user",
+            actor="user",
+            actor_id=str(current_user.id),
+        )
 
     # Notify service center
     center = session.get(ServiceCenter, booking.service_center_id)
@@ -560,6 +624,13 @@ def cancel_service_booking(
             body="A customer cancelled their service booking",
             data={"booking_id": booking.reference_id, "type": "cancellation"},
         )
+
+    return {
+        "message": "Booking cancelled",
+        "booking_id": booking.reference_id,
+        "advance_forfeited": late_cancel,
+        "refunded_payments": refunded,
+    }
 
     return {"message": "Booking cancelled successfully"}
 

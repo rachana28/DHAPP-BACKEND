@@ -201,9 +201,11 @@ async def update_ticket_status(
         raise HTTPException(404, "Ticket not found")
 
     previous_status = ticket.status
-    # Closed tickets are terminal — do not allow reopening through this route.
-    # If admin needs to continue helping the user, instruct them to ask the
-    # user to open a new ticket. This matches Uber/Lyft behaviour.
+
+    if payload.status == "resolved":
+        payload.status = "closed"
+
+
     if previous_status == "closed" and payload.status != "closed":
         raise HTTPException(
             409, "Closed tickets cannot be reopened. Ask the user to open a new one."

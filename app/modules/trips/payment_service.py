@@ -28,6 +28,7 @@ from app.core.models import (
     User,
 )
 from app.services.audit_log import emit_event as audit_emit
+from app.modules.payments import service as central
 
 # A trip charge counts as paid-in while succeeded or partially refunded.
 _PAID_IN_STATES = ["succeeded", "partially_refunded"]
@@ -36,7 +37,9 @@ _PAID_IN_STATES = ["succeeded", "partially_refunded"]
 def _resolve_driver_user(session: Session, driver_id: int) -> Optional[User]:
     """The User account behind a Driver PK (driver-paid charges debit/refund it)."""
     return session.exec(
-        select(User).join(Driver, Driver.user_id == User.id).where(Driver.id == driver_id)
+        select(User)
+        .join(Driver, Driver.user_id == User.id)
+        .where(Driver.id == driver_id)
     ).first()
 
 
@@ -46,9 +49,47 @@ def _bill_purpose(bill: TripBill) -> str:
         return bill.bill_type
     return "daily_bill"
 
+
 # Key in SystemConfig table (admin-editable via /admin/system-config).
 DRIVER_ACCEPTANCE_FEE_KEY = "driver_acceptance_fee"
 DEFAULT_DRIVER_ACCEPTANCE_FEE = 100.0
+
+DRIVER_ABANDON_SUSPENSION_HOURS_KEY = "driver_abandon_suspension_hours"
+DEFAULT_DRIVER_ABANDON_SUSPENSION_HOURS = 48.0
+
+
+def get_driver_abandon_suspension_hours(
+    session: Session,
+    redis_client: Optional[redis.Redis] = None,
+) -> float:
+    """Resolve the post-abandonment suspension window (hours). Redis →
+    SystemConfig → hard-coded default, mirroring get_driver_acceptance_fee."""
+    if redis_client is not None:
+        try:
+            cached = redis_client.get(f"config:{DRIVER_ABANDON_SUSPENSION_HOURS_KEY}")
+            if cached:
+                if isinstance(cached, bytes):
+                    cached = cached.decode()
+                return float(cached)
+        except (redis.RedisError, ValueError, TypeError):
+            pass
+
+    cfg = session.get(SystemConfig, DRIVER_ABANDON_SUSPENSION_HOURS_KEY)
+    if cfg and cfg.value:
+        try:
+            value = float(cfg.value)
+            if redis_client is not None:
+                try:
+                    redis_client.set(
+                        f"config:{DRIVER_ABANDON_SUSPENSION_HOURS_KEY}", cfg.value
+                    )
+                except redis.RedisError:
+                    pass
+            return value
+        except (TypeError, ValueError):
+            pass
+
+    return DEFAULT_DRIVER_ABANDON_SUSPENSION_HOURS
 
 
 def get_driver_acceptance_fee(
@@ -105,20 +146,34 @@ class PaymentService:
     ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
         """Charge the driver acceptance fee on the central ledger.
 
-        Returns ``(payment, client_secret, error)``. For wallet/cash the fee
-        settles synchronously and the orchestrator flips driver_payment_status
-        to "paid" + arms the trip; for platform it stays pending until the
-        gateway webhook fires that same hook. ``client_secret`` is set only for
-        platform charges."""
-        from app.modules.payments import service as central
+        The fee is gateway-card only (``channel`` must be "platform") — the
+        wallet is a user-only feature and is NOT available to drivers. Returns
+        ``(payment, client_secret, error)``; the charge stays pending until the
+        gateway webhook fires the orchestrator hook, which flips
+        driver_payment_status to "paid" and arms the trip. ``client_secret`` is
+        always set (platform channel)."""
+
         try:
+            if channel != "platform":
+                return (
+                    None,
+                    None,
+                    (
+                        "Drivers can only pay the acceptance fee by card (channel "
+                        "'platform'); the wallet is a user-only feature."
+                    ),
+                )
             trip = session.get(Trip, trip_id)
             if not trip:
                 return None, None, "Trip not found"
             if trip.driver_id != driver_id:
                 return None, None, "Driver not matched to this trip"
             if trip.driver_payment_status != "unpaid":
-                return None, None, f"Driver payment already {trip.driver_payment_status}"
+                return (
+                    None,
+                    None,
+                    f"Driver payment already {trip.driver_payment_status}",
+                )
 
             driver_user = _resolve_driver_user(session, driver_id)
             if not driver_user:
@@ -159,7 +214,7 @@ class PaymentService:
         Returns ``(payment, client_secret, error)``. For wallet the upfront
         settles synchronously and the orchestrator un-blocks the trip; for
         platform it stays pending until the webhook fires that hook."""
-        from app.modules.payments import service as central
+
         try:
             if amount is None or amount <= 0:
                 return None, None, "Invalid amount"
@@ -420,7 +475,7 @@ class PaymentService:
         the bill settles synchronously (the orchestrator marks it paid and
         unpauses the trip); for platform it stays open until the webhook fires
         that same hook. Returns ``(payment, client_secret, error)``."""
-        from app.modules.payments import service as central
+
         try:
             bill = session.exec(
                 select(TripBill).where(TripBill.id == bill_id).with_for_update()
@@ -467,7 +522,7 @@ class PaymentService:
     ) -> Tuple[bool, Optional[str]]:
         """Driver confirms cash collected from the user. Settles immediately on
         the central ledger (cash collected offline → succeeded right away)."""
-        from app.modules.payments import service as central
+
         try:
             bill = session.exec(
                 select(TripBill).where(TripBill.id == bill_id).with_for_update()

@@ -81,11 +81,19 @@ class IdempotencyGuard:
             _LOG.warning("idempotency cache write failed (swallowed): %s", exc)
 
 
-def idempotent(scope: str):
+def idempotent(scope: str, path_params: Optional[list[str]] = None):
     """Build a FastAPI dependency that gates an endpoint behind an idempotency key.
 
     :param scope: Static namespace e.g. ``"bill.pay"`` so two endpoints with the
         same Idempotency-Key from a client don't collide.
+    :param path_params: Optional list of path-param names (e.g. ``["bill_id"]``)
+        whose values are folded into the cache key. Without this, an endpoint
+        keyed only by a path resource (the body being identical across
+        resources) would alias one resource's cached response onto another when
+        a client reuses the same Idempotency-Key — e.g. paying bill A then bill B
+        with the same key returned bill A's response. Including the resource id
+        in the cache key scopes the replay to that exact resource. Default
+        (None) preserves the original body-only behaviour.
     """
 
     async def _dep(
@@ -102,7 +110,12 @@ def idempotent(scope: str):
 
         body = await request.body()
         body_hash = _hash_body(body)
-        cache_key = f"{_KEY_PREFIX}{scope}:{idempotency_key}"
+
+        scope_suffix = ""
+        if path_params:
+            parts = [str(request.path_params.get(name, "")) for name in path_params]
+            scope_suffix = ":" + ":".join(parts)
+        cache_key = f"{_KEY_PREFIX}{scope}{scope_suffix}:{idempotency_key}"
 
         try:
             cached_raw = redis_client.get(cache_key)

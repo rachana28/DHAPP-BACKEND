@@ -281,6 +281,31 @@ def confirm_topup(session: Session, gateway_intent_id: str) -> bool:
     wallet = session.exec(
         select(Wallet).where(Wallet.id == txn.wallet_id).with_for_update()
     ).first()
+
+    cap = _get_config_float(session, WALLET_MAX_BALANCE_KEY, DEFAULT_WALLET_MAX_BALANCE)
+    if wallet.balance + txn.amount > cap + _EPS:
+        txn.status = "failed"
+        txn.balance_after = wallet.balance  # unchanged — nothing credited
+        txn.note = (
+            txn.note or "Wallet top-up"
+        ) + f" — rejected at settlement: exceeds balance cap (₹{cap:.0f}); refund due"
+        txn.updated_at = now_ist()
+        session.add(txn)
+        session.commit()
+        audit_emit(
+            "wallet.topup_rejected_over_cap",
+            trip_id=None,
+            actor="system",
+            actor_id="gateway_webhook",
+            payload={
+                "txn_reference": txn.reference_id,
+                "amount": txn.amount,
+                "cap": cap,
+                "balance": wallet.balance,
+            },
+        )
+        return True  # the intent was recognized and handled (no credit)
+
     wallet.balance = round(wallet.balance + txn.amount, 2)
     wallet.updated_at = now_ist()
     txn.status = "success"
@@ -296,6 +321,51 @@ def confirm_topup(session: Session, gateway_intent_id: str) -> bool:
         actor="system",
         actor_id="gateway_webhook",
         payload={"txn_reference": txn.reference_id, "amount": txn.amount},
+    )
+    return True
+
+
+def fail_topup(
+    session: Session, gateway_intent_id: str, reason: Optional[str] = None
+) -> bool:
+    """Mark a pending top-up failed (gateway decline or auto-expiry).
+
+    Idempotent: an already-failed/terminal top-up is a no-op. Returns True when a
+    matching top-up txn was found so the webhook handler can report it handled.
+    Never un-settles a top-up that already credited the wallet."""
+    txn = session.exec(
+        select(WalletTransaction)
+        .where(
+            WalletTransaction.gateway_intent_id == gateway_intent_id,
+            WalletTransaction.source == "topup",
+        )
+        .with_for_update()
+    ).first()
+    if not txn:
+        return False
+    if txn.status == "success":
+        return True  # already credited — cannot fail it
+    if txn.status != "pending":
+        return True  # already failed/terminal
+
+    txn.status = "failed"
+    txn.note = (txn.note or "Wallet top-up") + (
+        f" — failed: {reason}" if reason else " — failed"
+    )
+    txn.updated_at = now_ist()
+    session.add(txn)
+    session.commit()
+
+    audit_emit(
+        "wallet.topup_failed",
+        trip_id=None,
+        actor="system",
+        actor_id="gateway_webhook",
+        payload={
+            "txn_reference": txn.reference_id,
+            "amount": txn.amount,
+            "reason": reason,
+        },
     )
     return True
 

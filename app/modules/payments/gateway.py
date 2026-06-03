@@ -98,3 +98,23 @@ def build_success_event(
     }
     payload = json.dumps(event, separators=(",", ":"), sort_keys=True)
     return event, payload, sign(payload)
+
+
+def build_failed_event(
+    intent_id: str, amount: float, reason: str = "card_declined"
+) -> Tuple[Dict[str, Any], str, str]:
+    """Construct a signed ``payment_intent.payment_failed`` event (the mock
+    'webhook'). Mirrors build_success_event so handle_webhook runs the same
+    signature-verification path for a declined charge."""
+    event = {
+        "id": f"evt_mock_{uuid.uuid4().hex[:12]}",
+        "type": "payment_intent.payment_failed",
+        "data": {
+            "intent_id": intent_id,
+            "amount": round(amount, 2),
+            "status": "failed",
+            "failure_reason": reason,
+        },
+    }
+    payload = json.dumps(event, separators=(",", ":"), sort_keys=True)
+    return event, payload, sign(payload)
