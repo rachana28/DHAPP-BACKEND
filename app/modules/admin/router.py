@@ -176,6 +176,9 @@ def update_driver_status(
     elif status == "available":
         driver.admin_notes = None
 
+    if status == "available":
+        driver.suspended_until = None
+
     session.add(driver)
     session.commit()
 

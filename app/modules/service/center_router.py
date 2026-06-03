@@ -25,6 +25,7 @@ from app.core.models import (
     ServiceStatus,
 )
 from app.core.security import get_current_active_service_center
+from app.modules.payments.service import refund_booking_payments
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
 from app.utils.id_generator import get_by_reference
 from sqlalchemy.orm import selectinload
@@ -557,8 +558,10 @@ def update_booking_status(
             detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}",
         )
 
+    previous_status = booking.status
     booking.status = new_status
 
+    center_cancelled = False
     # Set completion time if status is completed
     if new_status == "completed":
         booking.completed_time = datetime.utcnow()
@@ -570,8 +573,9 @@ def update_booking_status(
         # Store cancellation reason if provided
         if cancellation_reason:
             booking.cancellation_reason = cancellation_reason
+        center_cancelled = True
 
-        # Delete slot if it exists (for slot-based bookings)
+        # Delete slot if it exists (for slot-based bookings) — frees capacity.
         if booking.slot_id:
             try:
                 slot = session.get(ServiceSlot, booking.slot_id)
@@ -583,9 +587,20 @@ def update_booking_status(
     session.add(booking)
     session.commit()
 
+    if center_cancelled:
+        refund_booking_payments(
+            session,
+            "service_center",
+            booking.reference_id,
+            reason=cancellation_reason or "Cancelled by service center",
+            actor="service_center",
+            actor_id=str(current_center.id),
+        )
+
     return {
         "message": f"Booking status updated to {new_status}",
         "booking_id": booking_id,
+        "previous_status": previous_status,
     }
 
 
@@ -663,7 +678,6 @@ def set_expected_return_date(
 
     booking.expected_return_date = expected_return_date
     booking.expected_return_time = expected_return_time
-    booking.status = "in_service"
 
     session.add(booking)
     session.commit()
@@ -672,6 +686,7 @@ def set_expected_return_date(
         "message": "Expected return date set successfully",
         "expected_return_date": expected_return_date,
         "expected_return_time": expected_return_time,
+        "status": booking.status,
     }
 
 

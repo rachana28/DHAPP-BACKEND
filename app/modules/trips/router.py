@@ -34,7 +34,11 @@ from app.modules.trips.allocation import (
     attempt_trip_escalation,
 )
 from app.modules.trips.otp_service import OTPService
-from app.modules.trips.payment_service import PaymentService, get_driver_acceptance_fee
+from app.modules.trips.payment_service import (
+    PaymentService,
+    get_driver_acceptance_fee,
+    get_driver_abandon_suspension_hours,
+)
 from app.modules.trips.trip_service import TripService
 from app.modules.trips.billing_service import (
     BillingService,
@@ -45,6 +49,7 @@ from app.modules.trips.pricing_calculator import (
     validate_pricing_inputs,
 )
 from app.utils.time_utils import now_ist, today_ist, to_ist_naive
+from app.services.dues import raise_if_unpaid_past_due
 from app.utils.notifications import send_push_notification
 from app.utils.id_generator import (
     generate_reference_id,
@@ -66,6 +71,17 @@ _ONLINE_PAY_CHANNELS = ("platform", "wallet")
 def _validate_online_channel(channel: str) -> None:
     if channel not in _ONLINE_PAY_CHANNELS:
         raise HTTPException(400, f"channel must be one of {list(_ONLINE_PAY_CHANNELS)}")
+
+
+def _validate_driver_channel(channel: str) -> None:
+    """The wallet is a user-only feature — drivers pay the acceptance fee by
+    card (gateway) only."""
+    if channel != "platform":
+        raise HTTPException(
+            400,
+            "Drivers pay the acceptance fee by card only (channel must be "
+            "'platform'); the wallet is a user-only feature.",
+        )
 
 
 def _maybe_schedule_platform_settlement(background_tasks, payment) -> None:
@@ -184,6 +200,11 @@ def create_booking_request(
         )
         raise HTTPException(409, msg)
 
+    # D6: platform-wide gate — an unpaid PAST-DUE settlement from ANY service
+    # (trip or service-center) blocks new bookings until cleared (grace until
+    # due_date). Complements the stricter trip-only check above.
+    raise_if_unpaid_past_due(session, current_user.id)
+
     trip_data = trip_in.model_dump()
 
     trip_data["driver_id"] = None
@@ -294,9 +315,10 @@ def create_booking_request(
     ranked_drivers = rank_drivers(session, trip_in.vehicle_type)
 
     if not ranked_drivers:
-        db_trip.status = "no_drivers_found"
-        session.add(db_trip)
-        session.commit()
+        # D4: keep searching forever — never auto-give-up. With no driver
+        # available right now the trip stays in `searching` (no offers yet); the
+        # per-minute re-search scheduler seeds tier-1 offers as soon as a driver
+        # becomes available. (`no_drivers_found` is no longer set here.)
         return db_trip
 
     tier_1_drivers = ranked_drivers[:TIER_SIZE]
@@ -1020,6 +1042,13 @@ def select_payment_method(
             "trip_status": trip.status,
         }
 
+    if PaymentService(None).trip_has_unpaid_bills(session, trip_id):
+        raise HTTPException(
+            400,
+            "You have an unpaid bill on this trip. Please clear all outstanding "
+            "bills before switching to advance_20 / full_payment.",
+        )
+
     # advance_20 / full_payment — compute upfront on the outstanding portion only.
     portion = trip_service.compute_outstanding_portion(session, trip)
     outstanding_gross = portion["outstanding_gross"]
@@ -1086,7 +1115,7 @@ def user_pay_upfront(
     idempotency_key: Optional[str] = Header(
         default=None, alias="Idempotency-Key", convert_underscores=False
     ),
-    idem: IdempotencyGuard = Depends(idempotent("upfront.pay")),
+    idem: IdempotencyGuard = Depends(idempotent("upfront.pay", ["trip_id"])),
 ):
     """User upfront payment for an advance_20 / full_payment trip.
 
@@ -1347,21 +1376,24 @@ def driver_process_payment(
     idempotency_key: Optional[str] = Header(
         default=None, alias="Idempotency-Key", convert_underscores=False
     ),
-    idem: IdempotencyGuard = Depends(idempotent("driver.process_payment")),
+    idem: IdempotencyGuard = Depends(idempotent("driver.process_payment", ["trip_id"])),
 ):
     """Driver pays the acceptance fee to lock the trip.
 
-    ``channel`` is "wallet" (settles instantly) or "platform" (gateway card;
-    returns a client_secret). On success the centralized orchestrator arms the
-    trip — generates the shift schedule and moves it to active_pending_otp (or
-    `paused` for advance_20/full_payment until the user pays upfront). For
-    platform that arming happens when the gateway confirms, so the trip stays
-    ``accepted_pending_payment`` until then (the payment-timeout scheduler skips
-    a trip with a pending fee, so it won't be auto-rejected meanwhile).
+    The fee is paid by card through the gateway (``channel`` must be
+    "platform"); the wallet is a user-only feature and is NOT available to
+    drivers. The charge returns a ``client_secret`` and settles asynchronously
+    on the gateway webhook, which then arms the trip via the centralized
+    orchestrator — generating the shift schedule and moving it to
+    active_pending_otp (or ``paused`` for advance_20/full_payment until the user
+    pays upfront). The trip stays ``accepted_pending_payment`` until the gateway
+    confirms (the payment-timeout scheduler skips a trip with a pending fee, so
+    it won't be auto-rejected meanwhile). An optional ``card_reference_id`` may
+    reference one of the driver's own saved cards.
     """
     if idem.cached_response is not None:
         return idem.cached_response
-    _validate_online_channel(channel)
+    _validate_driver_channel(channel)
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id)
     ).first()
@@ -1402,43 +1434,26 @@ def driver_process_payment(
     if error:
         raise HTTPException(400, f"Payment failed: {error}")
 
-    if client_secret:
-        # Platform: the fee settles on the gateway webhook, which then arms the
-        # trip via the orchestrator (finalize_driver_acceptance).
-        _maybe_schedule_platform_settlement(background_tasks, payment)
-        response = {
-            "message": "Driver payment initiated. Confirm with the client "
-            "secret; the trip arms once the gateway confirms.",
-            "trip_id": trip.reference_id,
-            "trip_status": trip.status,
-            "channel": channel,
-            "status": "pending",
-            "payment_reference": payment.reference_id,
-            "client_secret": client_secret,
-            "next_step": "confirm_gateway",
-        }
-        idem.store(response)
-        return response
-
-    # Wallet: settled synchronously; the orchestrator already armed the trip.
+    # Driver fees are gateway-only (no wallet) and settle asynchronously; the
+    # orchestrator arms the trip on the gateway webhook (finalize_driver_
+    # acceptance). create_trip_payment_intent always returns a client_secret for
+    # the platform channel.
     try:
         redis_client.delete(f"driver_payment_timer:{trip.id}:{driver.id}")
     except Exception:
         pass
-    session.refresh(trip)
-    if trip.payment_method in ("advance_20", "full_payment"):
-        response = {
-            "message": "Driver payment successful. Awaiting user upfront payment before OTP can be requested.",
-            "trip_id": trip.reference_id,
-            "trip_status": trip.status,
-            "next_step": "user_upfront_payment",
-        }
-    else:
-        response = {
-            "message": "Driver payment successful. Trip is ready for OTP verification.",
-            "trip_id": trip.reference_id,
-            "trip_status": trip.status,
-        }
+    _maybe_schedule_platform_settlement(background_tasks, payment)
+    response = {
+        "message": "Driver payment initiated. Confirm with the client secret; "
+        "the trip arms once the gateway confirms.",
+        "trip_id": trip.reference_id,
+        "trip_status": trip.status,
+        "channel": channel,
+        "status": "pending",
+        "payment_reference": payment.reference_id,
+        "client_secret": client_secret,
+        "next_step": "confirm_gateway",
+    }
     idem.store(response)
     return response
 
@@ -1707,6 +1722,11 @@ def driver_abandon_trip(
         trip_service_inst.transition_trip_state(
             session, trip_id, "settled", validate=False
         )
+
+    suspension_hours = get_driver_abandon_suspension_hours(session, redis_client)
+    driver.suspended_until = now_ist() + timedelta(hours=suspension_hours)
+    session.add(driver)
+    session.commit()
 
     # Free the driver from any cached availability snapshot.
     try:
@@ -2394,7 +2414,7 @@ def user_pay_bill(
     idempotency_key: Optional[str] = Header(
         default=None, alias="Idempotency-Key", convert_underscores=False
     ),
-    idem: IdempotencyGuard = Depends(idempotent("bill.pay")),
+    idem: IdempotencyGuard = Depends(idempotent("bill.pay", ["bill_id"])),
 ):
     if idem.cached_response is not None:
         return idem.cached_response
@@ -2501,7 +2521,9 @@ def driver_mark_bill_paid(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
-    idem: IdempotencyGuard = Depends(idempotent("bill.mark_paid_by_driver")),
+    idem: IdempotencyGuard = Depends(
+        idempotent("bill.mark_paid_by_driver", ["bill_id"])
+    ),
 ):
     if idem.cached_response is not None:
         return idem.cached_response
@@ -2588,7 +2610,7 @@ def pay_trip_settlement(
     idempotency_key: Optional[str] = Header(
         default=None, alias="Idempotency-Key", convert_underscores=False
     ),
-    idem: IdempotencyGuard = Depends(idempotent("settlement.pay")),
+    idem: IdempotencyGuard = Depends(idempotent("settlement.pay", ["settlement_id"])),
 ):
     """User pays the final trip settlement for advance_20 or full_payment methods.
 

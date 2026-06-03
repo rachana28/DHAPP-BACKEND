@@ -16,6 +16,7 @@ from app.core.models import (
     User,
 )
 from app.modules.payments.service import refund_booking_payments
+from app.services.dues import raise_if_unpaid_past_due
 from app.core.security import get_current_user, get_current_active_tow_truck_driver
 from app.modules.towing.tow_allocation import (
     rank_tow_drivers,
@@ -36,6 +37,8 @@ def create_tow_booking_request(
     current_user: User = Depends(get_current_user),
     trip_in: TowTripCreate,
 ):
+    raise_if_unpaid_past_due(session, current_user.id)
+
     trip_data = trip_in.model_dump(exclude_unset=True)
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"

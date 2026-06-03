@@ -81,7 +81,8 @@ _SERVICE_MAP: Dict[str, Dict[str, Any]] = {
         "model": ServiceRequest,
         "entity": SERVICE_REQUEST,
         "amount_attrs": ("final_price", "price_at_booking"),
-        "provider_attr": None,  # collected by the center, not a single driver
+        "provider_attr": None,
+        "partial": True,
     },
     "trip": {
         "model": Trip,
@@ -109,11 +110,19 @@ def _resolve_booking(session: Session, service_type: str, service_reference_id: 
 
 
 def _derive_amount(booking, cfg: Dict[str, Any]) -> Optional[float]:
+    total = None
     for attr in cfg["amount_attrs"]:
         val = getattr(booking, attr, None)
         if val:
-            return float(val)
-    return None
+            total = float(val)
+            break
+    if total is None:
+        return None
+
+    if cfg.get("partial"):
+        already = float(getattr(booking, "amount_paid", 0.0) or 0.0)
+        return round(max(0.0, total - already), 2)
+    return total
 
 
 def _validate_card_reference(session: Session, user: User, card_reference: str) -> str:
@@ -423,7 +432,10 @@ def handle_webhook(
     import json
 
     event = json.loads(raw_payload)
-    if event.get("type") != "payment_intent.succeeded":
+    event_type = event.get("type")
+    if event_type == "payment_intent.payment_failed":
+        return _handle_failed_webhook(session, event)
+    if event_type != "payment_intent.succeeded":
         return {"status": "ignored"}
 
     info = event.get("data", {})
@@ -460,6 +472,50 @@ def handle_webhook(
         },
     )
     return {"status": "ok"}
+
+
+def _handle_failed_webhook(session: Session, event: Dict[str, Any]) -> Dict[str, str]:
+    """Process a ``payment_intent.payment_failed`` event: mark the matching
+    Payment ``failed`` (the booking stays unpaid), or fail a pending wallet
+    top-up when the intent belongs to one. Never un-settles a payment/top-up
+    that already succeeded."""
+    info = event.get("data", {})
+    intent_id = info.get("intent_id")
+    reason = info.get("failure_reason")
+    payment = session.exec(
+        select(Payment).where(Payment.gateway_intent_id == intent_id).with_for_update()
+    ).first()
+    if not payment:
+        # Could be a wallet top-up intent that declined at the gateway.
+        if wallet_service.fail_topup(session, intent_id, reason=reason):
+            return {"status": "ok", "kind": "wallet_topup_failed"}
+        return {"status": "ignored"}
+
+    # A failure arriving after success is a no-op — real money already moved.
+    if payment.status in ("succeeded", "refunded", "partially_refunded"):
+        return {"status": "already_processed"}
+    if payment.status in ("failed", "cancelled"):
+        return {"status": "already_processed"}
+
+    payment.status = "failed"
+    payment.updated_at = now_ist()
+    payment.extra = {**(payment.extra or {}), "failure_reason": reason}
+    session.add(payment)
+    session.commit()
+
+    audit_emit(
+        "payment.failed",
+        trip_id=None,
+        actor="system",
+        actor_id="gateway_webhook",
+        payload={
+            "payment_reference": payment.reference_id,
+            "channel": payment.channel,
+            "amount": payment.amount,
+            "reason": reason,
+        },
+    )
+    return {"status": "ok", "kind": "failed"}
 
 
 def simulate_webhook_delivery(payment_reference: str) -> None:
@@ -557,7 +613,23 @@ def _sync_booking(session: Session, payment: Payment) -> None:
     booking = session.get(cfg["model"], payment.service_id)
     if not booking:
         return
-    booking.payment_status = "paid"
+    if cfg.get("partial"):
+        # Accumulate each succeeded charge (advance, then settlement) and derive
+        # the status: fully covered → "paid"; otherwise → "advance_paid".
+        booking.amount_paid = round(
+            float(booking.amount_paid or 0.0) + float(payment.amount), 2
+        )
+        total = float(
+            getattr(booking, "final_price", None)
+            or getattr(booking, "price_at_booking", None)
+            or 0.0
+        )
+        if total and booking.amount_paid + _EPS >= total:
+            booking.payment_status = "paid"
+        else:
+            booking.payment_status = "advance_paid"
+    else:
+        booking.payment_status = "paid"
     session.add(booking)
     audit_emit(
         "booking.payment_synced",
@@ -606,6 +678,14 @@ def refund_payment(
     cash/upi_direct are settled offline by the provider. Idempotent once the
     payment is fully refunded.
     """
+
+    if payment.id is not None:
+        locked = session.exec(
+            select(Payment).where(Payment.id == payment.id).with_for_update()
+        ).first()
+        if locked is not None:
+            payment = locked
+
     if payment.status == "refunded":
         return payment
     if payment.status not in ("succeeded", "partially_refunded"):
@@ -654,12 +734,27 @@ def refund_payment(
     session.add(payment)
 
     # Reflect the reversal on the linked booking (skipped for trips, which have
-    # no payment_status column — sync=False). Only flip to "refunded" on a full
-    # refund so a partial does not mislabel the booking.
+    # no payment_status column — sync=False).
     cfg = _cfg(payment.service_type)
-    if cfg.get("sync", True) and fully_refunded:
+    if cfg.get("sync", True):
         booking = session.get(cfg["model"], payment.service_id)
-        if booking:
+        if booking and cfg.get("partial"):
+            booking.amount_paid = max(
+                0.0, round(float(booking.amount_paid or 0.0) - this_refund, 2)
+            )
+            total = float(
+                getattr(booking, "final_price", None)
+                or getattr(booking, "price_at_booking", None)
+                or 0.0
+            )
+            if booking.amount_paid <= _EPS:
+                booking.payment_status = "refunded"
+            elif total and booking.amount_paid + _EPS >= total:
+                booking.payment_status = "paid"
+            else:
+                booking.payment_status = "advance_paid"
+            session.add(booking)
+        elif booking and fully_refunded:
             booking.payment_status = "refunded"
             session.add(booking)
 

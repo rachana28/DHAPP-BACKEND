@@ -53,9 +53,12 @@ def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
     Drivers already engaged on any in-flight trip (``DRIVER_BUSY_STATES``)
     are excluded so one driver only ever holds one booking at a time.
     """
+    now = now_ist()
     drivers = session.exec(
         select(Driver).where(
-            Driver.vehicle_type == vehicle_type, Driver.status == "available"
+            Driver.vehicle_type == vehicle_type,
+            Driver.status == "available",
+            (Driver.suspended_until.is_(None)) | (Driver.suspended_until <= now),
         )
     ).all()
     if not drivers:
@@ -103,9 +106,13 @@ def create_offers_for_tier(
 
 
 def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
-    """Move trip to the next tier if due. Auto-cancels if no drivers remain.
+    """Move trip to the next tier if due, or keep searching when the pool is dry.
 
-    Returns True iff something changed (new tier created or trip cancelled).
+    D4 (keep searching forever): this NEVER auto-cancels a trip. When the fresh
+    driver pool is exhausted it restarts the offer cycle (re-offering the
+    currently-available drivers) after the escalation interval; when no driver
+    is available at all it simply leaves the trip in `searching` to retry on the
+    next tick. Returns True iff something changed (offers created/restarted).
     """
     latest_offer = session.exec(
         select(TripOffer)
@@ -114,6 +121,10 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
         .limit(1)
     ).first()
     if not latest_offer:
+        ranked = rank_drivers(session, trip.vehicle_type)
+        if ranked:
+            create_offers_for_tier(session, trip.id, ranked[:TIER_SIZE], tier=1)
+            return True
         return False
 
     current_tier = latest_offer.tier
@@ -159,12 +170,18 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
         create_offers_for_tier(session, trip.id, next_batch, next_tier)
         return True
 
-    # Exhausted the driver pool — cancel the trip and clean up offers.
-    trip.status = "cancelled"
-    session.add(trip)
-    for o in session.exec(select(TripOffer).where(TripOffer.trip_id == trip.id)).all():
-        session.delete(o)
-    return True
+    if ranked:
+        for o in session.exec(
+            select(TripOffer).where(
+                TripOffer.trip_id == trip.id,
+                TripOffer.status != "accepted",
+            )
+        ).all():
+            session.delete(o)
+        create_offers_for_tier(session, trip.id, ranked[:TIER_SIZE], tier=1)
+        return True
+
+    return False
 
 
 def process_tier_escalation(session: Session) -> int:

@@ -489,6 +489,8 @@ async def auto_mark_missed_shifts_scheduler():
         logger.error(f"Missed-shift auto-absent scheduler failed: {str(e)}")
 
 
+DRIVER_FEE_PENDING_GRACE_MIN = 10
+
 async def driver_payment_timeout_scheduler():
     try:
         with Session(engine) as session:
@@ -516,22 +518,31 @@ async def driver_payment_timeout_scheduler():
                 if not locked_trip or locked_trip.status != "accepted_pending_payment":
                     continue
 
-                # A pending platform intent counts as "payment in progress" too:
-                # the gateway charge may settle on its webhook any moment, so we
-                # must NOT yank the trip back to searching and orphan a charge.
-                payment_check = session.exec(
+                grace_cutoff = now - timedelta(minutes=DRIVER_FEE_PENDING_GRACE_MIN)
+                paid_fee = session.exec(
                     select(Payment).where(
                         Payment.service_type == "trip",
                         Payment.service_id == locked_trip.id,
                         Payment.payer_driver_id == locked_trip.driver_id,
                         Payment.purpose == "driver_acceptance",
-                        Payment.status.in_(["pending", "succeeded"]),
+                        Payment.status == "succeeded",
+                    )
+                ).first()
+                recent_pending_fee = session.exec(
+                    select(Payment).where(
+                        Payment.service_type == "trip",
+                        Payment.service_id == locked_trip.id,
+                        Payment.payer_driver_id == locked_trip.driver_id,
+                        Payment.purpose == "driver_acceptance",
+                        Payment.status == "pending",
+                        Payment.created_at >= grace_cutoff,
                     )
                 ).first()
 
-                if payment_check:
+                if paid_fee or recent_pending_fee:
                     logger.info(
-                        f"Driver payment found for trip {locked_trip.id}, skipping auto-reject"
+                        f"Driver fee in progress for trip {locked_trip.id}, "
+                        f"skipping auto-reject"
                     )
                     session.commit()  # release the row lock
                     continue
@@ -900,15 +911,12 @@ async def dunning_scheduler():
                 if days_overdue <= 0:
                     continue
 
-                # Pick the latest ladder entry the settlement has reached but
-                # not yet been advanced past. Iterate in order — the loop
-                # advances at most one stage per nightly run so push fatigue
-                # stays bounded.
+                current_stage = settlement.dunning_stage or 0
                 target_stage = None
                 for threshold_days, stage, title, body in _DUNNING_LADDER:
                     if days_overdue < threshold_days:
                         break
-                    if stage <= settlement.dunning_stage:
+                    if stage <= current_stage:
                         continue
                     target_stage = (threshold_days, stage, title, body)
                     break
@@ -942,3 +950,77 @@ async def dunning_scheduler():
                 session.commit()
     except Exception as e:
         logger.error(f"Dunning scheduler failed: {str(e)}")
+
+
+async def repair_orphan_active_trips_scheduler():
+    """Self-heal trips stuck in `active_pending_otp` with no attendance rows (D3).
+
+    If the driver-acceptance fee succeeded but the inline attendance generation
+    in finalize_driver_acceptance failed (a transient error), the trip lands in
+    `active_pending_otp` with zero TripAttendance rows — OTP can never be
+    requested and the booking is dead-locked. This job detects that exact shape
+    (paid + active_pending_otp + zero attendance) and regenerates the schedule
+    idempotently, mirroring the attendance block of finalize_driver_acceptance.
+    """
+    try:
+        with Session(engine) as session:
+            trip_service = TripService()
+            orphans = session.exec(
+                select(Trip)
+                .outerjoin(TripAttendance, TripAttendance.trip_id == Trip.id)
+                .where(
+                    Trip.status == "active_pending_otp",
+                    Trip.driver_payment_status == "paid",
+                    Trip.start_date.isnot(None),
+                    TripAttendance.id.is_(None),
+                )
+            ).all()
+
+            for trip in orphans:
+                duration_hours = (
+                    trip_service.get_trip_duration_hours(trip.shift_details)
+                    or trip.trip_duration_hours
+                    or 8
+                )
+                parsed_time = trip_service.get_trip_start_time(
+                    trip.shift_details, trip.start_date
+                )
+                effective_start_dt = (
+                    parsed_time
+                    or trip.scheduled_start_time
+                    or datetime.combine(trip.start_date, datetime.min.time())
+                )
+                is_outstation = (trip.hiring_type or "").strip().lower() == "outstation"
+                end_date_for_attendance = trip.end_date or trip.start_date
+
+                ok, err = trip_service.create_trip_attendance_records(
+                    session,
+                    trip.id,
+                    trip.start_date,
+                    end_date_for_attendance,
+                    effective_start_dt,
+                    duration_hours,
+                    selected_days=trip.selected_days,
+                    single_shift=is_outstation,
+                    commit=False,
+                )
+                if ok:
+                    if is_outstation:
+                        single_att = session.exec(
+                            select(TripAttendance).where(
+                                TripAttendance.trip_id == trip.id
+                            )
+                        ).first()
+                        if single_att:
+                            trip.scheduled_start_time = single_att.scheduled_start
+                            trip.scheduled_end_time = single_att.scheduled_end
+                            session.add(trip)
+                    session.commit()
+                    logger.info(
+                        f"Repaired orphan trip {trip.id}: regenerated attendance rows."
+                    )
+                else:
+                    session.rollback()
+                    logger.warning(f"Orphan trip {trip.id} repair failed: {err}")
+    except Exception as e:
+        logger.error(f"Orphan-trip repair scheduler failed: {str(e)}")

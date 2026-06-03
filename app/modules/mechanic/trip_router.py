@@ -29,6 +29,7 @@ from app.utils.id_generator import (
     MECHANIC_TRIP,
 )
 from app.modules.payments.service import refund_booking_payments
+from app.services.dues import raise_if_unpaid_past_due
 
 router = APIRouter(prefix="/mechanic-trips", tags=["Mechanic Trips"])
 
@@ -44,6 +45,8 @@ def create_mechanic_booking_request(
     current_user: User = Depends(get_current_user),
     trip_in: MechanicTripCreate,
 ):
+    raise_if_unpaid_past_due(session, current_user.id)
+
     trip_data = trip_in.model_dump(exclude_unset=True)
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"

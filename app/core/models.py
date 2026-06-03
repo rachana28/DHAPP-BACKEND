@@ -41,6 +41,7 @@ class DriverBase(SQLModel):
     driver_allowance: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: str = "pending_approval"
+    suspended_until: Optional[datetime] = None
     verification_documents: List[str] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
@@ -159,13 +160,16 @@ class BookingType(str, Enum):
 
 
 class ServiceStatus(str, Enum):
-    SEARCHING = "searching"
+    SEARCHING = "searching"  # legacy/unused
+    PENDING_CONFIRMATION = (
+        "pending_confirmation"  # slot over-capacity: awaits center accept/decline
+    )
     BOOKED = "booked"
     ACCEPTED = "accepted"
     CHECKED_IN = "checked_in"
     SERVICE_ONGOING = "service_ongoing"
     SERVICE_ACCEPTED = "service_accepted"
-    IN_SERVICE = "in_service"
+    IN_SERVICE = "in_service"  # legacy/unused (replaced by service_ongoing)
     COMPLETED = "completed"
     CANCELLED = "cancelled"
 
@@ -307,6 +311,8 @@ class ServiceRequest(SQLModel, table=True):
     final_price: Optional[float] = None
     price_locked: bool = False
     payment_status: str = "unpaid"  # synced by the centralized payment module
+    advance_amount: Optional[float] = None
+    amount_paid: float = 0.0
     price_components: List[Dict[str, Any]] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
@@ -464,6 +470,8 @@ class ServiceRequestPublic(SQLModel):
     booking_time: datetime
     price_at_booking: Optional[float] = None
     final_price: Optional[float] = None
+    advance_amount: Optional[float] = None
+    amount_paid: float = 0.0
     price_components: List[Dict[str, Any]]
     cancellation_reason: Optional[str] = None
 
