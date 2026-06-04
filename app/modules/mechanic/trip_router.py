@@ -22,6 +22,7 @@ from app.modules.mechanic.mechanic_allocation import (
     create_mechanic_offers_for_tier,
     attempt_mechanic_trip_escalation,
 )
+from app.modules.dispatch import geo
 from app.utils.notifications import send_push_notification
 from app.utils.id_generator import (
     generate_reference_id,
@@ -30,6 +31,9 @@ from app.utils.id_generator import (
 )
 from app.modules.payments.service import refund_booking_payments
 from app.services.dues import raise_if_unpaid_past_due
+from app.modules.trips import booking_otp_service
+from app.workers.topics import telemetry_topic
+from app.utils.time_utils import now_ist
 
 router = APIRouter(prefix="/mechanic-trips", tags=["Mechanic Trips"])
 
@@ -58,7 +62,7 @@ def create_mechanic_booking_request(
     session.commit()
     session.refresh(db_trip)
 
-    ranked_mechanics = rank_mechanics(session)
+    ranked_mechanics = rank_mechanics(session, db_trip.start_lat, db_trip.start_lng)
 
     if not ranked_mechanics:
         db_trip.status = "no_mechanics_found"
@@ -66,7 +70,8 @@ def create_mechanic_booking_request(
         session.commit()
         return db_trip
 
-    tier_1_mechanics = ranked_mechanics[:3]
+    tier_size = geo.get_config_int(session, geo.KNN_LIMIT_KEY, geo.DEFAULT_KNN_LIMIT)
+    tier_1_mechanics = ranked_mechanics[:tier_size]
     create_mechanic_offers_for_tier(session, db_trip.id, tier_1_mechanics, tier=1)
 
     return db_trip
@@ -237,7 +242,12 @@ def accept_mechanic_offer(
         data={"trip_id": trip.reference_id, "screen": "tracking"},
     )
 
-    return {"message": "Service accepted", "trip_id": trip.reference_id}
+    return {
+        "message": "Service accepted",
+        "trip_id": trip.reference_id,
+        # Per-ride MQTT topic: mechanic app publishes GPS here; user app subscribes.
+        "telemetry_topic": telemetry_topic(trip.reference_id),
+    }
 
 
 @router.post("/mechanic/reject-offer/{offer_id}")
@@ -279,3 +289,67 @@ def update_mechanic_status(
     session.commit()
 
     return {"message": f"Status updated to {status_data.status}"}
+
+
+class OTPVerifyIn(BaseModel):
+    otp: str
+
+
+@router.post("/{trip_id}/verify-otp")
+def verify_mechanic_otp(
+    trip_id: str,
+    body: OTPVerifyIn,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    current_mechanic: Mechanic = Depends(get_current_active_mechanic),
+):
+    """Mechanic manually enters the OTP on arrival → the job ENDS; user pays."""
+    trip = get_by_reference(session, MechanicTrip, trip_id)
+    if not trip or trip.mechanic_id != current_mechanic.id:
+        raise HTTPException(404, "Trip not found")
+
+    if trip.status != "arrived":
+        raise HTTPException(
+            400, "OTP can only be verified once you've reached the customer."
+        )
+
+    ok, err = booking_otp_service.verify(
+        session, "mechanic", trip.id, body.otp, current_mechanic.user_id
+    )
+    if not ok:
+        raise HTTPException(400, err)
+
+    trip.status = "completed"
+    trip.actual_end_time = now_ist()
+    session.add(trip)
+    session.commit()
+
+    background_tasks.add_task(
+        send_push_notification,
+        session=session,
+        user_ids=[trip.user_id],
+        title="Service Completed ✅",
+        body="Your mechanic service is complete. Please complete the payment.",
+        data={"trip_id": trip.reference_id, "screen": "payment"},
+    )
+    return {"message": "OTP verified. Service completed.", "status": trip.status}
+
+
+@router.post("/{trip_id}/regenerate-otp")
+def regenerate_mechanic_otp(
+    trip_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """User regenerates the completion-OTP after the previous one expired."""
+    trip = get_by_reference(session, MechanicTrip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(404, "Trip not found")
+
+    if trip.status != "arrived":
+        raise HTTPException(
+            400, "An OTP is only available once the mechanic has reached you."
+        )
+
+    code = booking_otp_service.generate(session, "mechanic", trip.id)
+    return {"otp": code, "message": "Share this OTP with the mechanic."}

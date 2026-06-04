@@ -1,8 +1,9 @@
 from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 from app.core.models import Mechanic, MechanicTrip, MechanicOffer
 from app.utils.notifications import send_push_notification
+from app.modules.dispatch import geo
 
 
 def get_mechanic_score(
@@ -23,7 +24,27 @@ def get_mechanic_score(
     return score
 
 
-def rank_mechanics(session: Session) -> List[Mechanic]:
+def rank_mechanics(
+    session: Session,
+    pickup_lat: Optional[float] = None,
+    pickup_lng: Optional[float] = None,
+) -> List[Mechanic]:
+    """Available mechanics, closest-first.
+
+    When pickup coordinates are supplied, ordering is by spatial distance
+    (PostGIS KNN, Haversine fallback on SQLite). If no coordinates are given,
+    falls back to the legacy score-based ranking so existing behaviour holds.
+    """
+    if pickup_lat is not None and pickup_lng is not None:
+        nearby = geo.nearest_available_mechanics(
+            session, pickup_lat, pickup_lng, limit=geo.DISPATCH_POOL_LIMIT
+        )
+        # Use spatial ordering when it yields candidates. If it's empty (e.g. no
+        # mechanic has reported a fresh location yet — common right after rollout),
+        # fall through to the legacy score ranking so dispatch never hard-stalls.
+        if nearby:
+            return nearby
+
     query = select(Mechanic).where(Mechanic.status == "available")
     mechanics = session.exec(query).all()
 
@@ -75,7 +96,7 @@ def attempt_mechanic_trip_escalation(session: Session, trip: MechanicTrip) -> bo
     """
     Checks if a mechanic trip should move to the next tier or be cancelled.
     """
-    TIER_SIZE = 3
+    TIER_SIZE = geo.get_config_int(session, geo.KNN_LIMIT_KEY, geo.DEFAULT_KNN_LIMIT)
 
     latest_offer = session.exec(
         select(MechanicOffer)
@@ -120,7 +141,7 @@ def attempt_mechanic_trip_escalation(session: Session, trip: MechanicTrip) -> bo
             return False
 
         next_tier = current_tier + 1
-        all_ranked_mechanics = rank_mechanics(session)
+        all_ranked_mechanics = rank_mechanics(session, trip.start_lat, trip.start_lng)
 
         start = current_tier * TIER_SIZE
         end = start + TIER_SIZE

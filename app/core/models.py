@@ -95,6 +95,9 @@ class Mechanic(MechanicBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
+    current_lat: Optional[float] = Field(default=None)
+    current_lng: Optional[float] = Field(default=None)
+    location_updated_at: Optional[datetime] = Field(default=None)
 
     user: "User" = Relationship(back_populates="mechanic_profile")
     mechanic_trips: List["MechanicTrip"] = Relationship(back_populates="mechanic")
@@ -615,6 +618,7 @@ class MechanicTripBase(SQLModel):
 class MechanicTrip(MechanicTripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    actual_end_time: Optional[datetime] = Field(default=None)
     mechanic: Optional["Mechanic"] = Relationship(back_populates="mechanic_trips")
     user: "User" = Relationship(back_populates="mechanic_trips")
     offers: List["MechanicOffer"] = Relationship(back_populates="trip")
@@ -648,6 +652,9 @@ class TowTripBase(SQLModel):
 class TowTrip(TowTripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    actual_start_time: Optional[datetime] = Field(default=None)
+    actual_end_time: Optional[datetime] = Field(default=None)
+    payment_due_at: Optional[datetime] = Field(default=None)
     tow_truck_driver: Optional["TowTruckDriver"] = Relationship(
         back_populates="tow_trips"
     )
@@ -705,10 +712,40 @@ class TowTruckDriver(TowTruckDriverBase, table=True):
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
 
+    # See Mechanic.current_lat — same plain-float live-location scheme; Postgres
+    # derives a generated GEOGRAPHY `current_location` + GiST index in migration.
+    current_lat: Optional[float] = Field(default=None)
+    current_lng: Optional[float] = Field(default=None)
+    location_updated_at: Optional[datetime] = Field(default=None)
+
     user: "User" = Relationship(back_populates="tow_truck_driver_profile")
     tow_trips: List["TowTrip"] = Relationship(back_populates="tow_truck_driver")
     reviews: List["TowTruckDriverReview"] = Relationship(back_populates="driver")
     offers: List[TowTripOffer] = Relationship(back_populates="driver")
+
+
+class BookingOTP(SQLModel, table=True):
+    """Geofenced start/end OTP for tow & mechanic bookings.
+
+    The telemetry worker generates an OTP once the provider reaches the pickup
+    geofence; the provider enters it manually to START a tow (or END a mechanic
+    job). Independent of the regular-trip OTPRegistry, which is keyed on
+    TripAttendance and has no equivalent for these per-table bookings.
+
+    Invariant: at most one *active* (unverified, unexpired) row per
+    (booking_type, booking_id); regeneration supersedes the previous row.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    booking_type: str  # "tow" | "mechanic"
+    booking_id: int = Field(index=True)
+    otp_hash: str  # sha256(otp)
+    expires_at: datetime
+    verified_at: Optional[datetime] = Field(default=None)
+    verified_by_user_id: Optional[uuid.UUID] = Field(default=None)
+    attempts: int = Field(default=0)
+    max_attempts: int = Field(default=3)
+    created_at: datetime = Field(default_factory=_now_ist_naive)
 
 
 # --- API Response Models ---
