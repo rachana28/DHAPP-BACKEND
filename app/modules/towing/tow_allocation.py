@@ -1,8 +1,9 @@
 from sqlmodel import Session, select, func, desc
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 from app.core.models import TowTruckDriver, TowTrip, TowTripOffer
 from app.utils.notifications import send_push_notification
+from app.modules.dispatch import geo
 
 
 def get_tow_driver_score(
@@ -23,7 +24,28 @@ def get_tow_driver_score(
     return score
 
 
-def rank_tow_drivers(session: Session) -> List[TowTruckDriver]:
+def rank_tow_drivers(
+    session: Session,
+    pickup_lat: Optional[float] = None,
+    pickup_lng: Optional[float] = None,
+) -> List[TowTruckDriver]:
+    """Available tow drivers, closest-first.
+
+    When pickup coordinates are supplied, ordering is by spatial distance
+    (PostGIS KNN, Haversine fallback on SQLite). If no coordinates are given —
+    or the booking predates location capture — falls back to the legacy
+    score-based ranking so existing behaviour is preserved.
+    """
+    if pickup_lat is not None and pickup_lng is not None:
+        nearby = geo.nearest_available_tow_drivers(
+            session, pickup_lat, pickup_lng, limit=geo.DISPATCH_POOL_LIMIT
+        )
+        # Use spatial ordering when it yields candidates. If it's empty (e.g. no
+        # driver has reported a fresh location yet — common right after rollout),
+        # fall through to the legacy score ranking so dispatch never hard-stalls.
+        if nearby:
+            return nearby
+
     query = select(TowTruckDriver).where(TowTruckDriver.status == "available")
     drivers = session.exec(query).all()
 
@@ -80,7 +102,7 @@ def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
     """
     Checks if a tow trip should move to the next tier or be cancelled.
     """
-    TIER_SIZE = 3
+    TIER_SIZE = geo.get_config_int(session, geo.KNN_LIMIT_KEY, geo.DEFAULT_KNN_LIMIT)
 
     latest_offer = session.exec(
         select(TowTripOffer)
@@ -124,7 +146,7 @@ def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
             return False
 
         next_tier = current_tier + 1
-        all_ranked_drivers = rank_tow_drivers(session)
+        all_ranked_drivers = rank_tow_drivers(session, trip.start_lat, trip.start_lng)
 
         start = current_tier * TIER_SIZE
         end = start + TIER_SIZE

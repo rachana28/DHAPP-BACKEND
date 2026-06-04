@@ -11,6 +11,7 @@ from app.core.models import (
 )
 from app.core.security import get_current_user
 from app.utils.id_generator import get_by_reference
+from app.utils.time_utils import now_ist
 from sqlalchemy.orm import selectinload
 import redis
 import json
@@ -98,7 +99,7 @@ def update_location(
                 403, "You are not authorized to update location for this trip."
             )
 
-    if trip.status not in ["accepted", "in_progress", "arrived"]:
+    if trip.status not in ["accepted", "in_progress", "arrived", "near_destination"]:
         raise HTTPException(400, "Tracking is not allowed for inactive trips.")
 
     data = {
@@ -122,6 +123,43 @@ def update_location(
         redis_client.set(
             f"loc:trip:{kind}:{location.trip_id}", json.dumps(data), ex=300
         )
+
+    return {"status": "ok"}
+
+
+@router.post("/presence")
+def update_presence(
+    location: LocationUpdate,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Idle-location heartbeat for tow drivers & mechanics.
+
+    Persists the provider's ``current_location`` (plain lat/lng + timestamp) so
+    KNN dispatch can find them *before* a booking exists. Unlike ``/update``
+    (which requires an active trip and feeds Redis for the live map), this is a
+    low-frequency presence ping that writes the DB columns the dispatcher reads.
+    """
+    if current_user.role not in ["tow_truck_driver", "mechanic"]:
+        raise HTTPException(403, "Presence is only for service professionals.")
+
+    if current_user.role == "tow_truck_driver":
+        provider = session.exec(
+            select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
+        ).first()
+    else:
+        provider = session.exec(
+            select(Mechanic).where(Mechanic.user_id == current_user.id)
+        ).first()
+
+    if not provider:
+        raise HTTPException(404, "Professional profile not found.")
+
+    provider.current_lat = location.latitude
+    provider.current_lng = location.longitude
+    provider.location_updated_at = now_ist()
+    session.add(provider)
+    session.commit()
 
     return {"status": "ok"}
 

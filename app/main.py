@@ -7,7 +7,9 @@ from apscheduler.schedulers.asyncio import (
 from sqlmodel import Session
 from fastapi_limiter import FastAPILimiter
 import redis.asyncio as redis_async
+import asyncio
 import os
+from app.workers.telemetry_worker import TelemetryWorker
 
 from app.core.database import (
     create_db_and_tables,
@@ -149,8 +151,18 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     print("🚀 Scheduler started.")
 
+    telemetry_worker = TelemetryWorker()
+    telemetry_task = asyncio.create_task(telemetry_worker.run())
+    print("📡 Telemetry worker started.")
+
     yield
 
+    telemetry_worker.request_stop()
+    telemetry_task.cancel()
+    try:
+        await telemetry_task
+    except asyncio.CancelledError:
+        pass
     scheduler.shutdown()
     print("🛑 Scheduler shut down.")
     await redis_connection.close()
