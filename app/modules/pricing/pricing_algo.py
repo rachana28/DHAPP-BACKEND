@@ -3,10 +3,24 @@ import requests
 from datetime import datetime
 import json
 import base64
-from typing import Optional
+from typing import List, Optional
+
+from sqlmodel import Session
+
+from app.modules.trips.pricing_calculator import _get_config_value
 
 # --- CONFIGURATION ---
 OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving"
+
+TOW_VEHICLE_TYPES = ("flatbed", "wheel_lift", "hook_chain", "integrated")
+DEFAULT_TOW_VEHICLE_TYPE = "wheel_lift"
+
+DEFAULT_TOW_PRICING = {
+    "flatbed": {"base_fare": 600.0, "per_km": 40.0, "min_charge": 800.0},
+    "wheel_lift": {"base_fare": 450.0, "per_km": 30.0, "min_charge": 600.0},
+    "hook_chain": {"base_fare": 350.0, "per_km": 25.0, "min_charge": 500.0},
+    "integrated": {"base_fare": 1200.0, "per_km": 60.0, "min_charge": 2000.0},
+}
 
 
 def get_road_distance_duration(
@@ -43,63 +57,68 @@ def get_road_distance_duration(
     return dist_km, dist_km * 3
 
 
+def normalize_tow_vehicle_type(tow_vehicle_type: Optional[str]) -> str:
+    """Coerce to a supported tow-truck class, defaulting unknown/empty values."""
+    t = (tow_vehicle_type or "").strip().lower()
+    return t if t in DEFAULT_TOW_PRICING else DEFAULT_TOW_VEHICLE_TYPE
+
+
+def _tow_cfg(
+    session: Optional[Session], redis_client, key: str, default: float
+) -> float:
+    """SystemConfig lookup (Redis → DB → default). Safe when session is None."""
+    if session is None:
+        return float(default)
+    return _get_config_value(session, redis_client, key, default)
+
+
 def calculate_tow_cost(
-    distance_km: float, vehicle_type: str, redis_client: Optional[object] = None
+    distance_km: float,
+    tow_vehicle_type: str,
+    session: Optional[Session] = None,
+    redis_client: Optional[object] = None,
 ) -> dict:
+    """Per-tow-type tow fare. Rates come from SystemConfig (Redis → DB → default).
+
+    ``tow_vehicle_type`` is the tow-TRUCK class (flatbed / wheel_lift / hook_chain
+    / integrated) — NOT the customer's vehicle. Keys:
+    ``pricing_tow_<type>_base_fare`` / ``_per_km`` / ``_min_charge`` plus the
+    evening/night multipliers. Unknown/empty types fall back to a default class.
     """
-    Intelligent Pricing Algorithm.
-    Fetches dynamic base fare from Redis if available.
-    """
+    tow_type = normalize_tow_vehicle_type(tow_vehicle_type)
+    defaults = DEFAULT_TOW_PRICING[tow_type]
+
+    base_fare = _tow_cfg(
+        session,
+        redis_client,
+        f"pricing_tow_{tow_type}_base_fare",
+        defaults["base_fare"],
+    )
+    rate_per_km = _tow_cfg(
+        session, redis_client, f"pricing_tow_{tow_type}_per_km", defaults["per_km"]
+    )
+    min_charge = _tow_cfg(
+        session,
+        redis_client,
+        f"pricing_tow_{tow_type}_min_charge",
+        defaults["min_charge"],
+    )
+
+    # Time multiplier (admin-tunable surcharge for evening / night).
     current_hour = datetime.now().hour
-
-    # 1. Base Parameters (Defaults)
-    if vehicle_type.upper() == "BIKE":
-        base_fare = 255.0
-        rate_per_km = 12.0
-        min_charge = 380.0
-    else:  # CAR / SUV
-        base_fare = 450.0
-        rate_per_km = 15.0
-        min_charge = 580.0
-
-    # 2. Dynamic Override (Check Admin Config)
-    if redis_client:
-        try:
-            # Keys must match what Admin sets in System Config
-            # Example Key: config:bike_base_fare
-            v_key = vehicle_type.lower()
-
-            # Fetch Base Fare
-            dyn_base = redis_client.get(f"config:{v_key}_base_fare")
-            if dyn_base:
-                base_fare = float(dyn_base)
-
-            # Fetch Rate Per KM
-            dyn_rate = redis_client.get(f"config:{v_key}_rate_per_km")
-            if dyn_rate:
-                rate_per_km = float(dyn_rate)
-
-            # Fetch Min Charge
-            dyn_min = redis_client.get(f"config:{v_key}_min_charge")
-            if dyn_min:
-                min_charge = float(dyn_min)
-
-        except Exception as e:
-            print(f"Pricing Config Fetch Error: {e}")
-
-    # 3. Time Multiplier (AI Heuristic)
+    night_mult = _tow_cfg(session, redis_client, "pricing_tow_night_multiplier", 1.5)
+    evening_mult = _tow_cfg(
+        session, redis_client, "pricing_tow_evening_multiplier", 1.25
+    )
     if 22 <= current_hour or current_hour < 5:
-        time_multiplier = 1.5  # Night
-        time_label = "Night"
+        time_multiplier, time_label = night_mult, "Night"
     elif 18 <= current_hour < 22:
-        time_multiplier = 1.25  # Evening
-        time_label = "Evening"
+        time_multiplier, time_label = evening_mult, "Evening"
     else:
-        time_multiplier = 1.0  # Day
-        time_label = "Day"
+        time_multiplier, time_label = 1.0, "Day"
 
-    # 4. Distance Calculation
-    distance_cost = 0.0
+    # Distance tiering (tapering per-km rate beyond 10 / 50 km).
+    distance_km = max(0.0, float(distance_km or 0.0))
     if distance_km <= 10:
         distance_cost = distance_km * rate_per_km
     elif distance_km <= 50:
@@ -111,24 +130,39 @@ def calculate_tow_cost(
             + ((distance_km - 50) * (rate_per_km * 0.85))
         )
 
-    # 5. Final Calculation
     sub_total = base_fare + distance_cost
     total_price = max(sub_total * time_multiplier, min_charge)
-
-    # Round to nearest 10
     final_price = math.ceil(total_price / 10.0) * 10
 
     return {
         "final_price": final_price,
         "breakdown": {
+            "tow_vehicle_type": tow_type,
             "base_fare": base_fare,
+            "distance_km": round(distance_km, 2),
             "distance_cost": round(distance_cost, 2),
+            "rate_per_km": rate_per_km,
             "time_multiplier": time_multiplier,
             "time_slot": time_label,
-            "vehicle_type": vehicle_type,
-            "rate_used": rate_per_km,
+            "min_charge": min_charge,
         },
     }
+
+
+def estimate_tow_for_all_types(
+    distance_km: float,
+    session: Optional[Session] = None,
+    redis_client: Optional[object] = None,
+) -> List[dict]:
+    """Price every supported tow-truck class for a given distance, so the user
+    app can present the options side-by-side."""
+    return [
+        {
+            "tow_vehicle_type": t,
+            **calculate_tow_cost(distance_km, t, session, redis_client),
+        }
+        for t in TOW_VEHICLE_TYPES
+    ]
 
 
 def calculate_mechanic_cost(

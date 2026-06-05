@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from app.core.models import TowTruckDriver, TowTrip, TowTripOffer
 from app.utils.notifications import send_push_notification
+from app.utils.time_utils import now_ist
 from app.modules.dispatch import geo
 
 
@@ -11,7 +12,7 @@ def get_tow_driver_score(
 ) -> float:
     score = (driver.rating or 0) * 10
     if last_trip_time:
-        hours_since_last = (datetime.utcnow() - last_trip_time).total_seconds() / 3600
+        hours_since_last = (now_ist() - last_trip_time).total_seconds() / 3600
         if hours_since_last > 24:
             score += 20
         elif hours_since_last > 4:
@@ -28,6 +29,7 @@ def rank_tow_drivers(
     session: Session,
     pickup_lat: Optional[float] = None,
     pickup_lng: Optional[float] = None,
+    tow_vehicle_type: Optional[str] = None,
 ) -> List[TowTruckDriver]:
     """Available tow drivers, closest-first.
 
@@ -35,18 +37,26 @@ def rank_tow_drivers(
     (PostGIS KNN, Haversine fallback on SQLite). If no coordinates are given —
     or the booking predates location capture — falls back to the legacy
     score-based ranking so existing behaviour is preserved.
+
+    When ``tow_vehicle_type`` is supplied, ranking is strictly limited to drivers
+    registered for that exact tow-truck class (both the spatial and legacy
+    paths); legacy bookings without a requested type are unfiltered.
     """
     if pickup_lat is not None and pickup_lng is not None:
         nearby = geo.nearest_available_tow_drivers(
-            session, pickup_lat, pickup_lng, limit=geo.DISPATCH_POOL_LIMIT
+            session,
+            pickup_lat,
+            pickup_lng,
+            limit=geo.DISPATCH_POOL_LIMIT,
+            tow_vehicle_type=tow_vehicle_type,
         )
-        # Use spatial ordering when it yields candidates. If it's empty (e.g. no
-        # driver has reported a fresh location yet — common right after rollout),
-        # fall through to the legacy score ranking so dispatch never hard-stalls.
+
         if nearby:
             return nearby
 
     query = select(TowTruckDriver).where(TowTruckDriver.status == "available")
+    if tow_vehicle_type:
+        query = query.where(TowTruckDriver.tow_vehicle_type == tow_vehicle_type)
     drivers = session.exec(query).all()
 
     driver_scores = []
@@ -82,13 +92,9 @@ def create_tow_offers_for_tier(
         session.add(offer)
     session.commit()
 
-    # 2. Notify Drivers (Bulk Send)
-    # Collect all user_ids for these drivers
     driver_user_ids = [d.user_id for d in drivers]
 
     if driver_user_ids:
-        # Note: We cannot use BackgroundTasks easily here since this is a helper function.
-        # But `send_push_notification` is optimized to batch requests.
         send_push_notification(
             session=session,
             user_ids=driver_user_ids,
@@ -146,7 +152,9 @@ def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
             return False
 
         next_tier = current_tier + 1
-        all_ranked_drivers = rank_tow_drivers(session, trip.start_lat, trip.start_lng)
+        all_ranked_drivers = rank_tow_drivers(
+            session, trip.start_lat, trip.start_lng, trip.tow_vehicle_type
+        )
 
         start = current_tier * TIER_SIZE
         end = start + TIER_SIZE
@@ -165,8 +173,7 @@ def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
             create_tow_offers_for_tier(session, trip.id, next_batch, next_tier)
             return True
         else:
-            # Auto-Cancel if no drivers left
-            trip.status = "cancelled"
+            trip.status = "no_drivers_found"
             session.add(trip)
             # Cleanup offers
             all_offers = session.exec(
@@ -174,6 +181,16 @@ def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
             ).all()
             for o in all_offers:
                 session.delete(o)
+            try:
+                send_push_notification(
+                    session=session,
+                    user_ids=[trip.user_id],
+                    title="No Tow Trucks Available 😔",
+                    body="We couldn't find an available tow truck nearby. Please try again.",
+                    data={"trip_id": trip.reference_id, "type": "no_drivers_found"},
+                )
+            except Exception as e:
+                print(f"No-drivers notification error: {e}")
             return True
 
     return False
