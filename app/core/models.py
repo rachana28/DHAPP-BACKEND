@@ -56,6 +56,7 @@ class TowTruckDriverBase(SQLModel):
     name: str
     phone_number: str
     vehicle_number: Optional[str] = None
+    tow_vehicle_type: Optional[str] = None
     address: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: str = "pending_approval"
@@ -618,7 +619,9 @@ class MechanicTripBase(SQLModel):
 class MechanicTrip(MechanicTripBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    actual_start_time: Optional[datetime] = Field(default=None)
     actual_end_time: Optional[datetime] = Field(default=None)
+    payment_due_at: Optional[datetime] = Field(default=None)
     mechanic: Optional["Mechanic"] = Relationship(back_populates="mechanic_trips")
     user: "User" = Relationship(back_populates="mechanic_trips")
     offers: List["MechanicOffer"] = Relationship(back_populates="trip")
@@ -630,7 +633,8 @@ class TowTripBase(SQLModel):
     tow_truck_driver_id: Optional[int] = Field(
         default=None, foreign_key="towtruckdriver.id"
     )
-    vehicle_type: str
+    vehicle_type: str  # the customer's vehicle (BIKE/CAR/...)
+    tow_vehicle_type: Optional[str] = None
     start_location: Optional[str] = None
     end_location: Optional[str] = None
     start_lat: Optional[float] = None
@@ -740,6 +744,7 @@ class BookingOTP(SQLModel, table=True):
     booking_type: str  # "tow" | "mechanic"
     booking_id: int = Field(index=True)
     otp_hash: str  # sha256(otp)
+    otp_plain: Optional[str] = Field(default=None)
     expires_at: datetime
     verified_at: Optional[datetime] = Field(default=None)
     verified_by_user_id: Optional[uuid.UUID] = Field(default=None)
@@ -766,24 +771,16 @@ class TowTruckDriverPublic(SQLModel):
     name: str
     rating: float
     profile_picture_url: Optional[str] = None
-    # Optional: the DB column allows NULL (TowTruckDriverBase.vehicle_number),
-    # so the public response must too — otherwise serializing a tow driver
-    # without one set raises 500.
     vehicle_number: Optional[str] = None
+    tow_vehicle_type: Optional[str] = None
     status: str
     total_trips: int = 0
 
 
 class TripReadUser(TripSafe):
     driver: Optional[DriverPublic] = None
-    # tow_truck_driver / mechanic are kept as optional fields here so the
-    # polymorphic /trips/my-bookings endpoint can still surface tow + mechanic
-    # bookings to the user app without changing the response field shape.
-    # Rides leave these as None; tow rows populate tow_truck_driver; mechanic
-    # rows populate mechanic.
     tow_truck_driver: Optional[TowTruckDriverPublic] = None
     mechanic: Optional[MechanicPublic] = None
-    # Assigned driver's remaining shift-skips on this trip booking this month.
     driver_skips_remaining: Optional[int] = None
 
 
@@ -832,6 +829,7 @@ class TowTripSafe(SQLModel):
     payment_status: Optional[str] = None
     hiring_type: str = "Tow Service"
     vehicle_type: str
+    tow_vehicle_type: Optional[str] = None
     shift_details: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -892,6 +890,7 @@ class TowTruckDriverUpdate(SQLModel):
     address: Optional[str] = None
     phone_number: Optional[str] = None
     vehicle_number: Optional[str] = None
+    tow_vehicle_type: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: Optional[str] = None
 
@@ -1607,6 +1606,7 @@ class MechanicTripCreate(SQLModel):
 
 class TowTripCreate(SQLModel):
     vehicle_type: str  # required, matches existing TripCreate contract
+    tow_vehicle_type: Optional[str] = None  # requested tow-truck class
     user_id: Optional[uuid.UUID] = None
     tow_truck_driver_id: Optional[int] = None
     hiring_type: Optional[str] = None  # accepted for back-compat; ignored
@@ -1621,6 +1621,15 @@ class TowTripCreate(SQLModel):
     fare: Optional[float] = None
     fare_breakdown: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
+
+
+class BookingAddressUpdate(SQLModel):
+    start_location: Optional[str] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_location: Optional[str] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
 
 
 class TripDaySkipRequest(SQLModel):
@@ -1657,6 +1666,7 @@ class VerifyOTPRequest(SQLModel):
     vehicle_type: Optional[str] = None
     # Tow Truck Specific Fields
     vehicle_number: Optional[str] = None
+    tow_vehicle_type: Optional[str] = None  # flatbed/wheel_lift/hook_chain/integrated
     specialization: Optional[str] = None
     # Service Center Specific Fields
     address: Optional[str] = None

@@ -38,20 +38,22 @@ KNN_SEARCH_RADIUS_M_KEY = "dispatch_knn_search_radius_m"
 LOCATION_FRESHNESS_MIN_KEY = "dispatch_location_freshness_min"
 GEOFENCE_RADIUS_M_KEY = "geofence_radius_m"
 BOOKING_OTP_EXPIRY_MIN_KEY = "booking_otp_expiry_min"
+ADDRESS_EDIT_WINDOW_MIN_KEY = "booking_address_edit_window_min"
 
 DEFAULT_KNN_LIMIT = 5  # tier-1 size: the "5 closest" offered first
 DEFAULT_KNN_SEARCH_RADIUS_M = 15000.0  # 15 km candidate search radius
 DEFAULT_LOCATION_FRESHNESS_MIN = 5.0
 DEFAULT_GEOFENCE_RADIUS_M = 200.0
 DEFAULT_BOOKING_OTP_EXPIRY_MIN = 30.0
+DEFAULT_ADDRESS_EDIT_WINDOW_MIN = 3.0
 
-# Distance-ordered candidate pool the allocator pulls once and slices per
-# escalation tier. Larger than KNN_LIMIT so later tiers have depth.
 DISPATCH_POOL_LIMIT = 50
 
 # Booking states in which an assigned provider is busy (excluded from dispatch).
 TOW_ACTIVE_STATES = ("accepted", "arrived", "in_progress", "near_destination")
-MECHANIC_ACTIVE_STATES = ("accepted", "arrived")
+# "in_progress" added with the split mechanic flow (arrive → complete) so a
+# mechanic actively on a job isn't offered new work.
+MECHANIC_ACTIVE_STATES = ("accepted", "arrived", "in_progress")
 
 
 # ── config helpers ───────────────────────────────────────────────────────────
@@ -105,9 +107,13 @@ def _nearest(
     lat: Optional[float],
     lng: Optional[float],
     limit: Optional[int],
+    type_col: Optional[str] = None,
+    type_val: Optional[str] = None,
 ) -> Optional[List]:
     if lat is None or lng is None:
         return None
+    # Strict provider-type filter (e.g. tow_vehicle_type) when requested.
+    type_filter = (type_col, type_val) if type_col and type_val else None
 
     if limit is None:
         limit = get_config_int(session, KNN_LIMIT_KEY, DEFAULT_KNN_LIMIT)
@@ -133,6 +139,7 @@ def _nearest(
             radius_m=radius_m,
             fresh_cutoff=fresh_cutoff,
             limit=limit,
+            type_filter=type_filter,
         )
         if not ordered_ids:
             return []
@@ -151,6 +158,7 @@ def _nearest(
         lng=lng,
         fresh_cutoff=fresh_cutoff,
         limit=limit,
+        type_filter=type_filter,
     )
 
 
@@ -166,7 +174,23 @@ def _knn_postgres(
     radius_m: float,
     fresh_cutoff,
     limit: int,
+    type_filter: Optional[tuple] = None,
 ) -> List[int]:
+    params = {
+        "lat": lat,
+        "lng": lng,
+        "radius_m": radius_m,
+        "fresh_cutoff": fresh_cutoff,
+        "limit": limit,
+    }
+    # Optional strict provider-type clause; column name is a module-supplied
+    # constant (never user input), the value is bound as a parameter.
+    type_clause = ""
+    if type_filter:
+        type_col, type_val = type_filter
+        type_clause = f"AND {type_col} = :type_val"
+        params["type_val"] = type_val
+
     sql = text(
         f"""
         SELECT id AS pid
@@ -174,6 +198,7 @@ def _knn_postgres(
         WHERE status = 'available'
           AND current_location IS NOT NULL
           AND location_updated_at >= :fresh_cutoff
+          {type_clause}
           AND ST_DWithin(
                 current_location,
                 ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
@@ -188,16 +213,7 @@ def _knn_postgres(
         LIMIT :limit
         """
     )
-    rows = session.execute(
-        sql,
-        {
-            "lat": lat,
-            "lng": lng,
-            "radius_m": radius_m,
-            "fresh_cutoff": fresh_cutoff,
-            "limit": limit,
-        },
-    ).all()
+    rows = session.execute(sql, params).all()
     return [r[0] for r in rows]
 
 
@@ -212,16 +228,19 @@ def _nearest_haversine(
     lng: float,
     fresh_cutoff,
     limit: int,
+    type_filter: Optional[tuple] = None,
 ) -> List:
-    candidates = session.exec(
-        select(model).where(
-            model.status == "available",
-            model.current_lat.is_not(None),
-            model.current_lng.is_not(None),
-            model.location_updated_at.is_not(None),
-            model.location_updated_at >= fresh_cutoff,
-        )
-    ).all()
+    conditions = [
+        model.status == "available",
+        model.current_lat.is_not(None),
+        model.current_lng.is_not(None),
+        model.location_updated_at.is_not(None),
+        model.location_updated_at >= fresh_cutoff,
+    ]
+    if type_filter:
+        type_col, type_val = type_filter
+        conditions.append(getattr(model, type_col) == type_val)
+    candidates = session.exec(select(model).where(*conditions)).all()
 
     busy_ids = set(
         session.exec(
@@ -247,8 +266,13 @@ def nearest_available_tow_drivers(
     lat: Optional[float],
     lng: Optional[float],
     limit: Optional[int] = None,
+    tow_vehicle_type: Optional[str] = None,
 ) -> Optional[List[TowTruckDriver]]:
-    """Closest available tow drivers to (lat, lng); None if no coords given."""
+    """Closest available tow drivers to (lat, lng); None if no coords given.
+
+    When ``tow_vehicle_type`` is given, only drivers of that exact tow-truck
+    class are returned (strict matching).
+    """
     return _nearest(
         session,
         model=TowTruckDriver,
@@ -260,6 +284,8 @@ def nearest_available_tow_drivers(
         lat=lat,
         lng=lng,
         limit=limit,
+        type_col="tow_vehicle_type" if tow_vehicle_type else None,
+        type_val=tow_vehicle_type,
     )
 
 

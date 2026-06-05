@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from app.core.models import Mechanic, MechanicTrip, MechanicOffer
 from app.utils.notifications import send_push_notification
+from app.utils.time_utils import now_ist
 from app.modules.dispatch import geo
 
 
@@ -11,7 +12,7 @@ def get_mechanic_score(
 ) -> float:
     score = (mechanic.rating or 0) * 10
     if last_trip_time:
-        hours_since_last = (datetime.utcnow() - last_trip_time).total_seconds() / 3600
+        hours_since_last = (now_ist() - last_trip_time).total_seconds() / 3600
         if hours_since_last > 24:
             score += 20
         elif hours_since_last > 4:
@@ -160,8 +161,7 @@ def attempt_mechanic_trip_escalation(session: Session, trip: MechanicTrip) -> bo
             create_mechanic_offers_for_tier(session, trip.id, next_batch, next_tier)
             return True
         else:
-            # Auto-Cancel if no mechanics are left to notify
-            trip.status = "cancelled"
+            trip.status = "no_mechanics_found"
             session.add(trip)
 
             # Cleanup offers
@@ -170,6 +170,17 @@ def attempt_mechanic_trip_escalation(session: Session, trip: MechanicTrip) -> bo
             ).all()
             for o in all_offers:
                 session.delete(o)
+
+            try:
+                send_push_notification(
+                    session=session,
+                    user_ids=[trip.user_id],
+                    title="No Mechanics Available 😔",
+                    body="We couldn't find an available mechanic nearby. Please try again.",
+                    data={"trip_id": trip.reference_id, "type": "no_mechanics_found"},
+                )
+            except Exception as e:
+                print(f"No-mechanics notification error: {e}")
 
             return True
 

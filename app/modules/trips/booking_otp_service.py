@@ -52,6 +52,20 @@ def has_active_otp(session: Session, booking_type: str, booking_id: int) -> bool
     return _active_row(session, booking_type, booking_id) is not None
 
 
+def active_otp_view(
+    session: Session, booking_type: str, booking_id: int
+) -> Optional[Tuple[str, "object"]]:
+    """Live (plaintext, expires_at) for an active unverified OTP, or None.
+
+    Used by the user-facing summary API so the customer can read the code
+    without depending on the arrival push being delivered.
+    """
+    row = _active_row(session, booking_type, booking_id)
+    if row and row.otp_plain:
+        return row.otp_plain, row.expires_at
+    return None
+
+
 def is_verified(session: Session, booking_type: str, booking_id: int) -> bool:
     row = session.exec(
         select(BookingOTP)
@@ -84,6 +98,7 @@ def generate(session: Session, booking_type: str, booking_id: int) -> str:
     ).all()
     for row in prior:
         row.expires_at = now
+        row.otp_plain = None
         session.add(row)
 
     code = _generate_code()
@@ -94,6 +109,7 @@ def generate(session: Session, booking_type: str, booking_id: int) -> str:
         booking_type=booking_type,
         booking_id=booking_id,
         otp_hash=_hash(code),
+        otp_plain=code,
         expires_at=now + timedelta(minutes=expiry_min),
     )
     session.add(otp)
@@ -138,6 +154,7 @@ def verify(
 
     row.verified_at = now_ist()
     row.verified_by_user_id = provider_user_id
+    row.otp_plain = None  # drop the plaintext once it's been used
     session.add(row)
     session.commit()
     return True, None

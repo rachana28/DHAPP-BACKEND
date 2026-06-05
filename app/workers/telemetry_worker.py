@@ -38,7 +38,7 @@ from sqlmodel import Session
 from app.core.database import engine
 from app.core.models import MechanicTrip, TowTrip, TowTruckDriver, Mechanic
 from app.modules.dispatch import geo
-from app.modules.trips import booking_otp_service
+from app.modules.trips import arrival_service
 from app.utils.id_generator import get_by_reference
 from app.utils.notifications import send_push_notification
 from app.utils.time_utils import now_ist
@@ -231,17 +231,8 @@ class TelemetryWorker:
             if tow.start_lat is None or tow.start_lng is None:
                 return
             if geo.haversine_m(lat, lng, tow.start_lat, tow.start_lng) <= radius:
-                tow.status = "arrived"
-                session.add(tow)
-                session.commit()
-                code = booking_otp_service.generate(session, "tow", tow.id)
-                self._notify(
-                    session,
-                    [tow.user_id],
-                    "Driver Arrived 🚛",
-                    f"Your tow driver is here. Share OTP {code} to start the tow.",
-                    {"trip_id": tow.reference_id, "otp": code, "screen": "otp"},
-                )
+                # Shared transition: accepted→arrived, issue + push the start OTP.
+                arrival_service.mark_tow_arrived(session, tow)
         elif tow.status == "in_progress":
             if tow.end_lat is None or tow.end_lng is None:
                 return
@@ -264,17 +255,8 @@ class TelemetryWorker:
         if mech.start_lat is None or mech.start_lng is None:
             return
         if geo.haversine_m(lat, lng, mech.start_lat, mech.start_lng) <= radius:
-            mech.status = "arrived"
-            session.add(mech)
-            session.commit()
-            code = booking_otp_service.generate(session, "mechanic", mech.id)
-            self._notify(
-                session,
-                [mech.user_id],
-                "Mechanic Arrived 🛠️",
-                f"Your mechanic is here. Share OTP {code} to confirm the service.",
-                {"trip_id": mech.reference_id, "otp": code, "screen": "otp"},
-            )
+            # Shared transition: accepted→arrived, issue + push the on-site OTP.
+            arrival_service.mark_mechanic_arrived(session, mech)
 
     def _notify(self, session, user_ids, title, body, data) -> None:
         try:

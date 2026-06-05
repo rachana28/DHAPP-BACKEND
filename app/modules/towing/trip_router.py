@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlmodel import Session, select, desc
-from typing import List
+from typing import Any, Dict, List
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import NoResultFound
 from pydantic import BaseModel
+import redis
 
-from app.core.database import get_session
+from app.core.database import get_session, get_redis
 from app.core.models import (
     TowTrip,
     TowTripCreate,
@@ -14,9 +15,16 @@ from app.core.models import (
     TowTruckDriver,
     TowTripOffer,
     TowTripOfferPublic,
+    BookingAddressUpdate,
     User,
 )
 from app.modules.trips import booking_otp_service
+from app.modules.trips.arrival_service import mark_tow_arrived
+from app.modules.trips.booking_summary import build_tow_summary, address_edit_window
+from app.modules.pricing.pricing_algo import (
+    get_road_distance_duration,
+    calculate_tow_cost,
+)
 from app.workers.topics import telemetry_topic
 from app.utils.time_utils import now_ist
 from app.modules.payments.service import refund_booking_payments
@@ -30,9 +38,30 @@ from app.modules.towing.tow_allocation import (
 from app.modules.dispatch import geo
 from app.utils.notifications import send_push_notification
 from app.utils.id_generator import generate_reference_id, get_by_reference, TOW_TRIP
-from fastapi import BackgroundTasks
 
 router = APIRouter(prefix="/tow-trips", tags=["Tow Trips"])
+
+
+def _price_tow_trip(session, redis_client, trip: TowTrip) -> None:
+    """Authoritatively (re)set distance_km + fare + fare_breakdown on a tow trip
+    from its tow-truck class and route. Server-side so a quote and the charge
+    can't diverge, and so an address edit re-prices consistently."""
+    if (
+        trip.start_lat is not None
+        and trip.start_lng is not None
+        and trip.end_lat is not None
+        and trip.end_lng is not None
+    ):
+        dist, _ = get_road_distance_duration(
+            trip.start_lat, trip.start_lng, trip.end_lat, trip.end_lng
+        )
+        if dist:
+            trip.distance_km = round(dist, 2)
+    price = calculate_tow_cost(
+        trip.distance_km or 0.0, trip.tow_vehicle_type, session, redis_client
+    )
+    trip.fare = price["final_price"]
+    trip.fare_breakdown = price["breakdown"]
 
 
 @router.post("/book-request", response_model=TowTripSafe)
@@ -40,6 +69,7 @@ def create_tow_booking_request(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
     trip_in: TowTripCreate,
 ):
     raise_if_unpaid_past_due(session, current_user.id)
@@ -51,12 +81,17 @@ def create_tow_booking_request(
 
     db_trip = TowTrip.model_validate(trip_data)
     db_trip.reference_id = generate_reference_id(session, TOW_TRIP)
+    # Server-authoritative pricing keyed on the requested tow-truck class.
+    _price_tow_trip(session, redis_client, db_trip)
 
     session.add(db_trip)
     session.commit()
     session.refresh(db_trip)
 
-    ranked_drivers = rank_tow_drivers(session, db_trip.start_lat, db_trip.start_lng)
+    # Strict dispatch: only drivers registered for the requested tow-truck class.
+    ranked_drivers = rank_tow_drivers(
+        session, db_trip.start_lat, db_trip.start_lng, db_trip.tow_vehicle_type
+    )
 
     if not ranked_drivers:
         db_trip.status = "no_drivers_found"
@@ -127,6 +162,14 @@ def cancel_tow_trip(
         raise HTTPException(
             status_code=400,
             detail="Cannot cancel a completed or already cancelled trip",
+        )
+
+    # Free cancellation only pre-pickup. Once the tow is physically underway
+    # (in_progress / near_destination) it can't be cancelled from the app.
+    if trip.status in ("in_progress", "near_destination"):
+        raise HTTPException(
+            status_code=400,
+            detail="The tow is already underway and can no longer be cancelled.",
         )
 
     driver_user_id_to_notify = None
@@ -202,7 +245,6 @@ def accept_tow_offer(
 
     # CRITICAL: Lock the Trip Row
     try:
-        # This query will WAIT if another driver is currently trying to accept the same trip
         statement = select(TowTrip).where(TowTrip.id == offer.trip_id).with_for_update()
         trip = session.exec(statement).one()
     except NoResultFound:
@@ -369,3 +411,130 @@ def end_tow_trip(
         data={"trip_id": trip.reference_id, "screen": "payment"},
     )
     return {"message": "Tow completed.", "status": trip.status}
+
+
+@router.post("/{trip_id}/mark-arrived")
+def mark_tow_arrived_endpoint(
+    trip_id: str,
+    session: Session = Depends(get_session),
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+):
+    """Driver manually marks arrival at the pickup — a fallback for when the
+    telemetry geofence doesn't fire (no broker / GPS drift). Generates and
+    pushes the start OTP, mirroring the automatic geofence trigger."""
+    trip = get_by_reference(session, TowTrip, trip_id)
+    if not trip or trip.tow_truck_driver_id != current_driver.id:
+        raise HTTPException(404, "Trip not found")
+
+    if trip.status == "arrived":
+        return {"message": "Already marked as arrived.", "status": trip.status}
+    if trip.status != "accepted":
+        raise HTTPException(
+            400,
+            "Arrival can only be marked after accepting and before the tow starts.",
+        )
+
+    mark_tow_arrived(session, trip)
+    return {
+        "message": "Marked as arrived. The customer has been sent the OTP.",
+        "status": trip.status,
+    }
+
+
+@router.get("/{trip_id}/summary")
+def get_tow_trip_summary(
+    trip_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Rich status/tracking summary for the user app's Tow screen (parity with
+    the regular-trip summary). Visible to the booking's owner or its driver."""
+    trip = get_by_reference(session, TowTrip, trip_id)
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+
+    authorized = trip.user_id == current_user.id
+    if not authorized and current_user.role == "tow_truck_driver":
+        driver = session.exec(
+            select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
+        ).first()
+        authorized = bool(driver and trip.tow_truck_driver_id == driver.id)
+    if not authorized:
+        raise HTTPException(403, "Not authorized to view this trip")
+
+    return build_tow_summary(session, trip)
+
+
+@router.patch("/{trip_id}/address")
+def update_tow_trip_address(
+    trip_id: str,
+    body: BookingAddressUpdate,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
+) -> Dict[str, Any]:
+    """Edit pickup/destination within the 3-minute post-booking window. Re-prices
+    the trip; re-dispatches if still searching and the pickup moved; otherwise
+    notifies the already-assigned driver. Returns the refreshed summary."""
+    trip = get_by_reference(session, TowTrip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(404, "Trip not found")
+
+    editable, _ = address_edit_window(session, trip)
+    if not editable:
+        raise HTTPException(
+            400,
+            "Address can no longer be edited (the 3-minute window has passed or the tow has started).",
+        )
+
+    data = body.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(400, "No address fields provided.")
+    pickup_moved = any(k in data for k in ("start_lat", "start_lng", "start_location"))
+    for key, value in data.items():
+        setattr(trip, key, value)
+
+    # Re-derive distance + fare from the new route (server-authoritative).
+    _price_tow_trip(session, redis_client, trip)
+    session.add(trip)
+    session.commit()
+    session.refresh(trip)
+
+    if trip.status == "searching" and pickup_moved:
+        # Re-dispatch from the new pickup: clear pending offers, re-rank.
+        for offer in session.exec(
+            select(TowTripOffer).where(TowTripOffer.trip_id == trip.id)
+        ).all():
+            session.delete(offer)
+        session.commit()
+        ranked = rank_tow_drivers(
+            session, trip.start_lat, trip.start_lng, trip.tow_vehicle_type
+        )
+        if ranked:
+            tier_size = geo.get_config_int(
+                session, geo.KNN_LIMIT_KEY, geo.DEFAULT_KNN_LIMIT
+            )
+            create_tow_offers_for_tier(session, trip.id, ranked[:tier_size], tier=1)
+        else:
+            trip.status = "no_drivers_found"
+            session.add(trip)
+            session.commit()
+    elif trip.status == "accepted" and trip.tow_truck_driver_id:
+        # Keep the assigned driver; just notify them of the change.
+        driver = session.get(TowTruckDriver, trip.tow_truck_driver_id)
+        if driver:
+            background_tasks.add_task(
+                send_push_notification,
+                session=session,
+                user_ids=[driver.user_id],
+                title="Trip Updated 📍",
+                body="The customer updated the pickup/destination. Please review the new route.",
+                data={
+                    "trip_id": trip.reference_id,
+                    "screen": "tracking",
+                    "type": "address_update",
+                },
+            )
+
+    return build_tow_summary(session, trip)
