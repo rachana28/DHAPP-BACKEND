@@ -10,26 +10,39 @@ on ``TripAttendance``). DB-backed only — these are low-frequency, one-shot OTP
 so the Redis-primary machinery of the trip flow would be overkill here.
 """
 
-import hashlib
-import secrets
 from datetime import timedelta
 from typing import Optional, Tuple
 
 from sqlmodel import Session, select
 
+from app.core import otp_redis
 from app.core.models import BookingOTP
 from app.modules.dispatch import geo
 from app.utils.time_utils import now_ist
 
-OTP_LENGTH = 6
+OTP_LENGTH = otp_redis.OTP_LENGTH
 
 
 def _generate_code() -> str:
-    return "".join(secrets.choice("0123456789") for _ in range(OTP_LENGTH))
+    return otp_redis.generate_numeric_code(OTP_LENGTH)
 
 
 def _hash(code: str) -> str:
-    return hashlib.sha256(code.encode()).hexdigest()
+    return otp_redis.sha256_hex(code)
+
+
+def _purge_db_rows(session: Session, booking_type: str, booking_id: int) -> None:
+    """Delete ALL DB OTP rows for a booking (used on verify success)."""
+    rows = session.exec(
+        select(BookingOTP).where(
+            BookingOTP.booking_type == booking_type,
+            BookingOTP.booking_id == booking_id,
+        )
+    ).all()
+    for row in rows:
+        session.delete(row)
+    if rows:
+        session.commit()
 
 
 def _active_row(
@@ -105,15 +118,22 @@ def generate(session: Session, booking_type: str, booking_id: int) -> str:
     expiry_min = geo.get_config_float(
         session, geo.BOOKING_OTP_EXPIRY_MIN_KEY, geo.DEFAULT_BOOKING_OTP_EXPIRY_MIN
     )
+    expires_at = now + timedelta(minutes=expiry_min)
+    otp_hash = _hash(code)
     otp = BookingOTP(
         booking_type=booking_type,
         booking_id=booking_id,
-        otp_hash=_hash(code),
+        otp_hash=otp_hash,
         otp_plain=code,
-        expires_at=now + timedelta(minutes=expiry_min),
+        expires_at=expires_at,
     )
     session.add(otp)
     session.commit()
+
+    # Redis is primary: store the hash with a TTL equal to the remaining
+    # validity (it self-expires). The DB row above is the secondary/fallback.
+    ttl = max(1, int((expires_at - now).total_seconds()))
+    otp_redis.store_hash(booking_type, booking_id, otp_hash, ttl)
     return code
 
 
@@ -145,16 +165,17 @@ def verify(
             "Too many incorrect attempts. Ask the customer to regenerate the OTP.",
         )
 
-    if _hash(code) != row.otp_hash:
+    # Redis is primary for the hash; fall back to the DB row when Redis is down
+    # or the key is missing.
+    expected_hash = otp_redis.get_hash(booking_type, booking_id) or row.otp_hash
+    if _hash(code) != expected_hash:
         row.attempts += 1
         session.add(row)
         session.commit()
         remaining = max(row.max_attempts - row.attempts, 0)
         return False, f"Incorrect OTP. {remaining} attempt(s) left."
 
-    row.verified_at = now_ist()
-    row.verified_by_user_id = provider_user_id
-    row.otp_plain = None  # drop the plaintext once it's been used
-    session.add(row)
-    session.commit()
+    # Success → wipe the OTP from BOTH stores (post-verification deletion).
+    otp_redis.delete(booking_type, booking_id)
+    _purge_db_rows(session, booking_type, booking_id)
     return True, None

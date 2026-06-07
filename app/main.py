@@ -51,6 +51,7 @@ from app.modules.payments import router as payments_router
 from app.modules.addresses import router as addresses_router
 from app.modules.cards import router as cards_router
 from app.modules.wallet import router as wallet_router
+from app.modules.bookings import active_router as bookings_active_router
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -58,6 +59,7 @@ from app.modules.towing.tow_allocation import process_tow_tier_escalation
 from app.modules.trips.scheduler_jobs import (
     generate_otp_for_trip_scheduler,
     expire_otp_for_trip_scheduler,
+    purge_otps_scheduler,
     auto_end_trip_scheduler,
     driver_payment_timeout_scheduler,
     daily_settlement_scheduler,
@@ -127,6 +129,7 @@ async def lifespan(app: FastAPI):
     # Trip OTP / payment / billing automation
     scheduler.add_job(generate_otp_for_trip_scheduler, "interval", minutes=1)
     scheduler.add_job(expire_otp_for_trip_scheduler, "interval", minutes=5)
+    scheduler.add_job(purge_otps_scheduler, "interval", minutes=5)
     scheduler.add_job(auto_end_trip_scheduler, "interval", minutes=2)
     scheduler.add_job(driver_payment_timeout_scheduler, "interval", minutes=1)
     scheduler.add_job(daily_settlement_scheduler, "cron", hour=23, minute=59)
@@ -201,6 +204,7 @@ app.include_router(payments_router.router)
 app.include_router(addresses_router.router)
 app.include_router(cards_router.router)
 app.include_router(wallet_router.router)
+app.include_router(bookings_active_router.router)
 
 
 @app.get("/")

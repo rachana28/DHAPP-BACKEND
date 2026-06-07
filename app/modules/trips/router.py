@@ -1,10 +1,19 @@
 import redis
-from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Header
+from datetime import date, timedelta
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    BackgroundTasks,
+    Header,
+    Query,
+)
 from sqlmodel import Session, select, desc
 from typing import List, Optional
 from sqlalchemy.orm import selectinload
 
+from app.core import cache
 from app.core.database import get_session, get_redis
 from app.core.idempotency import IdempotencyGuard, idempotent
 from app.core.models import (
@@ -40,10 +49,7 @@ from app.modules.trips.payment_service import (
     get_driver_abandon_suspension_hours,
 )
 from app.modules.trips.trip_service import TripService
-from app.modules.trips.billing_service import (
-    BillingService,
-    payment_method_discount_pct,
-)
+from app.modules.trips.billing_service import BillingService
 from app.modules.trips.pricing_calculator import (
     calculate_fare,
     validate_pricing_inputs,
@@ -60,6 +66,30 @@ from app.utils.id_generator import (
 )
 
 router = APIRouter(prefix="/trips", tags=["Trips"])
+
+
+def _trip_read_driver(t: Trip, skips_remaining: Optional[int]) -> TripReadDriver:
+    """Marshal a Trip into the driver-app view.
+
+    Never leaks the user UUID, internal flags, or customer phone/address
+    (UserPublicForDriver carries only name + avatar).
+    """
+    return TripReadDriver(
+        reference_id=t.reference_id,
+        **{
+            k: getattr(t, k)
+            for k in TripReadDriver.model_fields.keys()
+            if k not in ("user", "driver_skips_remaining", "id")
+        },
+        user={
+            "full_name": t.user.full_name if t.user else None,
+            "avatar_url": getattr(t.user, "avatar_url", None) if t.user else None,
+        }
+        if t.user
+        else None,
+        driver_skips_remaining=skips_remaining,
+    )
+
 
 TIER_SIZE = 3
 
@@ -332,6 +362,8 @@ def get_my_bookings(
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
 ):
     if current_user.role == "driver":
         driver = session.exec(
@@ -343,33 +375,15 @@ def get_my_bookings(
             select(Trip)
             .where(Trip.driver_id == driver.id)
             .order_by(desc(Trip.booking_time))
+            .offset(offset)
+            .limit(limit)
             .options(selectinload(Trip.user))
         ).all()
         # Skip allowance is scoped per trip booking — surface each trip's own
         # remaining count.
         trip_service = TripService()
-        # Hand-marshal so we never leak the user UUID or internal flags.
         return [
-            TripReadDriver(
-                reference_id=t.reference_id,
-                **{
-                    k: getattr(t, k)
-                    for k in TripReadDriver.model_fields.keys()
-                    if k not in ("user", "driver_skips_remaining", "id")
-                },
-                user={
-                    "full_name": t.user.full_name if t.user else None,
-                    "phone_number": t.user.phone_number if t.user else None,
-                    "avatar_url": getattr(t.user, "avatar_url", None)
-                    if t.user
-                    else None,
-                }
-                if t.user
-                else None,
-                driver_skips_remaining=trip_service.driver_skips_remaining(
-                    session, t.id
-                ),
-            )
+            _trip_read_driver(t, trip_service.driver_skips_remaining(session, t.id))
             for t in trips
         ]
 
@@ -387,6 +401,8 @@ def get_my_bookings(
             select(Trip)
             .where(Trip.user_id == current_user.id)
             .order_by(desc(Trip.booking_time))
+            .offset(offset)
+            .limit(limit)
             .options(selectinload(Trip.driver))
         ).all()
 
@@ -406,6 +422,47 @@ def get_my_bookings(
         return result
     else:
         return []
+
+
+@router.get("/driver/active-bookings")
+def get_driver_active_bookings(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Driver-app polling target: only the driver's currently-engaged trips
+    (DRIVER_BUSY_STATES). Lighter than `my-bookings` and short-TTL cached so
+    frequent polling doesn't sweep the table. No customer phone/address."""
+    if current_user.role != "driver":
+        return []
+    driver = session.exec(
+        select(Driver).where(Driver.user_id == current_user.id)
+    ).first()
+    if not driver:
+        return []
+
+    key = cache.active_key("driver_trips", driver.id)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+
+    trips = session.exec(
+        select(Trip)
+        .where(
+            Trip.driver_id == driver.id,
+            Trip.status.in_(TripService.DRIVER_BUSY_STATES),
+        )
+        .order_by(desc(Trip.booking_time))
+        .options(selectinload(Trip.user))
+    ).all()
+    trip_service = TripService()
+    result = [
+        _trip_read_driver(
+            t, trip_service.driver_skips_remaining(session, t.id)
+        ).model_dump(mode="json")
+        for t in trips
+    ]
+    cache.cache_set_json(key, result, cache.ACTIVE_CACHE_TTL)
+    return result
 
 
 @router.post("/{trip_id}/cancel")
@@ -632,10 +689,17 @@ def get_driver_offers(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
+    # Only surface offers that are still actionable: pending AND whose trip is
+    # still searching for a driver (skip offers for trips already taken/cancelled
+    # so the poll returns only relevant data). Capped for a lean payload.
     statement = (
         select(TripOffer)
+        .join(Trip, TripOffer.trip_id == Trip.id)
         .where(TripOffer.driver_id == driver.id)
         .where(TripOffer.status == "pending")
+        .where(Trip.status == "searching")
+        .order_by(desc(TripOffer.created_at))
+        .limit(20)
         .options(selectinload(TripOffer.trip))
     )
 

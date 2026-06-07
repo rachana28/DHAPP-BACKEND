@@ -3,8 +3,10 @@ from sqlmodel import Session, select, func, desc
 from typing import List
 import redis
 
+from app.core import cache
 from app.core.database import get_session, get_redis
 from app.core.models import (
+    AvailabilityUpdate,
     TowTruckDriver,
     TowTruckDriverUpdate,
     TowTruckDriverPublic,
@@ -19,10 +21,39 @@ from app.utils.id_generator import get_by_reference
 router = APIRouter(prefix="/tow-truck-drivers", tags=["Tow Truck Drivers"])
 
 
+def _tow_me_key(current_driver: TowTruckDriver) -> str:
+    return cache.me_key("tow_driver", current_driver.user_id)
+
+
 @router.get("/me", response_model=TowTruckDriverPrivate)
 def read_current_tow_driver_profile(
     current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
 ):
+    key = _tow_me_key(current_driver)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+    data = TowTruckDriverPrivate.model_validate(
+        current_driver, from_attributes=True
+    ).model_dump(mode="json")
+    cache.cache_set_json(key, data, cache.ME_CACHE_TTL)
+    return data
+
+
+@router.patch("/me/availability", response_model=TowTruckDriverPrivate)
+def set_tow_driver_availability(
+    *,
+    session: Session = Depends(get_session),
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+    body: AvailabilityUpdate,
+):
+    """Online/offline toggle. When offline the driver is excluded from geo
+    dispatch (alongside the admin `status` check) without touching that status."""
+    current_driver.is_online = body.is_online
+    session.add(current_driver)
+    session.commit()
+    session.refresh(current_driver)
+    cache.cache_delete(_tow_me_key(current_driver))
     return current_driver
 
 
@@ -44,6 +75,7 @@ def update_current_tow_driver_profile(
     session.add(current_driver)
     session.commit()
     session.refresh(current_driver)
+    cache.cache_delete(_tow_me_key(current_driver))
     return current_driver
 
 
@@ -68,6 +100,7 @@ async def update_profile_picture(
     session.commit()
     session.refresh(current_driver)
 
+    cache.cache_delete(_tow_me_key(current_driver))
     return current_driver
 
 
@@ -137,6 +170,7 @@ async def upload_verification_document(
     session.commit()
     session.refresh(current_driver)
 
+    cache.cache_delete(_tow_me_key(current_driver))
     return {
         "message": "Document uploaded successfully",
         "documents": current_driver.verification_documents,

@@ -12,7 +12,7 @@ integer primary keys, driver/mechanic ids, or phone numbers.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from sqlmodel import Session, func, select
 
@@ -161,6 +161,10 @@ def build_tow_summary(session: Session, trip: TowTrip) -> Dict[str, Any]:
             result["tow_truck_driver"] = _tow_driver_block(session, driver)
             if trip.status in _TOW_LIVE_STATES:
                 result["telemetry_topic"] = telemetry_topic(trip.reference_id)
+    elif trip.status == "searching":
+        result["nearby_providers"] = geo.nearby_provider_locations(
+            session, trip.start_lat, trip.start_lng, kind="tow"
+        )
     return result
 
 
@@ -194,4 +198,8 @@ def build_mechanic_summary(session: Session, trip: MechanicTrip) -> Dict[str, An
             result["mechanic"] = _mechanic_block(session, mech)
             if trip.status in _MECHANIC_LIVE_STATES:
                 result["telemetry_topic"] = telemetry_topic(trip.reference_id)
+    elif trip.status == "searching":
+        result["nearby_providers"] = geo.nearby_provider_locations(
+            session, trip.start_lat, trip.start_lng, kind="mechanic"
+        )
     return result

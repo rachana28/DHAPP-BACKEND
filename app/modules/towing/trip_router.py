@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlmodel import Session, select, desc
 from typing import Any, Dict, List
 from sqlalchemy.orm import selectinload
@@ -6,6 +6,7 @@ from sqlalchemy.exc import NoResultFound
 from pydantic import BaseModel
 import redis
 
+from app.core import cache
 from app.core.database import get_session, get_redis
 from app.core.models import (
     TowTrip,
@@ -110,6 +111,8 @@ def create_tow_booking_request(
 def get_my_tow_bookings(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
 ):
     if current_user.role == "tow_truck_driver":
         driver = session.exec(
@@ -122,6 +125,8 @@ def get_my_tow_bookings(
             select(TowTrip)
             .where(TowTrip.tow_truck_driver_id == driver.id)
             .order_by(desc(TowTrip.booking_time))
+            .offset(offset)
+            .limit(limit)
             .options(selectinload(TowTrip.user))
         )
         return session.exec(statement).all()
@@ -131,12 +136,44 @@ def get_my_tow_bookings(
             select(TowTrip)
             .where(TowTrip.user_id == current_user.id)
             .order_by(desc(TowTrip.booking_time))
+            .offset(offset)
+            .limit(limit)
             .options(selectinload(TowTrip.tow_truck_driver))
         )
         return session.exec(statement).all()
 
     else:
         return []
+
+
+@router.get("/driver/active-bookings", response_model=List[TowTripReadUser])
+def get_tow_driver_active_bookings(
+    session: Session = Depends(get_session),
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+):
+    """Driver-app polling target: the tow driver's currently-engaged jobs only
+    (accepted → near_destination). Short-TTL cached; carries no customer
+    phone/address (TowTripReadUser exposes no `user` block)."""
+    key = cache.active_key("tow_driver", current_driver.id)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+
+    rows = session.exec(
+        select(TowTrip)
+        .where(
+            TowTrip.tow_truck_driver_id == current_driver.id,
+            TowTrip.status.in_(geo.TOW_ACTIVE_STATES),
+        )
+        .order_by(desc(TowTrip.booking_time))
+        .options(selectinload(TowTrip.tow_truck_driver))
+    ).all()
+    result = [
+        TowTripReadUser.model_validate(t, from_attributes=True).model_dump(mode="json")
+        for t in rows
+    ]
+    cache.cache_set_json(key, result, cache.ACTIVE_CACHE_TTL)
+    return result
 
 
 @router.post("/{trip_id}/cancel")
@@ -219,10 +256,16 @@ def get_tow_driver_offers(
     session: Session = Depends(get_session),
     current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
 ):
+    # Only actionable offers: pending AND whose trip is still searching (drop
+    # offers for trips already taken/cancelled). Capped for a lean payload.
     statement = (
         select(TowTripOffer)
+        .join(TowTrip, TowTripOffer.trip_id == TowTrip.id)
         .where(TowTripOffer.tow_truck_driver_id == current_driver.id)
         .where(TowTripOffer.status == "pending")
+        .where(TowTrip.status == "searching")
+        .order_by(desc(TowTripOffer.created_at))
+        .limit(20)
         .options(selectinload(TowTripOffer.trip))
     )
     offers = session.exec(statement).all()
