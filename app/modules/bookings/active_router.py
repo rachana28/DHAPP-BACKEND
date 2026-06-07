@@ -26,7 +26,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import Session, desc, select
 
 from app.core import cache
-from app.core.booking_states import (
+from app.utils.booking_states import (
     MECHANIC_ACTIVE_STATES,
     SERVICE_ACTIVE_STATES,
     TOW_ACTIVE_STATES,

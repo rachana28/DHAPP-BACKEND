@@ -25,7 +25,7 @@ from app.core.models import (
     ServiceStatus,
 )
 from app.core import cache
-from app.core.booking_states import SERVICE_CENTER_ENGAGED_STATES
+from app.utils.booking_states import SERVICE_CENTER_ENGAGED_STATES
 from app.core.security import get_current_active_service_center
 from app.modules.payments.service import refund_booking_payments
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
