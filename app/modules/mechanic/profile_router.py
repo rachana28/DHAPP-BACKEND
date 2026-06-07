@@ -3,8 +3,10 @@ from sqlmodel import Session, select, func, desc
 from typing import List
 import redis
 
+from app.core import cache
 from app.core.database import get_session, get_redis
 from app.core.models import (
+    AvailabilityUpdate,
     Mechanic,
     MechanicUpdate,
     MechanicPublic,
@@ -19,10 +21,39 @@ from app.utils.id_generator import get_by_reference
 router = APIRouter(prefix="/mechanics", tags=["Mechanics"])
 
 
+def _mechanic_me_key(current_mechanic: Mechanic) -> str:
+    return cache.me_key("mechanic", current_mechanic.user_id)
+
+
 @router.get("/me", response_model=MechanicPrivate)
 def read_current_mechanic_profile(
     current_mechanic: Mechanic = Depends(get_current_active_mechanic),
 ):
+    key = _mechanic_me_key(current_mechanic)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+    data = MechanicPrivate.model_validate(
+        current_mechanic, from_attributes=True
+    ).model_dump(mode="json")
+    cache.cache_set_json(key, data, cache.ME_CACHE_TTL)
+    return data
+
+
+@router.patch("/me/availability", response_model=MechanicPrivate)
+def set_mechanic_availability(
+    *,
+    session: Session = Depends(get_session),
+    current_mechanic: Mechanic = Depends(get_current_active_mechanic),
+    body: AvailabilityUpdate,
+):
+    """Online/offline toggle. When offline the mechanic is excluded from geo
+    dispatch (alongside the admin `status` check) without touching that status."""
+    current_mechanic.is_online = body.is_online
+    session.add(current_mechanic)
+    session.commit()
+    session.refresh(current_mechanic)
+    cache.cache_delete(_mechanic_me_key(current_mechanic))
     return current_mechanic
 
 
@@ -44,6 +75,7 @@ def update_current_mechanic_profile(
     session.add(current_mechanic)
     session.commit()
     session.refresh(current_mechanic)
+    cache.cache_delete(_mechanic_me_key(current_mechanic))
     return current_mechanic
 
 
@@ -68,6 +100,7 @@ async def update_profile_picture(
     session.commit()
     session.refresh(current_mechanic)
 
+    cache.cache_delete(_mechanic_me_key(current_mechanic))
     return current_mechanic
 
 
@@ -139,6 +172,7 @@ async def upload_verification_document(
     session.commit()
     session.refresh(current_mechanic)
 
+    cache.cache_delete(_mechanic_me_key(current_mechanic))
     return {
         "message": "Document uploaded successfully",
         "documents": current_mechanic.verification_documents,

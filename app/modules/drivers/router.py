@@ -5,6 +5,7 @@ from sqlmodel import Session, select, func, desc
 from typing import List
 import redis
 
+from app.core import cache
 from app.core.database import get_session, get_redis
 from app.core.models import (
     Driver,
@@ -21,14 +22,28 @@ from app.utils.id_generator import get_by_reference
 router = APIRouter(prefix="/drivers", tags=["Drivers"])
 
 
+def _driver_me_key(current_driver: Driver) -> str:
+    return cache.me_key("driver", current_driver.user_id)
+
+
 @router.get("/me", response_model=DriverPrivate)
 def read_current_driver_profile(
     current_driver: Driver = Depends(get_current_active_driver),
 ):
     """
     Get the full profile for the currently authenticated driver.
+
+    Redis-cached; invalidated on profile/picture/document writes below.
     """
-    return current_driver
+    key = _driver_me_key(current_driver)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+    data = DriverPrivate.model_validate(
+        current_driver, from_attributes=True
+    ).model_dump(mode="json")
+    cache.cache_set_json(key, data, cache.ME_CACHE_TTL)
+    return data
 
 
 @router.patch("/me", response_model=DriverPrivate)
@@ -58,6 +73,7 @@ def update_current_driver_profile(
     if redis_client:
         redis_client.delete("drivers")
         redis_client.delete(f"driver_{current_driver.id}")
+    cache.cache_delete(_driver_me_key(current_driver))
 
     return current_driver
 
@@ -83,6 +99,7 @@ async def update_driver_profile_picture(
     session.commit()
     session.refresh(current_driver)
 
+    cache.cache_delete(_driver_me_key(current_driver))
     return current_driver
 
 
@@ -203,6 +220,7 @@ async def upload_verification_document(
     session.commit()
     session.refresh(current_driver)
 
+    cache.cache_delete(_driver_me_key(current_driver))
     return {
         "message": "Document uploaded successfully",
         "documents": current_driver.verification_documents,

@@ -196,6 +196,7 @@ def _knn_postgres(
         SELECT id AS pid
         FROM {table}
         WHERE status = 'available'
+          AND is_online IS NOT FALSE
           AND current_location IS NOT NULL
           AND location_updated_at >= :fresh_cutoff
           {type_clause}
@@ -232,6 +233,7 @@ def _nearest_haversine(
 ) -> List:
     conditions = [
         model.status == "available",
+        model.is_online.is_not(False),
         model.current_lat.is_not(None),
         model.current_lng.is_not(None),
         model.location_updated_at.is_not(None),
@@ -308,3 +310,39 @@ def nearest_available_mechanics(
         lng=lng,
         limit=limit,
     )
+
+
+# Wider cap than the dispatch tier so the user-app map can show several pins.
+NEARBY_MAP_LIMIT = 20
+
+
+def nearby_provider_locations(
+    session: Session,
+    lat: Optional[float],
+    lng: Optional[float],
+    kind: str,
+    limit: int = NEARBY_MAP_LIMIT,
+) -> List[dict]:
+    """Coordinates ONLY of nearby available+online providers, for the user-app map.
+
+    Reuses the dispatch KNN/Haversine query (so the same availability, online,
+    freshness, radius and not-busy filters apply) but exposes **nothing
+    sensitive** — no ids, names, ratings or phone numbers, just ``current_lat`` /
+    ``current_lng``. Intended to be embedded in the tow/mechanic ``/summary``
+    response ONLY while the booking is still in the searching phase.
+    """
+    if lat is None or lng is None:
+        return []
+    if kind == "tow":
+        providers = nearest_available_tow_drivers(session, lat, lng, limit=limit)
+    elif kind == "mechanic":
+        providers = nearest_available_mechanics(session, lat, lng, limit=limit)
+    else:
+        return []
+    if not providers:
+        return []
+    return [
+        {"current_lat": p.current_lat, "current_lng": p.current_lng}
+        for p in providers
+        if p.current_lat is not None and p.current_lng is not None
+    ]

@@ -99,6 +99,7 @@ class Mechanic(MechanicBase, table=True):
     current_lat: Optional[float] = Field(default=None)
     current_lng: Optional[float] = Field(default=None)
     location_updated_at: Optional[datetime] = Field(default=None)
+    is_online: bool = Field(default=True)
 
     user: "User" = Relationship(back_populates="mechanic_profile")
     mechanic_trips: List["MechanicTrip"] = Relationship(back_populates="mechanic")
@@ -141,6 +142,7 @@ class MechanicPublic(SQLModel):
 class MechanicPrivate(MechanicPublic):
     phone_number: str
     address: Optional[str] = None
+    is_online: bool = True
 
 
 class MechanicReviewBase(SQLModel):
@@ -721,6 +723,7 @@ class TowTruckDriver(TowTruckDriverBase, table=True):
     current_lat: Optional[float] = Field(default=None)
     current_lng: Optional[float] = Field(default=None)
     location_updated_at: Optional[datetime] = Field(default=None)
+    is_online: bool = Field(default=True)
 
     user: "User" = Relationship(back_populates="tow_truck_driver_profile")
     tow_trips: List["TowTrip"] = Relationship(back_populates="tow_truck_driver")
@@ -868,6 +871,13 @@ class DriverPrivate(DriverBase):
 
 class TowTruckDriverPrivate(TowTruckDriverBase):
     id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    is_online: bool = True
+
+
+class AvailabilityUpdate(SQLModel):
+    """Body for the tow-driver / mechanic online-offline toggle."""
+
+    is_online: bool
 
 
 # --- Update Models ---
@@ -1998,10 +2008,13 @@ class FareEstimateRequest(SQLModel):
 
 
 class UserPublicForDriver(SQLModel):
-    """Trip-rider info exposed to the assigned driver. No UUID leak."""
+    """Trip-rider info exposed to the assigned driver.
+
+    No UUID leak, and deliberately NO phone number or address — driver-app
+    responses must never carry user contact/PII (privacy policy).
+    """
 
     full_name: Optional[str] = None
-    phone_number: Optional[str] = None
     avatar_url: Optional[str] = None
 
 

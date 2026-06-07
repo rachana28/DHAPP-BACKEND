@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, File, UploadFile
 from sqlmodel import Session
 
+from app.core import cache
 from app.core.database import get_session
 from app.core.models import User, UserUpdate, UserPrivate
 from app.core.security import get_current_active_user
@@ -9,14 +10,29 @@ from app.utils.storage import upload_profile_picture_to_r2
 router = APIRouter(prefix="/users", tags=["Users"])
 
 
+def _me_key(current_user: User) -> str:
+    return cache.me_key("user", current_user.id)
+
+
 @router.get("/me", response_model=UserPrivate)
 def read_current_user_profile(
     current_user: User = Depends(get_current_active_user),
 ):
     """
     Get the full profile for the currently authenticated user.
+
+    Cached in Redis (profile rarely changes between writes); invalidated on any
+    PATCH / picture upload below.
     """
-    return current_user
+    key = _me_key(current_user)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+    data = UserPrivate.model_validate(current_user, from_attributes=True).model_dump(
+        mode="json"
+    )
+    cache.cache_set_json(key, data, cache.ME_CACHE_TTL)
+    return data
 
 
 @router.patch("/me", response_model=UserPrivate)
@@ -38,6 +54,7 @@ def update_current_user_profile(
     session.commit()
     session.refresh(current_user)
 
+    cache.cache_delete(_me_key(current_user))
     return current_user
 
 
@@ -60,4 +77,5 @@ async def update_profile_picture(
     session.commit()
     session.refresh(current_user)
 
+    cache.cache_delete(_me_key(current_user))
     return current_user

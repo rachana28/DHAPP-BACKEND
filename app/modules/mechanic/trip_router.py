@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlmodel import Session, select, desc
 from typing import Any, Dict, List
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import NoResultFound
 from pydantic import BaseModel
 
+from app.core import cache
 from app.core.database import get_session
 from app.core.models import (
     MechanicTrip,
@@ -87,6 +88,8 @@ def create_mechanic_booking_request(
 def get_my_mechanic_bookings(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
 ):
     """
     Fetch mechanic bookings for the logged-in user or mechanic.
@@ -104,6 +107,8 @@ def get_my_mechanic_bookings(
             select(MechanicTrip)
             .where(MechanicTrip.mechanic_id == mechanic.id)
             .order_by(desc(MechanicTrip.booking_time))
+            .offset(offset)
+            .limit(limit)
             .options(selectinload(MechanicTrip.user))
         )
         return session.exec(statement).all()
@@ -114,12 +119,46 @@ def get_my_mechanic_bookings(
             select(MechanicTrip)
             .where(MechanicTrip.user_id == current_user.id)
             .order_by(desc(MechanicTrip.booking_time))
+            .offset(offset)
+            .limit(limit)
             .options(selectinload(MechanicTrip.mechanic))
         )
         return session.exec(statement).all()
 
     else:
         return []
+
+
+@router.get("/mechanic/active-bookings", response_model=List[MechanicTripReadUser])
+def get_mechanic_active_bookings(
+    session: Session = Depends(get_session),
+    current_mechanic: Mechanic = Depends(get_current_active_mechanic),
+):
+    """Mechanic-app polling target: the mechanic's currently-engaged jobs only
+    (accepted → in_progress). Short-TTL cached; carries no customer
+    phone/address (MechanicTripReadUser exposes no `user` block)."""
+    key = cache.active_key("mechanic", current_mechanic.id)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+
+    rows = session.exec(
+        select(MechanicTrip)
+        .where(
+            MechanicTrip.mechanic_id == current_mechanic.id,
+            MechanicTrip.status.in_(geo.MECHANIC_ACTIVE_STATES),
+        )
+        .order_by(desc(MechanicTrip.booking_time))
+        .options(selectinload(MechanicTrip.mechanic))
+    ).all()
+    result = [
+        MechanicTripReadUser.model_validate(t, from_attributes=True).model_dump(
+            mode="json"
+        )
+        for t in rows
+    ]
+    cache.cache_set_json(key, result, cache.ACTIVE_CACHE_TTL)
+    return result
 
 
 @router.post("/{trip_id}/cancel")
@@ -191,10 +230,16 @@ def get_mechanic_offers(
     current_mechanic: Mechanic = Depends(get_current_active_mechanic),
 ):
     """Fetch pending offers for the logged-in mechanic."""
+    # Only actionable offers: pending AND whose trip is still searching (drop
+    # offers for trips already taken/cancelled). Capped for a lean payload.
     statement = (
         select(MechanicOffer)
+        .join(MechanicTrip, MechanicOffer.trip_id == MechanicTrip.id)
         .where(MechanicOffer.mechanic_id == current_mechanic.id)
         .where(MechanicOffer.status == "pending")
+        .where(MechanicTrip.status == "searching")
+        .order_by(desc(MechanicOffer.created_at))
+        .limit(20)
         .options(selectinload(MechanicOffer.trip))  # Loads the nested trip data from DB
     )
     offers = session.exec(statement).all()

@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 
 from app.core.database import engine, get_redis
 from app.core.models import (
+    BookingOTP,
     Trip,
     TripOffer,
     OTPRegistry,
@@ -196,6 +197,50 @@ async def expire_otp_for_trip_scheduler():
                 )
     except Exception as e:
         logger.error(f"OTP expiry scheduler failed: {str(e)}")
+
+
+async def purge_otps_scheduler():
+    """Delete OTP rows from the DB once they can no longer be needed.
+
+    Closes the loop on "post-verification / post-expiry deletion":
+
+    - **Booking (tow/mechanic) OTPs** are already wiped from Redis *and* DB on
+      successful verify (see ``booking_otp_service.verify``). Here we sweep the
+      leftover *expired-unverified* rows. Redis self-expires via its TTL, so we
+      don't touch it (a newer regenerated OTP may legitimately own the key).
+    - **Trip OTPs**: Redis is dropped on verify already, but the DB row doubles
+      as the per-shift *regeneration guard* used by ``generate_otp_for_trip_scheduler``
+      (it skips a shift that already has a row) and is consumed by
+      ``expire_otp_for_trip_scheduler``. So we only delete trip rows once the
+      whole validity window has closed (``otp_expiry_at`` past, plus a 1-hour
+      grace so the expiry job has certainly run).
+    """
+    try:
+        with Session(engine) as session:
+            now = now_ist()
+
+            # Booking OTPs: any expired row (verified ones were already deleted).
+            expired_booking = session.exec(
+                select(BookingOTP).where(BookingOTP.expires_at < now)
+            ).all()
+            for row in expired_booking:
+                session.delete(row)
+
+            # Trip OTPs: only well after the window closed.
+            trip_cutoff = now - timedelta(hours=1)
+            old_trip = session.exec(
+                select(OTPRegistry).where(OTPRegistry.otp_expiry_at < trip_cutoff)
+            ).all()
+            for row in old_trip:
+                session.delete(row)
+
+            if expired_booking or old_trip:
+                session.commit()
+                logger.info(
+                    f"Purged {len(expired_booking)} booking + {len(old_trip)} trip OTP rows"
+                )
+    except Exception as e:
+        logger.error(f"OTP purge scheduler failed: {str(e)}")
 
 
 async def auto_end_trip_scheduler():
@@ -490,6 +535,7 @@ async def auto_mark_missed_shifts_scheduler():
 
 
 DRIVER_FEE_PENDING_GRACE_MIN = 10
+
 
 async def driver_payment_timeout_scheduler():
     try:

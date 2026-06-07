@@ -24,6 +24,8 @@ from app.core.models import (
     BookingType,
     ServiceStatus,
 )
+from app.core import cache
+from app.core.booking_states import SERVICE_CENTER_ENGAGED_STATES
 from app.core.security import get_current_active_service_center
 from app.modules.payments.service import refund_booking_payments
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
@@ -36,15 +38,28 @@ router = APIRouter(prefix="/service-centers", tags=["Service Centers"])
 # --- PROFILE MANAGEMENT ---
 
 
+def _center_me_key(current_center: ServiceCenter) -> str:
+    return cache.me_key("service_center", current_center.id)
+
+
 @router.get("/me", response_model=ServiceCenterPrivate)
 def read_current_service_center_profile(
     current_center: ServiceCenter = Depends(get_current_active_service_center),
 ):
     """
     Get the full profile for the currently authenticated service center.
-    Functionality: Retrieve service center's own complete profile information
+    Functionality: Retrieve service center's own complete profile information.
+    Redis-cached; invalidated on profile/picture/document writes below.
     """
-    return current_center
+    key = _center_me_key(current_center)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+    data = ServiceCenterPrivate.model_validate(
+        current_center, from_attributes=True
+    ).model_dump(mode="json")
+    cache.cache_set_json(key, data, cache.ME_CACHE_TTL)
+    return data
 
 
 @router.patch("/me", response_model=ServiceCenterPrivate)
@@ -73,6 +88,7 @@ def update_current_service_center_profile(
     # Invalidate cache for updated center
     if redis_client:
         redis_client.delete(f"service_center_{current_center.id}")
+    cache.cache_delete(_center_me_key(current_center))
 
     return current_center
 
@@ -105,6 +121,7 @@ async def upload_verification_document(
     session.commit()
     session.refresh(current_center)
 
+    cache.cache_delete(_center_me_key(current_center))
     return {
         "message": "Document uploaded successfully",
         "documents": current_center.verification_documents,
@@ -133,6 +150,7 @@ async def update_profile_picture(
     session.commit()
     session.refresh(current_center)
 
+    cache.cache_delete(_center_me_key(current_center))
     return current_center
 
 
@@ -529,6 +547,37 @@ def get_center_bookings(
         b_dict["customer_phone"] = b.user.phone_number if b.user else "Unknown"
         result.append(ServiceRequestForCenter(**b_dict))
 
+    return result
+
+
+@router.get("/me/active-bookings", response_model=List[ServiceRequestPublic])
+def get_center_active_bookings(
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """Center-app polling target: only the center's currently-engaged bookings
+    (booked → in_service). Short-TTL cached; the response model carries no
+    customer phone/address."""
+    key = cache.active_key("service_center", current_center.id)
+    cached = cache.cache_get_json(key)
+    if cached is not None:
+        return cached
+
+    rows = session.exec(
+        select(ServiceRequest)
+        .where(
+            ServiceRequest.service_center_id == current_center.id,
+            ServiceRequest.status.in_(SERVICE_CENTER_ENGAGED_STATES),
+        )
+        .order_by(desc(ServiceRequest.booking_time))
+    ).all()
+    result = [
+        ServiceRequestPublic.model_validate(s, from_attributes=True).model_dump(
+            mode="json"
+        )
+        for s in rows
+    ]
+    cache.cache_set_json(key, result, cache.ACTIVE_CACHE_TTL)
     return result
 
 
