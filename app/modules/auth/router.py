@@ -240,6 +240,8 @@ def verify_otp(
                 user_id=user.id,
                 license_number=request.license_number,
                 vehicle_type=request.vehicle_type,
+                # Optional at signup; required before admin approval.
+                vehicle_number=request.vehicle_number,
                 reference_id=generate_reference_id(session, DRIVER),
             )
             session.add(db_driver)

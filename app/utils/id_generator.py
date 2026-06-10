@@ -37,6 +37,10 @@ PAYMENT = "payment"
 ADDRESS = "address"
 CARD = "card"
 WALLET_TXN = "wallet_txn"
+PROVIDER_WALLET = "provider_wallet"
+PROVIDER_WALLET_TXN = "provider_wallet_txn"
+MERCHANT_LEDGER = "merchant_ledger"
+PAYOUT = "payout"
 
 # entity -> (prefix, zero-pad width)
 _SCHEME = {
@@ -52,6 +56,10 @@ _SCHEME = {
     ADDRESS: ("ADR", 4),
     CARD: ("CRD", 4),
     WALLET_TXN: ("WTX", 6),
+    PROVIDER_WALLET: ("PWL", 6),
+    PROVIDER_WALLET_TXN: ("PWX", 6),
+    MERCHANT_LEDGER: ("MBL", 6),
+    PAYOUT: ("PO", 6),
 }
 
 # Trip hiring_type -> subtype segment

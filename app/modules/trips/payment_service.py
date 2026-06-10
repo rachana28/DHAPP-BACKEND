@@ -146,21 +146,22 @@ class PaymentService:
     ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
         """Charge the driver acceptance fee on the central ledger.
 
-        The fee is gateway-card only (``channel`` must be "platform") — the
-        wallet is a user-only feature and is NOT available to drivers. Returns
-        ``(payment, client_secret, error)``; the charge stays pending until the
-        gateway webhook fires the orchestrator hook, which flips
-        driver_payment_status to "paid" and arms the trip. ``client_secret`` is
-        always set (platform channel)."""
+        Payable by card (``platform``), UPI (``upi``) or the driver's own
+        ``provider_wallet``. Card/UPI stay pending until the gateway webhook
+        fires the orchestrator hook (which flips driver_payment_status to "paid"
+        and arms the trip); ``provider_wallet`` settles synchronously. Returns
+        ``(payment, client_secret, error)``; ``client_secret`` is set only for
+        the gateway channels."""
 
         try:
-            if channel != "platform":
+            allowed = {"platform", "upi", "provider_wallet"}
+            if channel not in allowed:
                 return (
                     None,
                     None,
                     (
-                        "Drivers can only pay the acceptance fee by card (channel "
-                        "'platform'); the wallet is a user-only feature."
+                        "Acceptance fee channel must be one of "
+                        f"{sorted(allowed)} (card / UPI / provider wallet)."
                     ),
                 )
             trip = session.get(Trip, trip_id)

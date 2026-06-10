@@ -237,6 +237,54 @@ def get_current_active_user(
     raise HTTPException(status_code=403, detail="Not a valid user")
 
 
+# Maps the auth role to the provider_type used by the provider wallet / payout.
+_PROVIDER_ROLE_MAP = {
+    "driver": ("driver", Driver),
+    "tow_truck_driver": ("tow", TowTruckDriver),
+    "mechanic": ("mechanic", Mechanic),
+    "service_center": ("service_center", ServiceCenter),
+}
+
+
+class ProviderContext:
+    """Resolved provider identity for wallet / payout endpoints.
+
+    Wraps the authenticated User plus the provider_type ("driver" | "tow" |
+    "mechanic" | "service_center") and the provider profile row + its PK.
+    """
+
+    __slots__ = ("user", "provider_type", "profile", "provider_id")
+
+    def __init__(self, user: User, provider_type: str, profile):
+        self.user = user
+        self.provider_type = provider_type
+        self.profile = profile
+        self.provider_id = profile.id
+
+
+def get_current_provider(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ProviderContext:
+    """Authorize any provider (driver / tow / mechanic / service-center) and
+    resolve their provider_type + profile. Banned accounts are rejected."""
+    mapping = _PROVIDER_ROLE_MAP.get(current_user.role)
+    if not mapping:
+        raise HTTPException(status_code=403, detail="Not a provider account")
+    provider_type, model = mapping
+    profile = session.exec(
+        select(model).where(model.user_id == current_user.id)
+    ).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Provider profile not found")
+    if profile.status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail="ACCOUNT_BANNED: Your account has been permanently suspended.",
+        )
+    return ProviderContext(current_user, provider_type, profile)
+
+
 def get_current_admin(
     current_user: User = Depends(get_current_user),
 ) -> User:

@@ -103,24 +103,27 @@ def _validate_online_channel(channel: str) -> None:
         raise HTTPException(400, f"channel must be one of {list(_ONLINE_PAY_CHANNELS)}")
 
 
+_DRIVER_FEE_CHANNELS = {"platform", "upi", "provider_wallet"}
+
+
 def _validate_driver_channel(channel: str) -> None:
-    """The wallet is a user-only feature — drivers pay the acceptance fee by
-    card (gateway) only."""
-    if channel != "platform":
+    """Drivers pay the acceptance fee by card (``platform``), UPI (``upi``) or
+    their own provider wallet (``provider_wallet``)."""
+    if channel not in _DRIVER_FEE_CHANNELS:
         raise HTTPException(
             400,
-            "Drivers pay the acceptance fee by card only (channel must be "
-            "'platform'); the wallet is a user-only feature.",
+            "Acceptance fee channel must be one of "
+            f"{sorted(_DRIVER_FEE_CHANNELS)} (card / UPI / provider wallet).",
         )
 
 
 def _maybe_schedule_platform_settlement(background_tasks, payment) -> None:
-    """For a pending platform charge, deliver the mock gateway webhook shortly
-    after (a real gateway calls /payments/webhook out of band). No-op for the
-    synchronous wallet/cash channels, which already settled inline."""
+    """For a pending gateway charge (card/UPI), deliver the mock gateway webhook
+    shortly after (a real gateway calls /payments/webhook out of band). No-op
+    for the synchronous wallet/cash channels, which already settled inline."""
     if (
         payment is not None
-        and payment.channel == "platform"
+        and payment.channel in ("platform", "upi")
         and payment.status == "pending"
     ):
         background_tasks.add_task(
@@ -1444,16 +1447,16 @@ def driver_process_payment(
 ):
     """Driver pays the acceptance fee to lock the trip.
 
-    The fee is paid by card through the gateway (``channel`` must be
-    "platform"); the wallet is a user-only feature and is NOT available to
-    drivers. The charge returns a ``client_secret`` and settles asynchronously
-    on the gateway webhook, which then arms the trip via the centralized
-    orchestrator — generating the shift schedule and moving it to
-    active_pending_otp (or ``paused`` for advance_20/full_payment until the user
-    pays upfront). The trip stays ``accepted_pending_payment`` until the gateway
-    confirms (the payment-timeout scheduler skips a trip with a pending fee, so
-    it won't be auto-rejected meanwhile). An optional ``card_reference_id`` may
-    reference one of the driver's own saved cards.
+    The fee is payable by card (``channel="platform"``), UPI (``channel="upi"``)
+    or the driver's own provider wallet (``channel="provider_wallet"``). Card/UPI
+    return a ``client_secret`` and settle asynchronously on the gateway webhook,
+    which then arms the trip via the centralized orchestrator — generating the
+    shift schedule and moving it to active_pending_otp (or ``paused`` for
+    advance_20/full_payment until the user pays upfront). The provider-wallet
+    channel settles synchronously. The trip stays ``accepted_pending_payment``
+    until settlement (the payment-timeout scheduler skips a trip with a pending
+    fee, so it won't be auto-rejected meanwhile). An optional
+    ``card_reference_id`` may reference one of the driver's own saved cards.
     """
     if idem.cached_response is not None:
         return idem.cached_response
