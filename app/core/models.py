@@ -28,6 +28,28 @@ def _coerce_none_to_empty_list(v):
     return [] if v is None else v
 
 
+# Driver / tow-driver KYC documents are labelled one-per-requirement (no
+# duplicates). Each key holds a single document URL.
+PROVIDER_DOCUMENT_TYPES = ("aadhar", "pan", "license", "rc", "puc", "insurance")
+
+
+def _coerce_none_to_empty_dict(v):
+    # `verification_documents` moved from List[str] -> Dict[str, str] (keyed by
+    # document type). Old rows may hold NULL or a legacy list; coerce both to a
+    # dict so response validation never 500s on historical data.
+    if v is None:
+        return {}
+    if isinstance(v, list):
+        # Legacy positional list: map onto the fixed requirement order, best
+        # effort. Unmapped extras are dropped (admin re-uploads to fix labels).
+        return {
+            PROVIDER_DOCUMENT_TYPES[i]: url
+            for i, url in enumerate(v)
+            if i < len(PROVIDER_DOCUMENT_TYPES) and url
+        }
+    return v
+
+
 class DriverBase(SQLModel):
     name: str
     phone_number: str
@@ -37,19 +59,27 @@ class DriverBase(SQLModel):
     profile_picture_url: Optional[str] = None
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
+    vehicle_number: Optional[str] = None
     fare_per_km: Optional[float] = None
-    driver_allowance: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: str = "pending_approval"
     suspended_until: Optional[datetime] = None
-    verification_documents: List[str] = Field(
-        default_factory=list, sa_column=Column(JSON)
+    # Bank payout details (mandatory for approval; used by cash-out / payout).
+    bank_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    bank_account_holder_name: Optional[str] = None
+    passbook_document_url: Optional[str] = None
+    # Labelled KYC documents: {doc_type: url}. One document per requirement;
+    # re-uploading a type replaces the previous URL. See PROVIDER_DOCUMENT_TYPES.
+    verification_documents: Dict[str, str] = Field(
+        default_factory=dict, sa_column=Column(JSON)
     )
     admin_notes: Optional[str] = None
 
     _coerce_verification_documents = field_validator(
         "verification_documents", mode="before"
-    )(lambda cls, v: _coerce_none_to_empty_list(v))
+    )(lambda cls, v: _coerce_none_to_empty_dict(v))
 
 
 class TowTruckDriverBase(SQLModel):
@@ -61,14 +91,21 @@ class TowTruckDriverBase(SQLModel):
     profile_picture_url: Optional[str] = None
     status: str = "pending_approval"
     rating: float = Field(default=0.0)
-    verification_documents: List[str] = Field(
-        default_factory=list, sa_column=Column(JSON)
+    # Bank payout details (mandatory for approval; used by cash-out / payout).
+    bank_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    bank_account_holder_name: Optional[str] = None
+    passbook_document_url: Optional[str] = None
+    # Labelled KYC documents: {doc_type: url}. See PROVIDER_DOCUMENT_TYPES.
+    verification_documents: Dict[str, str] = Field(
+        default_factory=dict, sa_column=Column(JSON)
     )
     admin_notes: Optional[str] = None
 
     _coerce_verification_documents = field_validator(
         "verification_documents", mode="before"
-    )(lambda cls, v: _coerce_none_to_empty_list(v))
+    )(lambda cls, v: _coerce_none_to_empty_dict(v))
 
 
 # --- MECHANIC MODELS ADDITIONS ---
@@ -889,8 +926,8 @@ class DriverUpdate(SQLModel):
     profile_picture_url: Optional[str] = None
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
+    vehicle_number: Optional[str] = None
     fare_per_km: Optional[float] = None
-    driver_allowance: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: Optional[str] = None
 
@@ -903,6 +940,15 @@ class TowTruckDriverUpdate(SQLModel):
     tow_vehicle_type: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: Optional[str] = None
+
+
+class ProviderBankDetailsUpdate(SQLModel):
+    """Driver / tow-driver bank payout details (set via /me/bank-details)."""
+
+    bank_name: str
+    bank_account_number: str
+    bank_ifsc: str
+    bank_account_holder_name: str
 
 
 # --- Review Models ---
@@ -1587,6 +1633,180 @@ class WalletAdminCreditRequest(SQLModel):
         return v
 
 
+# --- Provider Wallet (drivers / tow / mechanic / service-center) ------------
+# Separate from the user `Wallet`: providers have a higher cap (₹1 lakh), can
+# cash out to their bank, and may carry a NEGATIVE balance after an admin fraud
+# deduction (recovered out of the next credit). Keyed by the provider's User id.
+PROVIDER_TYPES = ("driver", "tow", "mechanic", "service_center")
+
+
+class ProviderWallet(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", unique=True, index=True)
+    provider_type: str = Field(index=True)  # driver | tow | mechanic | service_center
+    balance: float = 0.0  # MAY go negative (fraud deduction recovery)
+    currency: str = "INR"
+    is_active: bool = True  # freeze/block flag
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+
+
+class ProviderWalletTransaction(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    wallet_id: int = Field(foreign_key="providerwallet.id", index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+
+    type: str  # "credit" | "debit"
+    # online_payment | topup | cashout | payout | acceptance_fee |
+    # admin_deduction | recovery | reversal
+    source: str
+    amount: float  # always positive; direction is in `type`
+    balance_after: float = 0.0
+    status: str = "success"  # pending | success | failed
+
+    payment_reference: Optional[str] = Field(default=None, index=True)
+    payout_reference: Optional[str] = Field(default=None, index=True)
+    related_service_type: Optional[str] = None
+    related_service_reference_id: Optional[str] = None
+    gateway_intent_id: Optional[str] = Field(default=None, index=True)
+    idempotency_key: Optional[str] = Field(default=None, index=True)
+    note: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+
+
+class ProviderWalletPublic(SQLModel):
+    balance: float
+    currency: str
+    is_active: bool
+    provider_type: str
+    updated_at: datetime
+
+
+class ProviderWalletTransactionPublic(SQLModel):
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    type: str
+    source: str
+    amount: float
+    balance_after: float
+    status: str
+    payment_reference: Optional[str] = None
+    payout_reference: Optional[str] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+
+class ProviderTopupRequest(SQLModel):
+    amount: float
+    # card | upi — both settle to the platform merchant account via the gateway.
+    method: str = "card"
+
+    @field_validator("method", mode="before")
+    def _validate_method(cls, v):
+        if v in (None, ""):
+            return "card"
+        if v not in {"card", "upi"}:
+            raise ValueError("method must be 'card' or 'upi'")
+        return v
+
+
+class ProviderCashoutRequest(SQLModel):
+    amount: float
+
+
+# --- Merchant bank ledger (single physical-money source of truth) -----------
+# Every rupee that physically reaches the platform merchant bank account is one
+# row here. `tag` segregates money owed to providers (`provider_owed`) from
+# user wallet float (`user_float`) so the payout sweep never touches user money.
+class MerchantBankLedger(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    entry_type: str = Field(index=True)  # credit | debit
+    tag: str = Field(index=True)  # provider_owed | user_float | payout | cashout
+    amount: float  # always positive; direction is in entry_type
+
+    # Running balances maintained at append time (newest row = current state).
+    running_balance: float = 0.0
+    provider_owed_balance: float = 0.0
+    user_float_balance: float = 0.0
+
+    provider_user_id: Optional[uuid.UUID] = Field(default=None, index=True)
+    provider_type: Optional[str] = None
+    service_type: Optional[str] = None
+    service_reference_id: Optional[str] = Field(default=None, index=True)
+    payment_reference: Optional[str] = Field(default=None, index=True)
+    payout_reference: Optional[str] = Field(default=None, index=True)
+    note: Optional[str] = None
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+
+
+class MerchantBankLedgerPublic(SQLModel):
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    entry_type: str
+    tag: str
+    amount: float
+    running_balance: float
+    provider_owed_balance: float
+    user_float_balance: float
+    provider_type: Optional[str] = None
+    service_type: Optional[str] = None
+    service_reference_id: Optional[str] = None
+    payment_reference: Optional[str] = None
+    payout_reference: Optional[str] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+
+# --- Payout / cash-out records (single table; includes bounces) -------------
+class PayoutRecord(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    kind: str = Field(index=True)  # auto_payout | cashout
+    # Not an FK: payout history is retained even if the provider account is
+    # deleted (financial audit record).
+    provider_user_id: uuid.UUID = Field(index=True)
+    provider_type: str
+    amount: float
+    status: str = Field(default="initiated", index=True)  # initiated|success|bounced|failed
+
+    bank_name: Optional[str] = None
+    account_number_masked: Optional[str] = None
+    ifsc: Optional[str] = None
+
+    partner_provider: str = "mock"
+    partner_txn_id: Optional[str] = None
+    failure_reason: Optional[str] = None
+
+    wallet_txn_reference: Optional[str] = Field(default=None, index=True)
+    merchant_ledger_reference: Optional[str] = Field(default=None, index=True)
+    idempotency_key: Optional[str] = Field(default=None, index=True)
+
+    created_at: datetime = Field(default_factory=_now_ist_naive)
+    updated_at: datetime = Field(default_factory=_now_ist_naive)
+    completed_at: Optional[datetime] = None
+
+
+class PayoutRecordPublic(SQLModel):
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    kind: str
+    provider_type: str
+    amount: float
+    status: str
+    bank_name: Optional[str] = None
+    account_number_masked: Optional[str] = None
+    ifsc: Optional[str] = None
+    partner_provider: str
+    partner_txn_id: Optional[str] = None
+    failure_reason: Optional[str] = None
+    wallet_txn_reference: Optional[str] = None
+    merchant_ledger_reference: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+
+
 # --- Trip API Models ---
 class TripUpdate(SQLModel):
     status: Optional[str] = None
@@ -1816,7 +2036,9 @@ class Payment(SQLModel, table=True):
 class PaymentIntentCreate(SQLModel):
     service_type: str
     service_reference_id: str
-    channel: str = "platform"  # "platform" | "wallet" | "cash" | "upi_direct"
+    # platform | upi | wallet | cash | upi_direct.  ``platform``/``upi`` both
+    # settle to the platform merchant account via the gateway (card vs UPI rail).
+    channel: str = "platform"
     amount: Optional[float] = None  # derived from the booking fare when omitted
     card_reference_id: Optional[str] = None
 

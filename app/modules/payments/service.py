@@ -52,9 +52,15 @@ from app.utils.id_generator import (
 )
 from app.utils.time_utils import now_ist
 
+# Gateway-settled channels: money reaches the platform merchant account and
+# settles async on the webhook. ``platform`` = card rail, ``upi`` = UPI rail.
+GATEWAY_CHANNELS = {"platform", "upi"}
 DIRECT_CHANNELS = {"cash", "upi_direct"}
 
-ALL_CHANNELS = {"platform", "wallet"} | DIRECT_CHANNELS
+ALL_CHANNELS = GATEWAY_CHANNELS | {"wallet"} | DIRECT_CHANNELS
+# ``provider_wallet`` is additionally valid for trip charges paid BY a driver
+# (acceptance fee) — handled in create_trip_payment_intent, not the generic flow.
+TRIP_CHANNELS = ALL_CHANNELS | {"provider_wallet"}
 
 _EPS = 1e-6  # float tolerance for money comparisons
 
@@ -163,7 +169,9 @@ def create_payment_intent(
 
     provider_attr = cfg["provider_attr"]
     payee_driver_id = getattr(booking, provider_attr, None) if provider_attr else None
-    payee_type = "platform" if data.channel in ("platform", "wallet") else "provider"
+    payee_type = (
+        "platform" if data.channel in (GATEWAY_CHANNELS | {"wallet"}) else "provider"
+    )
 
     payment = Payment(
         reference_id=generate_reference_id(session, PAYMENT),
@@ -179,13 +187,14 @@ def create_payment_intent(
     )
 
     client_secret: Optional[str] = None
-    if data.channel == "platform":
+    if data.channel in GATEWAY_CHANNELS:
         intent = gateway.create_intent(
             amount,
             metadata={
                 "payment_reference": payment.reference_id,
                 "service_type": data.service_type,
                 "service_reference_id": data.service_reference_id,
+                "method": "upi" if data.channel == "upi" else "card",
             },
         )
         payment.gateway_provider = gateway.PROVIDER
@@ -311,10 +320,12 @@ def create_trip_payment_intent(
       * ``platform`` — gateway intent; settles async on the webhook (hook then).
     The caller is responsible for authorizing the payer. Returns
     ``(payment, client_secret)``; client_secret is set only for platform."""
-    if channel not in ALL_CHANNELS:
-        raise HTTPException(400, f"channel must be one of {sorted(ALL_CHANNELS)}")
+    if channel not in TRIP_CHANNELS:
+        raise HTTPException(400, f"channel must be one of {sorted(TRIP_CHANNELS)}")
     if payer_type not in ("user", "driver"):
         raise HTTPException(400, "payer_type must be 'user' or 'driver'")
+    if channel == "provider_wallet" and payer_type != "driver":
+        raise HTTPException(400, "provider_wallet channel is only for driver charges")
     if not trip or not trip.reference_id:
         raise HTTPException(404, "Trip not found for payment")
     amount = round(float(amount), 2)
@@ -329,9 +340,9 @@ def create_trip_payment_intent(
         if existing:
             return existing, (existing.extra or {}).get("client_secret")
 
-    # One open platform intent per trip line item — guards against a double
+    # One open gateway intent per trip line item — guards against a double
     # charge when the user retries while a previous webhook is still in flight.
-    if channel == "platform":
+    if channel in GATEWAY_CHANNELS:
         pending = _find_pending_trip_payment(session, trip.id, purpose, extra)
         if pending:
             return pending, (pending.extra or {}).get("client_secret")
@@ -362,7 +373,7 @@ def create_trip_payment_intent(
     )
 
     client_secret: Optional[str] = None
-    if channel == "platform":
+    if channel in GATEWAY_CHANNELS:
         if card_reference_id:
             payment.extra["card_reference"] = _validate_card_reference(
                 session, payer_user, card_reference_id
@@ -374,6 +385,7 @@ def create_trip_payment_intent(
                 "service_type": "trip",
                 "service_reference_id": trip.reference_id,
                 "purpose": purpose,
+                "method": "upi" if channel == "upi" else "card",
             },
         )
         payment.gateway_provider = gateway.PROVIDER
@@ -388,6 +400,26 @@ def create_trip_payment_intent(
         payment.status = "succeeded"
         payment.completed_at = now_ist()
         payment.extra["wallet_txn_reference"] = wallet_txn.reference_id
+        session.add(payment)
+        _post_success(session, payment)
+    elif channel == "provider_wallet":
+        # Driver pays their own charge (acceptance fee) from the provider wallet.
+        from app.modules.provider_wallet import service as pw_service
+
+        pw_txn = pw_service.debit(
+            session,
+            payer_user.id,
+            "driver",
+            amount,
+            source="acceptance_fee",
+            payment_reference=payment.reference_id,
+            related_service_type="trip",
+            related_service_reference_id=trip.reference_id,
+            note=f"Trip {purpose} fee",
+        )
+        payment.status = "succeeded"
+        payment.completed_at = now_ist()
+        payment.extra["provider_wallet_txn_reference"] = pw_txn.reference_id
         session.add(payment)
         _post_success(session, payment)
     elif channel == "cash":
@@ -446,6 +478,10 @@ def handle_webhook(
     if not payment:
         if wallet_service.confirm_topup(session, intent_id):
             return {"status": "ok", "kind": "wallet_topup"}
+        from app.modules.provider_wallet import service as pw_service
+
+        if pw_service.confirm_topup(session, intent_id):
+            return {"status": "ok", "kind": "provider_wallet_topup"}
         raise HTTPException(404, "Unknown payment intent")
 
     if payment.status == "succeeded":
@@ -489,6 +525,10 @@ def _handle_failed_webhook(session: Session, event: Dict[str, Any]) -> Dict[str,
         # Could be a wallet top-up intent that declined at the gateway.
         if wallet_service.fail_topup(session, intent_id, reason=reason):
             return {"status": "ok", "kind": "wallet_topup_failed"}
+        from app.modules.provider_wallet import service as pw_service
+
+        if pw_service.fail_topup(session, intent_id, reason=reason):
+            return {"status": "ok", "kind": "provider_wallet_topup_failed"}
         return {"status": "ignored"}
 
     # A failure arriving after success is a no-op — real money already moved.
@@ -643,17 +683,189 @@ def _sync_booking(session: Session, payment: Payment) -> None:
     )
 
 
+def _resolve_payment_provider(session: Session, payment: Payment):
+    """Resolve (user_id, provider_type) of the PROVIDER owed for this payment,
+    or None when there is no payout-eligible provider (e.g. unassigned booking).
+    The trip import stays local to avoid a trips<->payments cycle."""
+    st = payment.service_type
+    if st == "tow":
+        booking = session.get(TowTrip, payment.service_id)
+        pid = getattr(booking, "tow_truck_driver_id", None) if booking else None
+        if pid:
+            p = session.get(TowTruckDriver, pid)
+            return (p.user_id, "tow") if p else None
+    elif st == "mechanic":
+        booking = session.get(MechanicTrip, payment.service_id)
+        pid = getattr(booking, "mechanic_id", None) if booking else None
+        if pid:
+            p = session.get(Mechanic, pid)
+            return (p.user_id, "mechanic") if p else None
+    elif st == "service_center":
+        booking = session.get(ServiceRequest, payment.service_id)
+        pid = getattr(booking, "service_center_id", None) if booking else None
+        if pid:
+            p = session.get(ServiceCenter, pid)
+            return (p.user_id, "service_center") if p else None
+    elif st == "trip":
+        booking = session.get(Trip, payment.service_id)
+        pid = getattr(booking, "driver_id", None) if booking else None
+        if pid:
+            from app.core.models import Driver
+
+            p = session.get(Driver, pid)
+            return (p.user_id, "driver") if p else None
+    return None
+
+
+def _credit_provider_for_payment(session: Session, payment: Payment) -> None:
+    """Move a successful user payment into the provider's digital wallet and
+    record the matching physical-money entry in the merchant bank ledger.
+
+    Conservation: platform never keeps the money. Skipped when —
+      * the payer is the provider (driver acceptance fee — platform revenue), or
+      * the channel is cash/upi_direct (provider already physically holds it), or
+      * no provider is assigned yet.
+    Idempotent via an ``extra`` marker so a re-entrant call can't double-credit.
+    """
+    if (payment.extra or {}).get("provider_credited"):
+        return
+    if payment.payer_type == "driver" or payment.channel == "provider_wallet":
+        return
+    if payment.channel in DIRECT_CHANNELS:
+        return  # provider collected cash/UPI directly — no platform float
+
+    resolved = _resolve_payment_provider(session, payment)
+    if not resolved:
+        return
+    provider_user_id, provider_type = resolved
+
+    # Net of platform commission (default 0 -> full pass-through).
+    from app.modules.wallet.service import _get_config_float
+
+    pct = _get_config_float(session, "platform_commission_pct", 0.0)
+    net = round(payment.amount * (1.0 - max(0.0, min(pct, 100.0)) / 100.0), 2)
+    if net <= 0:
+        return
+
+    from app.modules.provider_wallet import service as pw_service
+    from app.services import merchant_bank
+
+    # Physical money: gateway (platform/upi) brings NEW money tagged
+    # provider_owed; a user-wallet payment reclassifies existing user float.
+    if payment.channel == "wallet":
+        merchant_bank.reclassify_to_provider_owed(
+            session,
+            net,
+            provider_user_id=provider_user_id,
+            provider_type=provider_type,
+            service_type=payment.service_type,
+            service_reference_id=payment.service_reference_id,
+            payment_reference=payment.reference_id,
+        )
+    else:  # GATEWAY_CHANNELS
+        merchant_bank.credit_provider_owed(
+            session,
+            net,
+            provider_user_id=provider_user_id,
+            provider_type=provider_type,
+            service_type=payment.service_type,
+            service_reference_id=payment.service_reference_id,
+            payment_reference=payment.reference_id,
+            note=f"Online {payment.channel} payment",
+        )
+
+    # Digital money: provider wallet credit (cap not enforced on earnings so a
+    # legitimate payout is never blocked; the daily sweep drains the balance).
+    pw_service.credit(
+        session,
+        provider_user_id,
+        provider_type,
+        net,
+        source="online_payment",
+        payment_reference=payment.reference_id,
+        related_service_type=payment.service_type,
+        related_service_reference_id=payment.service_reference_id,
+        note="Customer online payment",
+        enforce_cap=False,
+    )
+
+    payment.extra = {
+        **(payment.extra or {}),
+        "provider_credited": True,
+        "provider_credit_amount": net,
+    }
+    session.add(payment)
+
+
+def _reverse_provider_credit_for_refund(
+    session: Session, payment: Payment, refund_amount: float
+) -> None:
+    """Undo the provider-side credit for a (partial) refund. Claws back the
+    provider wallet (may go negative) and reverses the merchant-ledger tag.
+    No-op when the original payment never credited a provider."""
+    extra = payment.extra or {}
+    if not extra.get("provider_credited"):
+        return
+    credited = float(extra.get("provider_credit_amount") or 0.0)
+    if credited <= 0 or payment.amount <= 0:
+        return
+    # Pro-rate the clawback to the refunded slice of the original charge.
+    portion = round(credited * (refund_amount / payment.amount), 2)
+    if portion <= 0:
+        return
+
+    resolved = _resolve_payment_provider(session, payment)
+    if not resolved:
+        return
+    provider_user_id, provider_type = resolved
+
+    from app.modules.provider_wallet import service as pw_service
+    from app.services import merchant_bank
+
+    pw_service.debit_clawback(
+        session,
+        provider_user_id,
+        provider_type,
+        portion,
+        payment_reference=payment.reference_id,
+        related_service_type=payment.service_type,
+        related_service_reference_id=payment.service_reference_id,
+        note="Refund clawback",
+    )
+    if payment.channel == "wallet":
+        merchant_bank.reclassify_to_user_float(
+            session,
+            portion,
+            provider_user_id=provider_user_id,
+            provider_type=provider_type,
+            payment_reference=payment.reference_id,
+        )
+    else:  # gateway refund — physical money returns to the user
+        merchant_bank.debit_provider_owed_refund(
+            session,
+            portion,
+            provider_user_id=provider_user_id,
+            provider_type=provider_type,
+            payment_reference=payment.reference_id,
+        )
+
+
 def _post_success(session: Session, payment: Payment) -> None:
     """Run side effects when a payment first reaches ``succeeded``.
 
     Generic booking sync for tow/mechanic/service, plus the trip orchestrator
-    hook for trip charges. Runs inside the caller's open transaction. The trip
-    import is local to avoid a trips<->payments circular import."""
+    hook for trip charges, plus crediting the provider's wallet + merchant
+    ledger. Runs inside the caller's open transaction. The trip import is local
+    to avoid a trips<->payments circular import."""
     _sync_booking(session, payment)
     if payment.service_type == "trip":
         from app.modules.trips.payment_orchestrator import on_trip_payment_succeeded
 
         on_trip_payment_succeeded(session, payment)
+    # Route the money to the provider (no platform float). Runs in the same
+    # transaction so the wallet credit + merchant-ledger entry commit atomically
+    # with the payment — like the trip orchestrator hook above.
+    _credit_provider_for_payment(session, payment)
 
 
 def refund_payment(
@@ -720,11 +932,32 @@ def refund_payment(
             enforce_cap=False,
             allow_inactive=True,
         )
-    elif payment.channel == "platform":
+    elif payment.channel == "provider_wallet":
+        # A driver-paid charge (acceptance fee) — refund to the provider wallet.
+        from app.modules.provider_wallet import service as pw_service
+
+        pw_service.credit(
+            session,
+            payment.user_id,
+            "driver",
+            this_refund,
+            source="reversal",
+            note=reason or "Acceptance fee refund",
+            payment_reference=payment.reference_id,
+            related_service_type=payment.service_type,
+            related_service_reference_id=payment.service_reference_id,
+            enforce_cap=False,
+        )
+    elif payment.channel in GATEWAY_CHANNELS:
         payment.gateway_transaction_id = (
             payment.gateway_transaction_id or f"REFUND_{payment.reference_id}"
         )
     # cash / upi_direct: money never flowed through us; provider returns it.
+
+    # Mirror the reversal on the provider side: if this payment credited a
+    # provider wallet + merchant ledger, claw it back proportionally (the
+    # money is going back to the user, so it is no longer owed to the provider).
+    _reverse_provider_credit_for_refund(session, payment, this_refund)
 
     payment.refunded_amount = round((payment.refunded_amount or 0.0) + this_refund, 2)
     fully_refunded = payment.refunded_amount >= payment.amount - _EPS

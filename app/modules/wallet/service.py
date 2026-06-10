@@ -313,6 +313,16 @@ def confirm_topup(session: Session, gateway_intent_id: str) -> bool:
     txn.updated_at = now_ist()
     session.add(wallet)
     session.add(txn)
+    # The user's top-up money physically arrives in the merchant bank as user
+    # float — segregated so the provider payout sweep never touches it.
+    from app.services import merchant_bank
+
+    merchant_bank.credit_user_float(
+        session,
+        txn.amount,
+        note="User wallet top-up",
+        payment_reference=txn.reference_id,
+    )
     session.commit()
 
     audit_emit(

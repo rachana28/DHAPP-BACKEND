@@ -30,6 +30,8 @@ from app.modules.tracking import router as tracking_router
 from app.modules.admin import (
     router as admin_router,
     support_router as admin_support_router,
+    merchant_bank_router as admin_merchant_bank_router,
+    payout_router as admin_payout_router,
 )
 from app.modules.support import (
     router as support_router,
@@ -51,6 +53,8 @@ from app.modules.payments import router as payments_router
 from app.modules.addresses import router as addresses_router
 from app.modules.cards import router as cards_router
 from app.modules.wallet import router as wallet_router
+from app.modules.provider_wallet import router as provider_wallet_router
+from app.modules.payout import router as payout_router
 from app.modules.bookings import active_router as bookings_active_router
 
 # Import Services for Scheduled Tasks
@@ -70,6 +74,7 @@ from app.modules.trips.scheduler_jobs import (
 from app.modules.payments.scheduler_jobs import (
     expire_stale_payment_intents_scheduler,
 )
+from app.modules.payout.scheduler_jobs import auto_payout_sweep_scheduler
 from app.modules.service.scheduler_jobs import (
     auto_cancel_no_show_service_bookings,
 )
@@ -147,6 +152,9 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(expire_stale_payment_intents_scheduler, "interval", minutes=15)
     # Auto-cancel no-show service-center slot bookings (advance forfeited).
     scheduler.add_job(auto_cancel_no_show_service_bookings, "interval", minutes=15)
+    # Daily provider payout sweep: move each provider's positive wallet balance
+    # to their bank via the payout partner (22:30 IST, after settlements).
+    scheduler.add_job(auto_payout_sweep_scheduler, "cron", hour=22, minute=30)
     # Auto-close service-linked support tickets after 2hrs of inactivity
     scheduler.add_job(auto_close_inactive_support_tickets, "interval", minutes=10)
     # Clean up attachments uploaded but never linked to a message
@@ -204,6 +212,10 @@ app.include_router(payments_router.router)
 app.include_router(addresses_router.router)
 app.include_router(cards_router.router)
 app.include_router(wallet_router.router)
+app.include_router(provider_wallet_router.router)
+app.include_router(payout_router.router)
+app.include_router(admin_merchant_bank_router.router)
+app.include_router(admin_payout_router.router)
 app.include_router(bookings_active_router.router)
 
 

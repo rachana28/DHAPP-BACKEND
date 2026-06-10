@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from sqlmodel import Session, select, func, desc
 from typing import List
 import redis
@@ -13,6 +13,8 @@ from app.core.models import (
     TowTruckDriverPrivate,
     TowTruckDriverReview,
     TowTrip,
+    ProviderBankDetailsUpdate,
+    PROVIDER_DOCUMENT_TYPES,
 )
 from app.core.security import get_current_active_tow_truck_driver
 from app.utils.storage import upload_profile_picture_to_r2, upload_document_to_r2
@@ -147,21 +149,28 @@ async def upload_verification_document(
     *,
     session: Session = Depends(get_session),
     current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+    doc_type: str = Form(...),
     file: UploadFile = File(...),
 ):
     """
-    Upload KYC documents, licenses, or garage photos for admin approval.
+    Upload a labelled KYC document. ``doc_type`` must be one of the six fixed
+    requirements (aadhar, pan, license, rc, puc, insurance). Re-uploading the
+    same type REPLACES the previous file (one document per requirement).
     """
-    # Reuse your R2 storage utility, but change the prefix folder
+    doc_type = (doc_type or "").strip().lower()
+    if doc_type not in PROVIDER_DOCUMENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"doc_type must be one of {list(PROVIDER_DOCUMENT_TYPES)}",
+        )
+
     public_url = await upload_document_to_r2(
-        file, "kyc_documents", str(current_driver.id)
+        file, f"kyc_documents/{doc_type}", str(current_driver.id)
     )
 
-    # Append the new document URL to the JSON array safely
-    current_docs = current_driver.verification_documents or []
-
-    # Create a new list to trigger SQLAlchemy's JSON mutation detection
-    current_driver.verification_documents = [*current_docs, public_url]
+    current_docs = dict(current_driver.verification_documents or {})
+    current_docs[doc_type] = public_url
+    current_driver.verification_documents = current_docs
 
     if current_driver.status == "rejected":
         current_driver.status = "pending_approval"
@@ -172,6 +181,63 @@ async def upload_verification_document(
 
     cache.cache_delete(_tow_me_key(current_driver))
     return {
-        "message": "Document uploaded successfully",
+        "message": f"{doc_type} document uploaded successfully",
         "documents": current_driver.verification_documents,
     }
+
+
+@router.get("/me/documents")
+def list_verification_documents(
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+):
+    """Return the labelled documents and a present/missing checklist."""
+    docs = current_driver.verification_documents or {}
+    return {
+        "documents": docs,
+        "checklist": {
+            dt: (dt in docs and bool(docs[dt])) for dt in PROVIDER_DOCUMENT_TYPES
+        },
+        "missing": [dt for dt in PROVIDER_DOCUMENT_TYPES if not docs.get(dt)],
+    }
+
+
+@router.post("/me/bank-details", response_model=TowTruckDriverPrivate)
+def set_bank_details(
+    *,
+    session: Session = Depends(get_session),
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+    bank: ProviderBankDetailsUpdate,
+):
+    """Set/replace the tow-driver's bank payout details (required for approval)."""
+    current_driver.bank_name = bank.bank_name
+    current_driver.bank_account_number = bank.bank_account_number
+    current_driver.bank_ifsc = bank.bank_ifsc
+    current_driver.bank_account_holder_name = bank.bank_account_holder_name
+    if current_driver.status == "rejected":
+        current_driver.status = "pending_approval"
+    session.add(current_driver)
+    session.commit()
+    session.refresh(current_driver)
+    cache.cache_delete(_tow_me_key(current_driver))
+    return current_driver
+
+
+@router.post("/me/passbook", response_model=TowTruckDriverPrivate)
+async def upload_passbook(
+    *,
+    session: Session = Depends(get_session),
+    current_driver: TowTruckDriver = Depends(get_current_active_tow_truck_driver),
+    file: UploadFile = File(...),
+):
+    """Upload the bank passbook/cancelled-cheque document (required for approval)."""
+    public_url = await upload_document_to_r2(
+        file, "kyc_documents/passbook", str(current_driver.id)
+    )
+    current_driver.passbook_document_url = public_url
+    if current_driver.status == "rejected":
+        current_driver.status = "pending_approval"
+    session.add(current_driver)
+    session.commit()
+    session.refresh(current_driver)
+    cache.cache_delete(_tow_me_key(current_driver))
+    return current_driver

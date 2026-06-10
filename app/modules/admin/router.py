@@ -58,6 +58,56 @@ router = APIRouter(
     prefix="/admin", tags=["Admin Dashboard"], dependencies=[Depends(get_current_admin)]
 )
 
+from app.core.models import PROVIDER_DOCUMENT_TYPES  # noqa: E402
+
+
+def assert_provider_profile_complete(profile, provider_type: str) -> None:
+    """Block approval (status -> "available") unless the mandatory profile
+    fields, all six labelled documents, and bank details are present. Applies to
+    drivers & tow-drivers (the providers that carry bank/document KYC)."""
+    missing = []
+
+    if not getattr(profile, "vehicle_number", None):
+        missing.append("vehicle_number")
+
+    docs = getattr(profile, "verification_documents", None) or {}
+    if isinstance(docs, dict):
+        missing += [f"document:{d}" for d in PROVIDER_DOCUMENT_TYPES if not docs.get(d)]
+    else:
+        missing.append("documents (all 6)")
+
+    for f in (
+        "bank_name",
+        "bank_account_number",
+        "bank_ifsc",
+        "bank_account_holder_name",
+        "passbook_document_url",
+    ):
+        if not getattr(profile, f, None):
+            missing.append(f)
+
+    if not getattr(profile, "name", None):
+        missing.append("name")
+    if not getattr(profile, "profile_picture_url", None):
+        missing.append("profile_picture_url")
+    if provider_type == "driver":
+        if not getattr(profile, "license_number", None):
+            missing.append("license_number")
+        if not getattr(profile, "vehicle_type", None):
+            missing.append("vehicle_type")
+    elif provider_type == "tow":
+        if not getattr(profile, "tow_vehicle_type", None):
+            missing.append("tow_vehicle_type")
+
+    if missing:
+        raise HTTPException(
+            400,
+            {
+                "message": "Profile incomplete — cannot approve.",
+                "missing": missing,
+            },
+        )
+
 
 # --- 1. DASHBOARD OVERVIEW ---
 @router.get("/dashboard-stats")
@@ -169,6 +219,10 @@ def update_driver_status(
     if not driver:
         raise HTTPException(404, "Driver not found")
 
+    # Approval gate: a driver cannot go "available" with an incomplete profile.
+    if status == "available":
+        assert_provider_profile_complete(driver, "driver")
+
     driver.status = status
 
     if admin_notes:
@@ -221,6 +275,10 @@ def update_tow_driver_status(
     if not driver:
         raise HTTPException(404, "Tow Driver not found")
 
+    # Approval gate: a tow-driver cannot go "available" with an incomplete profile.
+    if status == "available":
+        assert_provider_profile_complete(driver, "tow")
+
     driver.status = status
 
     if admin_notes:
@@ -241,6 +299,84 @@ def update_tow_driver_status(
         )
 
     return {"message": f"Tow Driver status updated to {status}"}
+
+
+# --- PROVIDER ACCOUNT + WALLET ADMIN CONTROLS ---
+_PROVIDER_MODELS = {
+    "driver": Driver,
+    "tow": TowTruckDriver,
+    "mechanic": Mechanic,
+    "service_center": ServiceCenter,
+}
+
+
+@router.delete("/providers/{role}/{provider_id}")
+def delete_provider_account(
+    role: str,
+    provider_id: str,
+    session: Session = Depends(get_session),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Hard-delete a provider account (driver / tow / mechanic / service-center)
+    and the underlying user. Provider wallet + its transactions are removed;
+    payout history (PayoutRecord) and the merchant ledger are retained for
+    audit (no FK to the user)."""
+    model = _PROVIDER_MODELS.get(role)
+    if not model:
+        raise HTTPException(400, "Invalid role")
+    profile = get_by_reference(session, model, provider_id)
+    if not profile:
+        raise HTTPException(404, f"{role} not found")
+    user_id = profile.user_id
+
+    # Remove the provider wallet + its transactions first (FK to user).
+    from app.core.models import ProviderWallet, ProviderWalletTransaction
+
+    session.exec(
+        delete(ProviderWalletTransaction).where(
+            ProviderWalletTransaction.user_id == user_id
+        )
+    )
+    session.exec(delete(ProviderWallet).where(ProviderWallet.user_id == user_id))
+    session.commit()
+
+    # Reuse the existing full user cascade (also deletes the provider profile).
+    return delete_user(user_id, session, current_admin)
+
+
+@router.post("/providers/{role}/{provider_id}/wallet/deduct")
+def deduct_provider_wallet(
+    role: str,
+    provider_id: str,
+    amount: float = Body(..., embed=True),
+    note: Optional[str] = Body(None, embed=True),
+    session: Session = Depends(get_session),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Fraud / dispute deduction from a provider wallet. May push the balance
+    negative; the deficit is recovered automatically from the provider's next
+    credit. Use when a user reports a fraudulent / disputed trip."""
+    model = _PROVIDER_MODELS.get(role)
+    if not model:
+        raise HTTPException(400, "Invalid role")
+    profile = get_by_reference(session, model, provider_id)
+    if not profile:
+        raise HTTPException(404, f"{role} not found")
+
+    from app.modules.provider_wallet import service as pw_service
+
+    txn = pw_service.admin_deduct(
+        session,
+        profile.user_id,
+        role,
+        amount,
+        note=note,
+    )
+    return {
+        "message": "Provider wallet deducted",
+        "transaction_reference": txn.reference_id,
+        "balance_after": txn.balance_after,
+    }
 
 
 # --- 3.5 MECHANIC MANAGEMENT ---
@@ -397,6 +533,27 @@ def get_verification_details(
     if not profile:
         raise HTTPException(404, f"{role} profile not found")
 
+    docs = getattr(profile, "verification_documents", None) or {}
+    # Driver / tow-driver documents are a labelled {doc_type: url} map; build a
+    # per-requirement review checklist so admin can verify each field's document.
+    if isinstance(docs, dict):
+        documents_by_field = {dt: docs.get(dt) for dt in PROVIDER_DOCUMENT_TYPES}
+        documents_checklist = {dt: bool(docs.get(dt)) for dt in PROVIDER_DOCUMENT_TYPES}
+        missing_documents = [dt for dt in PROVIDER_DOCUMENT_TYPES if not docs.get(dt)]
+    else:
+        # Mechanic / service-center keep the legacy list (models untouched).
+        documents_by_field = {"documents": docs}
+        documents_checklist = {}
+        missing_documents = []
+
+    bank_details = {
+        "bank_name": getattr(profile, "bank_name", None),
+        "bank_account_number": getattr(profile, "bank_account_number", None),
+        "bank_ifsc": getattr(profile, "bank_ifsc", None),
+        "bank_account_holder_name": getattr(profile, "bank_account_holder_name", None),
+        "passbook_document_url": getattr(profile, "passbook_document_url", None),
+    }
+
     return {
         "profile_id": profile.reference_id,
         "role": role,
@@ -404,7 +561,12 @@ def get_verification_details(
         "status": profile.status,
         "profile_picture": profile.profile_picture_url,
         "phone_number": profile.phone_number,
-        "verification_documents": getattr(profile, "verification_documents", []),
+        "vehicle_number": getattr(profile, "vehicle_number", None),
+        "documents_by_field": documents_by_field,
+        "documents_checklist": documents_checklist,
+        "missing_documents": missing_documents,
+        "bank_details": bank_details,
+        "verification_documents": docs,  # raw (back-compat)
         "details": profile.model_dump(),
     }
 

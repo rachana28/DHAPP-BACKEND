@@ -50,9 +50,9 @@ def create_intent(
         session, current_user, data, idempotency_key=idempotency_key
     )
 
-    # Mock async settlement for platform payments: deliver a signed webhook
-    # shortly after. A real gateway would call /payments/webhook out of band.
-    if payment.channel == "platform" and payment.status == "pending":
+    # Mock async settlement for gateway payments (card/UPI): deliver a signed
+    # webhook shortly after. A real gateway would call /payments/webhook OOB.
+    if payment.channel in ("platform", "upi") and payment.status == "pending":
         background_tasks.add_task(
             payment_service.simulate_webhook_delivery, payment.reference_id
         )
