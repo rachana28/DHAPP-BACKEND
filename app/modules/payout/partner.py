@@ -24,23 +24,15 @@ class PayoutResult:
 
 
 class PayoutPartner:
-    """Interface every payout partner implements."""
-
     provider: str = "abstract"
 
     def initiate_payout(
         self, amount: float, bank_details: Dict[str, str], *, idempotency_key: str
-    ) -> PayoutResult:  # pragma: no cover - interface
+    ) -> PayoutResult:
         raise NotImplementedError
 
 
 class MockPayoutPartner(PayoutPartner):
-    """Deterministic mock used until a real partner is integrated.
-
-    Succeeds by default. A bounce can be forced for testing by setting the env
-    var ``PAYOUT_FORCE_BOUNCE=1`` or passing a bank account number ending in
-    ``0000`` (handy in end-to-end tests without touching config)."""
-
     provider = "mock"
 
     def initiate_payout(
@@ -62,7 +54,6 @@ _PARTNER: Optional[PayoutPartner] = None
 
 
 def get_partner() -> PayoutPartner:
-    """Return the configured payout partner (mock for now)."""
     global _PARTNER
     if _PARTNER is None:
         _PARTNER = MockPayoutPartner()

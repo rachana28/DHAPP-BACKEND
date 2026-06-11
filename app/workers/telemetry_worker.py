@@ -38,7 +38,8 @@ from sqlmodel import Session
 from app.core.database import engine
 from app.core.models import MechanicTrip, TowTrip, TowTruckDriver, Mechanic
 from app.modules.dispatch import geo
-from app.modules.trips import arrival_service
+from app.modules.mechanic.arrival_service import mark_mechanic_arrived
+from app.modules.towing.arrival_service import mark_tow_arrived
 from app.utils.id_generator import get_by_reference
 from app.utils.notifications import send_push_notification
 from app.utils.time_utils import now_ist
@@ -232,7 +233,7 @@ class TelemetryWorker:
                 return
             if geo.haversine_m(lat, lng, tow.start_lat, tow.start_lng) <= radius:
                 # Shared transition: accepted→arrived, issue + push the start OTP.
-                arrival_service.mark_tow_arrived(session, tow)
+                mark_tow_arrived(session, tow)
         elif tow.status == "in_progress":
             if tow.end_lat is None or tow.end_lng is None:
                 return
@@ -256,7 +257,7 @@ class TelemetryWorker:
             return
         if geo.haversine_m(lat, lng, mech.start_lat, mech.start_lng) <= radius:
             # Shared transition: accepted→arrived, issue + push the on-site OTP.
-            arrival_service.mark_mechanic_arrived(session, mech)
+            mark_mechanic_arrived(session, mech)
 
     def _notify(self, session, user_ids, title, body, data) -> None:
         try:

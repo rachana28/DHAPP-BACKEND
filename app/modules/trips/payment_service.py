@@ -30,12 +30,10 @@ from app.core.models import (
 from app.services.audit_log import emit_event as audit_emit
 from app.modules.payments import service as central
 
-# A trip charge counts as paid-in while succeeded or partially refunded.
 _PAID_IN_STATES = ["succeeded", "partially_refunded"]
 
 
 def _resolve_driver_user(session: Session, driver_id: int) -> Optional[User]:
-    """The User account behind a Driver PK (driver-paid charges debit/refund it)."""
     return session.exec(
         select(User)
         .join(Driver, Driver.user_id == User.id)
@@ -44,13 +42,11 @@ def _resolve_driver_user(session: Session, driver_id: int) -> Optional[User]:
 
 
 def _bill_purpose(bill: TripBill) -> str:
-    """Map a bill's type to the Payment.purpose the orchestrator dispatches on."""
     if bill.bill_type in ("daily_bill", "cancellation_balance", "schedule_diff"):
         return bill.bill_type
     return "daily_bill"
 
 
-# Key in SystemConfig table (admin-editable via /admin/system-config).
 DRIVER_ACCEPTANCE_FEE_KEY = "driver_acceptance_fee"
 DEFAULT_DRIVER_ACCEPTANCE_FEE = 100.0
 
@@ -62,8 +58,6 @@ def get_driver_abandon_suspension_hours(
     session: Session,
     redis_client: Optional[redis.Redis] = None,
 ) -> float:
-    """Resolve the post-abandonment suspension window (hours). Redis →
-    SystemConfig → hard-coded default, mirroring get_driver_acceptance_fee."""
     if redis_client is not None:
         try:
             cached = redis_client.get(f"config:{DRIVER_ABANDON_SUSPENSION_HOURS_KEY}")
@@ -96,7 +90,6 @@ def get_driver_acceptance_fee(
     session: Session,
     redis_client: Optional[redis.Redis] = None,
 ) -> float:
-    """Resolve the driver acceptance fee. Redis → SystemConfig → hard-coded default."""
     if redis_client is not None:
         try:
             cached = redis_client.get(f"config:{DRIVER_ACCEPTANCE_FEE_KEY}")
@@ -124,13 +117,6 @@ def get_driver_acceptance_fee(
 
 
 class PaymentService:
-    """
-    Manages payment processing for both driver and user
-    - Dummy payment gateway integration
-    - Refund logic based on payment method
-    - State machine validation
-    """
-
     def __init__(self, redis_client: Optional[redis.Redis] = None):
         self.redis = redis_client
 
@@ -144,14 +130,6 @@ class PaymentService:
         card_reference_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
-        """Charge the driver acceptance fee on the central ledger.
-
-        Payable by card (``platform``), UPI (``upi``) or the driver's own
-        ``provider_wallet``. Card/UPI stay pending until the gateway webhook
-        fires the orchestrator hook (which flips driver_payment_status to "paid"
-        and arms the trip); ``provider_wallet`` settles synchronously. Returns
-        ``(payment, client_secret, error)``; ``client_secret`` is set only for
-        the gateway channels."""
 
         try:
             allowed = {"platform", "upi", "provider_wallet"}
@@ -210,11 +188,6 @@ class PaymentService:
         card_reference_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
-        """User upfront (advance_20 / full_payment) charge on the central ledger.
-
-        Returns ``(payment, client_secret, error)``. For wallet the upfront
-        settles synchronously and the orchestrator un-blocks the trip; for
-        platform it stays pending until the webhook fires that hook."""
 
         try:
             if amount is None or amount <= 0:
@@ -239,8 +212,6 @@ class PaymentService:
             return None, None, f"User payment processing failed: {str(e)}"
 
     def _user_paid_total(self, session: Session, trip_id: int) -> float:
-        """Gross successful USER charges on a trip (matches the legacy sum of
-        success rows; a partial refund leaves the charge amount intact)."""
         return sum(
             p.amount
             for p in session.exec(
@@ -256,7 +227,6 @@ class PaymentService:
     def calculate_driver_fee_refund(
         self, session: Session, trip_id: int, driver_id: Optional[int]
     ) -> float:
-        """Acceptance fee paid (and not yet refunded) for this driver on this trip."""
         if not driver_id:
             return 0.0
         paid = session.exec(
@@ -269,37 +239,11 @@ class PaymentService:
                 Payment.status.in_(_PAID_IN_STATES),
             )
         ).first()
-        # A fully refunded fee has status "refunded" (excluded above) → 0; a
-        # partial leaves the refundable remainder.
         if not paid:
             return 0.0
         return round(max(0.0, paid.amount - (paid.refunded_amount or 0.0)), 2)
 
     def calculate_user_cancel_settlement(self, session: Session, trip_id: int) -> dict:
-        """Final refund/shortfall maths for an advance_20 / full_payment cancel (F6).
-
-        Formula::
-
-            net = upfront_paid − (days_served × per_day_rate) − (₹50 × user_skipped_days)
-
-        Returns a dict::
-
-            {
-                "upfront_paid":   float,   # total successful user payments
-                "served_days":    int,
-                "skipped_user_days": int,
-                "per_day_rate":   float,
-                "served_charge":  float,   # served_days × per_day_rate
-                "anti_fraud":     float,   # 50 * skipped_user_days
-                "refund_amount":  float,   # max(net, 0)
-                "shortfall_amount": float, # max(-net, 0)
-            }
-
-        Same shape regardless of refund vs. shortfall so the caller can switch
-        on whichever is non-zero. ``per_day_rate = trip.fare / total_days``;
-        ``total_days`` is the count of TripAttendance rows on the booking
-        (falls back to 1 if there are none — should not happen post-payment).
-        """
         trip = session.get(Trip, trip_id)
         if not trip:
             return {
@@ -318,8 +262,6 @@ class PaymentService:
         ).all()
         total_days = len(attendances) or 1
         served_days = sum(1 for a in attendances if a.status == "present")
-        # Anti-fraud counts BOTH user-initiated and system-marked no-shows
-        # (Issue 5). Driver skips are excluded — not the user's fault.
         skipped_user_days = sum(
             1
             for a in attendances
@@ -345,12 +287,6 @@ class PaymentService:
         }
 
     def calculate_driver_abandon_refund(self, session: Session, trip_id: int) -> float:
-        """User refund when the driver abandons a trip mid-booking (F11).
-
-        Pro-rated: ``unused_days * per_day_rate``, capped at the amount the
-        user actually paid so we never refund more than they put in. The user
-        is blameless here so no anti-fraud deduction is applied.
-        """
         trip = session.get(Trip, trip_id)
         if not trip:
             return 0.0
@@ -373,10 +309,6 @@ class PaymentService:
     def calculate_refund_amount(
         self, session: Session, trip_id: int
     ) -> Tuple[float, Optional[str]]:
-        """Pre-F6 simple refund: total_paid if no shift started, else 0 (or
-        prorated for full_payment). Mid-trip cancellations now use
-        :meth:`calculate_user_cancel_settlement` which handles shortfalls too.
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
@@ -422,8 +354,6 @@ class PaymentService:
         driver_id: int,
         reason: str = "Driver rejected post-payment",
     ) -> Tuple[bool, Optional[str]]:
-        """Refund the acceptance fee via the central ledger (wallet→wallet,
-        platform→source). No-ops if never paid or already fully refunded."""
         from app.modules.payments import service as central
 
         try:
@@ -437,7 +367,6 @@ class PaymentService:
                     Payment.status.in_(_PAID_IN_STATES),
                 )
             ).first()
-            # None ⇒ never paid, or already fully refunded (status "refunded").
             if not paid:
                 return True, None
 
@@ -470,12 +399,6 @@ class PaymentService:
         idempotency_key: Optional[str] = None,
         note: Optional[str] = None,
     ) -> Tuple[Optional[Payment], Optional[str], Optional[str]]:
-        """User pays a daily / cancellation_balance / schedule_diff bill online.
-
-        Row-locks the bill, then charges it on the central ledger. For wallet
-        the bill settles synchronously (the orchestrator marks it paid and
-        unpauses the trip); for platform it stays open until the webhook fires
-        that same hook. Returns ``(payment, client_secret, error)``."""
 
         try:
             bill = session.exec(
@@ -521,8 +444,6 @@ class PaymentService:
         driver_id: int,
         note: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """Driver confirms cash collected from the user. Settles immediately on
-        the central ledger (cash collected offline → succeeded right away)."""
 
         try:
             bill = session.exec(
@@ -565,17 +486,12 @@ class PaymentService:
     def user_has_outstanding_dues(
         self, session: Session, user_id
     ) -> Tuple[bool, Optional[str]]:
-        """Booking gate: ``(has_dues, kind)`` where kind ∈ {"bill","settlement",None}.
-
-        Picks up daily bills, cancellation_balance shortfalls, and unpaid
-        final settlements. ``kind`` lets the caller render a precise message.
-        """
         bill = session.exec(
             select(TripBill).where(
                 TripBill.user_id == user_id,
-                # F6: include cancellation_balance shortfall bills in the
-                # booking gate too. Either kind unpaid blocks new bookings.
-                TripBill.bill_type.in_(("daily_bill", "cancellation_balance")),
+                TripBill.bill_type.in_(
+                    ("daily_bill", "cancellation_balance", "advance_recovery")
+                ),
                 TripBill.amount_due > 0,
             )
         ).first()
@@ -594,29 +510,22 @@ class PaymentService:
         return False, None
 
     def user_has_unpaid_bills(self, session: Session, user_id) -> bool:
-        """Boolean shim over :meth:`user_has_outstanding_dues` for legacy callers."""
         has, _ = self.user_has_outstanding_dues(session, user_id)
         return has
 
     def trip_has_unpaid_bills(self, session: Session, trip_id: int) -> bool:
-        """True iff the trip has any open-balance bill that blocks progression.
-
-        Checks ``amount_due > 0`` (not just ``is_paid == False``) so
-        advance/full-payment trips whose daily bills carry zero due don't
-        accidentally pause. ``schedule_diff`` bills also block — the user must
-        pay the modification top-up before the new schedule's first OTP.
-        """
         row = session.exec(
             select(TripBill).where(
                 TripBill.trip_id == trip_id,
-                TripBill.bill_type.in_(("daily_bill", "schedule_diff")),
+                TripBill.bill_type.in_(
+                    ("daily_bill", "schedule_diff", "advance_recovery")
+                ),
                 TripBill.amount_due > 0,
             )
         ).first()
         return row is not None
 
     def unpause_trip_if_clear(self, session: Session, trip_id: int) -> None:
-        """After a bill is paid, lift OTP block and flip `paused` → `active_pending_otp`."""
         if self.trip_has_unpaid_bills(session, trip_id):
             return
 
@@ -632,7 +541,6 @@ class PaymentService:
             att.marked_by = "system"
             session.add(att)
 
-        # Lock the trip row so we don't race with end-trip / auto-end / skip.
         trip = session.exec(
             select(Trip).where(Trip.id == trip_id).with_for_update()
         ).first()
@@ -643,7 +551,6 @@ class PaymentService:
             trip.is_payment_blocked = False
             changed = True
         if trip.status == "paused":
-            # Only re-arm OTP if there's actually a pending shift to run.
             pending = session.exec(
                 select(TripAttendance).where(
                     TripAttendance.trip_id == trip_id,
@@ -666,9 +573,6 @@ class PaymentService:
         refund_amount: float,
         reason: str = "Trip cancelled",
     ) -> Tuple[bool, Optional[str]]:
-        """Refund the user a computed amount, allocated across their succeeded
-        trip charges via the central partial-refund path (wallet→wallet,
-        platform→source). The caller commits the trip status afterwards."""
         from app.modules.trips import payment_orchestrator
 
         try:

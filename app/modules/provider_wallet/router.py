@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
 from sqlmodel import Session, select
 
 from app.core.database import get_session
@@ -68,6 +68,24 @@ def list_provider_transactions(
     return rows
 
 
+@router.get("/transactions/{txn_ref}", response_model=ProviderWalletTransactionPublic)
+def get_provider_transaction(
+    txn_ref: str,
+    session: Session = Depends(get_session),
+    ctx: ProviderContext = Depends(get_current_provider),
+):
+    """Fetch one wallet transaction by reference (e.g. poll a top-up status)."""
+    txn = session.exec(
+        select(ProviderWalletTransaction).where(
+            ProviderWalletTransaction.reference_id == txn_ref,
+            ProviderWalletTransaction.user_id == ctx.user.id,
+        )
+    ).first()
+    if not txn:
+        raise HTTPException(404, "Transaction not found")
+    return txn
+
+
 @router.post("/topup")
 def topup_provider_wallet(
     data: ProviderTopupRequest,
@@ -114,8 +132,7 @@ def cashout_provider_wallet(
         default=None, alias="Idempotency-Key", convert_underscores=False
     ),
 ):
-    """Withdraw money from the provider wallet to the registered bank account.
-    Validated against a positive wallet balance and settled provider funds."""
+    """Withdraw money from the provider wallet to the registered bank account."""
     wallet = pw_service.get_or_create_provider_wallet(
         session, ctx.user.id, ctx.provider_type
     )

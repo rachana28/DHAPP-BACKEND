@@ -1,5 +1,25 @@
-"""
-Scheduled Jobs for Trip Management
+"""Scheduled jobs for trip management.
+
+Interval scans (all re-entrant — they read pending state from the DB, so a
+restart after downtime resumes exactly where things stand):
+  * generate_otp_for_trip_scheduler — issues the shift OTP for any runnable
+    shift whose start is within 30 min OR already past (late start after an
+    outage) while its scheduled_end is still in the future; pauses the trip
+    instead when an unpaid blocking bill exists.
+  * expire_otp_for_trip_scheduler / purge_otps_scheduler — mark missed shifts
+    absent and clean up dead OTP rows.
+  * auto_end_trip_scheduler (+ auto_mark_missed_shifts_scheduler) — close
+    shifts past scheduled_end, raise the daily bill, run the advance_20
+    mid-trip recovery check, pause on unpaid bills, settle finished trips.
+  * driver_payment_timeout_scheduler — free trips whose acceptance fee never
+    arrived; auto_resolve_paused_trips_scheduler — 1h unpaid upfront converts
+    to trip_day, 48h unpaid bill force-closes the booking.
+  * repair_orphan_active_trips_scheduler — self-heal trips with no attendance.
+
+Daily jobs (gated, not cron): daily_settlement_scheduler (23:59) and
+dunning_scheduler (09:00) run on a 10-min interval but only execute when
+``daily_job_due`` says the day's slot is unserved (marker persisted as a
+SystemConfig row), so a run missed during downtime executes once on restart.
 """
 
 from datetime import datetime, timedelta
@@ -24,6 +44,7 @@ from app.modules.trips.otp_service import OTPService
 from app.modules.trips.trip_service import TripService
 from app.modules.trips.billing_service import BillingService
 from app.modules.trips.payment_service import PaymentService
+from app.utils.system_config import daily_job_due, mark_job_run
 from app.utils.time_utils import now_ist, today_ist
 from app.utils.notifications import send_push_notification
 
@@ -38,21 +59,17 @@ async def generate_otp_for_trip_scheduler():
 
             now = now_ist()
             window_end = now + timedelta(minutes=30)
-            today = today_ist()
 
             attendances = session.exec(
                 select(TripAttendance).where(
-                    TripAttendance.scheduled_start >= now,
                     TripAttendance.scheduled_start <= window_end,
-                    TripAttendance.status.notin_(
-                        ["skipped_by_user", "skipped_by_driver", "skipped_by_system"]
-                    ),
+                    TripAttendance.scheduled_end > now,
+                    TripAttendance.status.in_(["scheduled", "paused_payment"]),
                 )
             ).all()
 
             payment_service = PaymentService(redis_client)
 
-            # Batch-fetch trips to avoid N+1.
             trip_ids = list({a.trip_id for a in attendances})
             trips_by_id = {
                 t.id: t
@@ -75,16 +92,13 @@ async def generate_otp_for_trip_scheduler():
                 if not trip.payment_method:
                     continue
 
-                if (
-                    trip.payment_method == "trip_day"
-                    and payment_service.trip_has_unpaid_bills(session, trip.id)
-                ):
+                if payment_service.trip_has_unpaid_bills(session, trip.id):
                     if not trip.is_payment_blocked:
                         trip.is_payment_blocked = True
                         session.add(trip)
                     if att.status not in ("paused_payment", "skipped_by_system"):
                         att.status = "paused_payment"
-                        att.skip_reason = "Outstanding daily bill"
+                        att.skip_reason = "Outstanding bill"
                         att.marked_by = "system"
                         session.add(att)
                     session.commit()
@@ -92,22 +106,25 @@ async def generate_otp_for_trip_scheduler():
 
                 existing = session.exec(
                     select(OTPRegistry).where(
-                        OTPRegistry.trip_id == trip.id,
-                        OTPRegistry.trip_date == today,
+                        OTPRegistry.attendance_id == att.id,
                     )
                 ).first()
                 if existing:
                     continue
 
                 otp, err = otp_service.generate_otp(
-                    session, trip.id, att.scheduled_start, trip_date=today
+                    session,
+                    trip.id,
+                    att.scheduled_start,
+                    trip_date=att.trip_date,
+                    attendance_id=att.id,
                 )
                 if err:
                     logger.error(
-                        f"Failed to generate OTP for trip {trip.id} on {today}: {err}"
+                        f"Failed to generate OTP for trip {trip.id} on {att.trip_date}: {err}"
                     )
                 else:
-                    logger.info(f"OTP generated for trip {trip.id} on {today}")
+                    logger.info(f"OTP generated for trip {trip.id} on {att.trip_date}")
                     try:
                         send_push_notification(
                             session=session,
@@ -142,7 +159,6 @@ async def expire_otp_for_trip_scheduler():
 
             trip_service = TripService()
 
-            # Batch-fetch trips to avoid N+1.
             trip_ids = list({r.trip_id for r in expired_rows})
             trips_by_id = {
                 t.id: t
@@ -176,9 +192,13 @@ async def expire_otp_for_trip_scheduler():
                     session.add(attendance)
                     session.commit()
 
-                    # If this was the trip's last pending shift, advance the
-                    # trip status. Without this the trip stays in
-                    # active_pending_otp forever after an OTP timeout.
+                    try:
+                        BillingService().check_advance_recovery(session, trip.id)
+                    except Exception as rec_err:
+                        logger.warning(
+                            f"Advance-recovery check failed for trip {trip.id}: {rec_err}"
+                        )
+
                     if not trip_service.has_pending_shifts(session, trip.id):
                         has_any_present = session.exec(
                             select(TripAttendance).where(
@@ -200,33 +220,16 @@ async def expire_otp_for_trip_scheduler():
 
 
 async def purge_otps_scheduler():
-    """Delete OTP rows from the DB once they can no longer be needed.
-
-    Closes the loop on "post-verification / post-expiry deletion":
-
-    - **Booking (tow/mechanic) OTPs** are already wiped from Redis *and* DB on
-      successful verify (see ``booking_otp_service.verify``). Here we sweep the
-      leftover *expired-unverified* rows. Redis self-expires via its TTL, so we
-      don't touch it (a newer regenerated OTP may legitimately own the key).
-    - **Trip OTPs**: Redis is dropped on verify already, but the DB row doubles
-      as the per-shift *regeneration guard* used by ``generate_otp_for_trip_scheduler``
-      (it skips a shift that already has a row) and is consumed by
-      ``expire_otp_for_trip_scheduler``. So we only delete trip rows once the
-      whole validity window has closed (``otp_expiry_at`` past, plus a 1-hour
-      grace so the expiry job has certainly run).
-    """
     try:
         with Session(engine) as session:
             now = now_ist()
 
-            # Booking OTPs: any expired row (verified ones were already deleted).
             expired_booking = session.exec(
                 select(BookingOTP).where(BookingOTP.expires_at < now)
             ).all()
             for row in expired_booking:
                 session.delete(row)
 
-            # Trip OTPs: only well after the window closed.
             trip_cutoff = now - timedelta(hours=1)
             old_trip = session.exec(
                 select(OTPRegistry).where(OTPRegistry.otp_expiry_at < trip_cutoff)
@@ -263,9 +266,6 @@ async def auto_end_trip_scheduler():
             ]
 
             for trip_id in candidate_ids:
-                # Re-fetch under a row lock and re-check state — driver may
-                # have called /end-trip in parallel between the bulk select
-                # above and now.
                 trip = session.exec(
                     select(Trip).where(Trip.id == trip_id).with_for_update()
                 ).first()
@@ -293,7 +293,7 @@ async def auto_end_trip_scheduler():
                         TripAttendance.trip_id == trip.id,
                         TripAttendance.trip_date > shift_date,
                         TripAttendance.status.in_(["scheduled", "paused_payment"]),
-                        TripAttendance.user_otp_verified == False,  # noqa: E712
+                        TripAttendance.user_otp_verified == False,
                     )
                     .order_by(TripAttendance.trip_date)
                 ).first()
@@ -316,7 +316,6 @@ async def auto_end_trip_scheduler():
                     session.add(trip)
                     session.commit()
 
-                    # Stamp per-day actual_end so summaries reflect each shift.
                     if active_attendance:
                         trip_service.mark_trip_day_present(
                             session, trip.id, shift_date, actual_end=now
@@ -333,12 +332,14 @@ async def auto_end_trip_scheduler():
                     if not bill_success and bill_id:
                         bill_success = True
 
-                    # trip_day + future shifts with an unpaid bill: hold the
-                    # trip in `paused` so the user app surfaces the payment
-                    # screen instead of jumping to tomorrow's OTP screen.
-                    # Cleared by PaymentService.unpause_trip_if_clear once
-                    # the bill is paid.
-                    if has_future_shifts and trip.payment_method == "trip_day":
+                    try:
+                        billing_service.check_advance_recovery(session, trip.id)
+                    except Exception as rec_err:
+                        logger.warning(
+                            f"Advance-recovery check failed for trip {trip.id}: {rec_err}"
+                        )
+
+                    if has_future_shifts:
                         payment_service = PaymentService(get_redis())
                         if payment_service.trip_has_unpaid_bills(session, trip.id):
                             trip.status = "paused"
@@ -405,28 +406,10 @@ async def auto_end_trip_scheduler():
     except Exception as e:
         logger.error(f"Trip auto-end scheduler failed: {str(e)}")
 
-    # Same cadence handles the inverse case: shifts that were never started and
-    # whose scheduled window has now fully ended.
     await auto_mark_missed_shifts_scheduler()
 
 
 async def auto_mark_missed_shifts_scheduler():
-    """Mark un-started shifts absent once their scheduled window has fully ended.
-
-    Real-time scenario: neither the user nor the driver started a shift (no OTP
-    verified) and its scheduled_end has now passed — e.g. a 4 PM shift of 7
-    hours whose scheduled_end is 11 PM. The day is a no-show, marked
-    skipped_by_system so it is excluded from billing.
-
-    It is deliberately a SYSTEM skip (marked_by="system"): a forgotten shift is
-    not the driver's deliberate choice, so it never counts against the driver's
-    monthly skip limit (which only tallies skipped_by_driver).
-
-    Each TripAttendance row carries its own scheduled_end, so the correct
-    calendar day is always targeted: a shift running past midnight is closed by
-    its own row, and the next day's row (later scheduled_end, still in the
-    future) is left untouched.
-    """
     try:
         with Session(engine) as session:
             trip_service = TripService()
@@ -437,8 +420,8 @@ async def auto_mark_missed_shifts_scheduler():
                 select(TripAttendance)
                 .where(
                     TripAttendance.status.in_(["scheduled", "paused_payment"]),
-                    TripAttendance.user_otp_verified == False,  # noqa: E712
-                    TripAttendance.driver_otp_verified == False,  # noqa: E712
+                    TripAttendance.user_otp_verified == False,
+                    TripAttendance.driver_otp_verified == False,
                     TripAttendance.scheduled_end <= now,
                 )
                 .order_by(TripAttendance.trip_date)
@@ -455,12 +438,9 @@ async def auto_mark_missed_shifts_scheduler():
 
             for stub in missed_stubs:
                 trip = trips_by_id.get(stub.trip_id)
-                # Only finalize shifts for trips still waiting on / holding a shift.
                 if not trip or trip.status not in ("active_pending_otp", "paused"):
                     continue
 
-                # Re-fetch under a row lock and re-check — verify-otp or
-                # skip-day may have acted between the bulk select above and now.
                 att = session.exec(
                     select(TripAttendance)
                     .where(TripAttendance.id == stub.id)
@@ -473,7 +453,7 @@ async def auto_mark_missed_shifts_scheduler():
                     or att.driver_otp_verified
                     or att.scheduled_end > now
                 ):
-                    session.commit()  # release the row lock
+                    session.commit()
                     continue
 
                 att.status = "skipped_by_system"
@@ -487,9 +467,13 @@ async def auto_mark_missed_shifts_scheduler():
                     f"(not started by scheduled end {att.scheduled_end})"
                 )
 
-                # If that was the trip's last pending shift, push it to a
-                # terminal state so it doesn't sit in active_pending_otp /
-                # paused forever.
+                try:
+                    billing_service.check_advance_recovery(session, trip.id)
+                except Exception as rec_err:
+                    logger.warning(
+                        f"Advance-recovery check failed for trip {trip.id}: {rec_err}"
+                    )
+
                 if trip_service.has_pending_shifts(session, trip.id):
                     continue
 
@@ -555,9 +539,6 @@ async def driver_payment_timeout_scheduler():
             ).all()
 
             for trip in trips:
-                # Re-fetch with a row lock and re-check status: the driver
-                # may have just paid in /process-payment, or the user may
-                # have just cancelled, between the bulk select above and now.
                 locked_trip = session.exec(
                     select(Trip).where(Trip.id == trip.id).with_for_update()
                 ).first()
@@ -590,7 +571,7 @@ async def driver_payment_timeout_scheduler():
                         f"Driver fee in progress for trip {locked_trip.id}, "
                         f"skipping auto-reject"
                     )
-                    session.commit()  # release the row lock
+                    session.commit()
                     continue
 
                 success, error = trip_service.transition_trip_state(
@@ -629,7 +610,7 @@ async def driver_payment_timeout_scheduler():
                         f"Trip {locked_trip.id} auto-rejected due to driver payment timeout; back to searching"
                     )
                 else:
-                    session.commit()  # release the row lock
+                    session.commit()
                     logger.error(
                         f"Failed to auto-reject trip {locked_trip.id}: {error}"
                     )
@@ -641,14 +622,13 @@ async def driver_payment_timeout_scheduler():
 async def daily_settlement_scheduler():
     try:
         with Session(engine) as session:
+            if not daily_job_due(session, "job_last_run_daily_settlement", 23, 59):
+                return
+
             billing_service = BillingService()
 
             today = today_ist()
 
-            # Filter at the DB level: only trips that are completed/auto_completed,
-            # have ended, are past end_date (or end_date is null), and do NOT
-            # already have a settlement. Avoids loading every historical trip
-            # on every cron tick.
             stmt = (
                 select(Trip)
                 .outerjoin(TripSettlement, TripSettlement.trip_id == Trip.id)
@@ -686,34 +666,13 @@ async def daily_settlement_scheduler():
                         f"Failed to generate settlement for trip {trip.id}: {error}"
                     )
 
+            mark_job_run(session, "job_last_run_daily_settlement")
+
     except Exception as e:
         logger.error(f"Daily settlement scheduler failed: {str(e)}")
 
 
 async def auto_resolve_paused_trips_scheduler():
-    """Resolve trips that have been stuck in `paused` for too long (Issue 8).
-
-    Two real-time scenarios:
-
-      * advance_20 / full_payment upfront unpaid — the trip is paused waiting
-        for the user's upfront payment. After 1 hour the payment method is
-        auto-converted to trip_day and the trip is unpaused, so it can proceed
-        on pay-per-day billing instead of being stuck forever.
-
-      * trip_day with an unpaid daily bill — the trip is paused waiting for the
-        user to clear the daily bill. After 48 hours the whole booking is
-        force-closed: the remaining shifts are voided and a final settlement is
-        raised for the PENDING amount only. Once the user pays that settlement
-        the booking is fully settled — it does NOT continue with the other
-        days in the booking.
-
-    Pause start-times are derived without any new DB column:
-      * upfront pause  -> a Redis anchor key (1-hour grace) is stamped the
-        first time this job sees the paused trip; if Redis is unavailable the
-        conversion is simply skipped (safe degradation).
-      * daily-bill pause -> the oldest unpaid daily bill's generated_at is the
-        anchor (the bill is raised exactly when the pause begins).
-    """
     try:
         with Session(engine) as session:
             trip_service = TripService()
@@ -721,16 +680,18 @@ async def auto_resolve_paused_trips_scheduler():
             redis_client = get_redis()
             now = now_ist()
 
-            # ── 8d: advance/full upfront pending > 1h → convert to trip_day ──
             upfront_paused = session.exec(
                 select(Trip).where(
                     Trip.status == "paused",
-                    Trip.is_payment_blocked == True,  # noqa: E712
+                    Trip.is_payment_blocked == True,
                     Trip.payment_method.in_(["advance_20", "full_payment"]),
                 )
             ).all()
 
+            payment_service = PaymentService(redis_client)
             for trip in upfront_paused:
+                if payment_service.trip_has_unpaid_bills(session, trip.id):
+                    continue
                 anchor_key = f"trip:{trip.id}:upfront_pause_at"
                 started_iso = None
                 if redis_client:
@@ -740,7 +701,6 @@ async def auto_resolve_paused_trips_scheduler():
                         started_iso = None
 
                 if not started_iso:
-                    # First sighting — stamp the 1-hour grace anchor and wait.
                     if redis_client:
                         try:
                             redis_client.set(anchor_key, now.isoformat(), ex=86400)
@@ -764,7 +724,7 @@ async def auto_resolve_paused_trips_scheduler():
                     or locked.payment_method not in ("advance_20", "full_payment")
                     or not locked.is_payment_blocked
                 ):
-                    session.commit()  # release the row lock
+                    session.commit()
                     continue
 
                 locked.payment_method = "trip_day"
@@ -776,7 +736,6 @@ async def auto_resolve_paused_trips_scheduler():
                 locked.state_version += 1
                 session.add(locked)
 
-                # Re-arm any payment-paused shifts so OTP can resume.
                 for att in session.exec(
                     select(TripAttendance).where(
                         TripAttendance.trip_id == locked.id,
@@ -817,11 +776,10 @@ async def auto_resolve_paused_trips_scheduler():
                 except Exception:
                     pass
 
-            # ── 8c: trip_day unpaid daily bill paused > 48h → force-close ───
             billbased_paused = session.exec(
                 select(Trip).where(
                     Trip.status == "paused",
-                    Trip.payment_method == "trip_day",
+                    Trip.payment_method.in_(["trip_day", "advance_20"]),
                 )
             ).all()
 
@@ -830,7 +788,9 @@ async def auto_resolve_paused_trips_scheduler():
                     select(TripBill)
                     .where(
                         TripBill.trip_id == trip.id,
-                        TripBill.bill_type == "daily_bill",
+                        TripBill.bill_type.in_(
+                            ["daily_bill", "schedule_diff", "advance_recovery"]
+                        ),
                         TripBill.amount_due > 0,
                     )
                     .order_by(TripBill.generated_at)
@@ -844,10 +804,9 @@ async def auto_resolve_paused_trips_scheduler():
                     select(Trip).where(Trip.id == trip.id).with_for_update()
                 ).first()
                 if not locked or locked.status != "paused":
-                    session.commit()  # release the row lock
+                    session.commit()
                     continue
 
-                # Void every remaining shift — the whole booking ends here.
                 for att in session.exec(
                     select(TripAttendance).where(
                         TripAttendance.trip_id == locked.id,
@@ -855,9 +814,7 @@ async def auto_resolve_paused_trips_scheduler():
                     )
                 ).all():
                     att.status = "skipped_by_system"
-                    att.skip_reason = (
-                        "Booking closed: daily bill unpaid for over 48 hours"
-                    )
+                    att.skip_reason = "Booking closed: bill unpaid for over 48 hours"
                     att.marked_by = "system"
                     session.add(att)
 
@@ -869,13 +826,11 @@ async def auto_resolve_paused_trips_scheduler():
                 session.add(locked)
                 session.commit()
 
-                # Final settlement carries the PENDING amount only:
-                # remaining_due = billed total − amount already paid.
                 ok, sid, err = billing_service.generate_final_settlement(
                     session, locked.id
                 )
                 logger.info(
-                    f"Trip {locked.id}: daily bill unpaid for 48h — booking "
+                    f"Trip {locked.id}: bill unpaid for 48h — booking "
                     f"force-closed to `billed`; final settlement={sid} ({err})"
                 )
                 try:
@@ -886,8 +841,8 @@ async def auto_resolve_paused_trips_scheduler():
                         user_ids=[locked.user_id],
                         title="Trip closed — final bill due",
                         body=(
-                            f"Trip #{locked.id} was closed because the daily "
-                            f"bill stayed unpaid for 48 hours. Pay the pending "
+                            f"Trip #{locked.id} was closed because a bill "
+                            f"stayed unpaid for 48 hours. Pay the pending "
                             f"amount of ₹{due:.2f} to settle the booking."
                         ),
                         data={
@@ -903,11 +858,6 @@ async def auto_resolve_paused_trips_scheduler():
         logger.error(f"Paused-trip resolver scheduler failed: {str(e)}")
 
 
-# Dunning ladder (F8). Day offsets are measured from settlement.due_date
-# (falling back to settlement_date if due_date is unset). Each entry is the
-# stage marker we set on advance, plus the push title/body shown to the user.
-# Stage 6 is the collections handoff and skips the push because the SupportTicket
-# adapter handles that side.
 _DUNNING_LADDER = [
     (1, 1, "Payment reminder", "Your trip settlement is due. Please clear it today."),
     (3, 2, "Payment reminder", "Your trip settlement is 3 days overdue."),
@@ -929,16 +879,16 @@ _DUNNING_LADDER = [
         "Pre-collections notice",
         "Your settlement will be sent to collections in 2 days if unpaid.",
     ),
-    (30, 6, None, None),  # collections handoff
+    (30, 6, None, None),
 ]
 
 
 async def dunning_scheduler():
-    """Run nightly (~09:00 IST). Advance overdue settlements down the dunning
-    ladder, push reminders to the user, and hand off to collections at 30 days.
-    """
     try:
         with Session(engine) as session:
+            if not daily_job_due(session, "job_last_run_dunning", 9, 0):
+                return
+
             today = today_ist()
             unpaid = session.exec(
                 select(TripSettlement).where(
@@ -994,20 +944,13 @@ async def dunning_scheduler():
                 settlement.last_reminder_at = now_ist()
                 session.add(settlement)
                 session.commit()
+
+            mark_job_run(session, "job_last_run_dunning")
     except Exception as e:
         logger.error(f"Dunning scheduler failed: {str(e)}")
 
 
 async def repair_orphan_active_trips_scheduler():
-    """Self-heal trips stuck in `active_pending_otp` with no attendance rows (D3).
-
-    If the driver-acceptance fee succeeded but the inline attendance generation
-    in finalize_driver_acceptance failed (a transient error), the trip lands in
-    `active_pending_otp` with zero TripAttendance rows — OTP can never be
-    requested and the booking is dead-locked. This job detects that exact shape
-    (paid + active_pending_otp + zero attendance) and regenerates the schedule
-    idempotently, mirroring the attendance block of finalize_driver_acceptance.
-    """
     try:
         with Session(engine) as session:
             trip_service = TripService()

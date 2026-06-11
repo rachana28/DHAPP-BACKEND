@@ -60,7 +60,6 @@ class DriverBase(SQLModel):
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
     vehicle_number: Optional[str] = None
-    fare_per_km: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: str = "pending_approval"
     suspended_until: Optional[datetime] = None
@@ -821,7 +820,6 @@ class TripReadUser(TripSafe):
     driver: Optional[DriverPublic] = None
     tow_truck_driver: Optional[TowTruckDriverPublic] = None
     mechanic: Optional[MechanicPublic] = None
-    driver_skips_remaining: Optional[int] = None
 
 
 # --- MechanicTrip / TowTrip response models ---
@@ -927,7 +925,6 @@ class DriverUpdate(SQLModel):
     years_of_experience: Optional[int] = None
     vehicle_type: Optional[str] = None
     vehicle_number: Optional[str] = None
-    fare_per_km: Optional[float] = None
     spoken_languages: Optional[str] = None
     status: Optional[str] = None
 
@@ -2278,7 +2275,7 @@ class TripBillRead(SQLModel):
     """Bill row exposed via the API. Hides user_id/driver_id internals."""
 
     id: int
-    trip_id: int
+    trip_id: str
     bill_type: str
     bill_date: date
     total_amount: float

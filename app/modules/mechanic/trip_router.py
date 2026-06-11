@@ -33,12 +33,10 @@ from app.utils.id_generator import (
 )
 from app.modules.payments.service import refund_booking_payments
 from app.services.dues import raise_if_unpaid_past_due
-from app.modules.trips import booking_otp_service
-from app.modules.trips.arrival_service import mark_mechanic_arrived
-from app.modules.trips.booking_summary import (
-    build_mechanic_summary,
-    address_edit_window,
-)
+from app.modules.bookings import otp_service as booking_otp_service
+from app.modules.bookings.summary_helpers import address_edit_window
+from app.modules.mechanic.arrival_service import mark_mechanic_arrived
+from app.modules.mechanic.booking_summary import build_mechanic_summary
 from app.workers.topics import telemetry_topic
 from app.utils.time_utils import now_ist
 

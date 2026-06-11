@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from sqlmodel import Session
 
-from app.modules.trips.pricing_calculator import _get_config_value
+from app.utils.system_config import get_config_value
 
 # --- CONFIGURATION ---
 OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving"
@@ -69,7 +69,7 @@ def _tow_cfg(
     """SystemConfig lookup (Redis → DB → default). Safe when session is None."""
     if session is None:
         return float(default)
-    return _get_config_value(session, redis_client, key, default)
+    return get_config_value(session, redis_client, key, default)
 
 
 def calculate_tow_cost(
