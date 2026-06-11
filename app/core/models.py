@@ -53,7 +53,6 @@ def _coerce_none_to_empty_dict(v):
 class DriverBase(SQLModel):
     name: str
     phone_number: str
-    license_number: Optional[str] = None
     address: Optional[str] = None
     emergency_phone: Optional[str] = None
     profile_picture_url: Optional[str] = None
@@ -1338,7 +1337,6 @@ class UserCreate(SQLModel):
     full_name: Optional[str] = Field(default=None, max_length=100)
     role: str = "user"
     # Optional fields for Driver/Tow creation
-    license_number: Optional[str] = None
     vehicle_type: Optional[str] = None
     phone_number: Optional[str] = None
     vehicle_number: Optional[str] = None  # Added for TowTruckDriver
@@ -1889,7 +1887,6 @@ class VerifyOTPRequest(SQLModel):
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
     # Driver Specific Fields
-    license_number: Optional[str] = None
     vehicle_type: Optional[str] = None
     # Tow Truck Specific Fields
     vehicle_number: Optional[str] = None

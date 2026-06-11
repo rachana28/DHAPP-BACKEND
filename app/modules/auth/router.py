@@ -238,7 +238,6 @@ def verify_otp(
                 name=request.full_name,
                 phone_number=phone,
                 user_id=user.id,
-                license_number=request.license_number,
                 vehicle_type=request.vehicle_type,
                 # Optional at signup; required before admin approval.
                 vehicle_number=request.vehicle_number,

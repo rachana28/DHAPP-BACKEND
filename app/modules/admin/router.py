@@ -91,8 +91,6 @@ def assert_provider_profile_complete(profile, provider_type: str) -> None:
     if not getattr(profile, "profile_picture_url", None):
         missing.append("profile_picture_url")
     if provider_type == "driver":
-        if not getattr(profile, "license_number", None):
-            missing.append("license_number")
         if not getattr(profile, "vehicle_type", None):
             missing.append("vehicle_type")
     elif provider_type == "tow":

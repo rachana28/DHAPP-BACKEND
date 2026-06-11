@@ -47,9 +47,10 @@ def get_driver_score(
 
 def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
     now = now_ist()
+    normalized_type = (vehicle_type or "").strip().lower()
     drivers = session.exec(
         select(Driver).where(
-            Driver.vehicle_type == vehicle_type,
+            func.lower(func.trim(Driver.vehicle_type)) == normalized_type,
             Driver.status == "available",
             (Driver.suspended_until.is_(None)) | (Driver.suspended_until <= now),
         )
