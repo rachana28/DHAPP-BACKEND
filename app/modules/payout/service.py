@@ -38,8 +38,6 @@ from app.utils.time_utils import now_ist
 
 _EPS = 1e-6
 
-# Bank details currently live on driver & tow-driver profiles only. Mechanic and
-# service-center wallets cannot be paid out yet (their models are untouched).
 _BANK_MODELS = {"driver": Driver, "tow": TowTruckDriver}
 
 
@@ -72,7 +70,7 @@ def execute_payout(
     *,
     wallet: ProviderWallet,
     amount: float,
-    kind: str,  # "cashout" | "auto_payout"
+    kind: str,
     idempotency_key: Optional[str] = None,
 ) -> PayoutRecord:
     amount = round(float(amount), 2)
@@ -85,6 +83,12 @@ def execute_payout(
         ).first()
         if existing:
             return existing
+
+    freeze_reason = pw_service.driver_wallet_freeze_reason(
+        session, wallet.user_id, wallet.provider_type
+    )
+    if freeze_reason:
+        raise HTTPException(403, freeze_reason)
 
     if kind == "cashout":
         min_co = pw_service._get_config_float(
@@ -99,7 +103,6 @@ def execute_payout(
     if not bank:
         raise HTTPException(400, "Bank details required before payout/cash-out")
 
-    # Fraud guard: never move more than what is physically owed to providers.
     balances = merchant_bank.current_balances(session)
     if amount > balances["provider_owed_balance"] + _EPS:
         raise HTTPException(400, "Amount exceeds settled provider funds available")
@@ -122,7 +125,6 @@ def execute_payout(
     session.add(record)
     session.flush()
 
-    # Debit the wallet (raises 400 if insufficient) + the merchant bank.
     wallet_txn = pw_service.debit(
         session,
         wallet.user_id,
@@ -144,7 +146,6 @@ def execute_payout(
     record.wallet_txn_reference = wallet_txn.reference_id
     record.merchant_ledger_reference = ledger.reference_id
 
-    # Call the partner (mock today; real RazorpayX/Cashfree later).
     result = payout_partner.get_partner().initiate_payout(
         amount, bank, idempotency_key=record.reference_id
     )
@@ -154,7 +155,6 @@ def execute_payout(
         record.partner_txn_id = result.partner_txn_id
         record.completed_at = now_ist()
     else:
-        # Bounce: money never actually left — reverse the wallet + ledger moves.
         pw_service.reverse_debit(
             session,
             wallet.user_id,
@@ -195,20 +195,80 @@ def execute_payout(
     return record
 
 
+def _record_failed_sweep(
+    session: Session, wallet: ProviderWallet, amount: float, reason: str
+) -> Optional[PayoutRecord]:
+    key = f"sweep:{wallet.reference_id}:{now_ist().date().isoformat()}"
+    existing = session.exec(
+        select(PayoutRecord).where(PayoutRecord.idempotency_key == key)
+    ).first()
+    if existing:
+        return existing
+    try:
+        record = PayoutRecord(
+            reference_id=generate_reference_id(session, PAYOUT),
+            kind="auto_payout",
+            provider_user_id=wallet.user_id,
+            provider_type=wallet.provider_type,
+            amount=round(amount, 2),
+            status="failed",
+            failure_reason=reason,
+            partner_provider=payout_partner.get_partner().provider,
+            idempotency_key=key,
+            completed_at=now_ist(),
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    except Exception:
+        session.rollback()
+        return None
+    audit_emit(
+        "payout.failed",
+        trip_id=None,
+        actor="scheduler",
+        actor_id=str(wallet.user_id),
+        payload={
+            "payout_reference": record.reference_id,
+            "kind": "auto_payout",
+            "amount": record.amount,
+            "status": "failed",
+            "reason": reason,
+        },
+        severity="warning",
+    )
+    return record
+
+
 def sweep_all_providers(session: Session) -> List[str]:
-    """Auto-pay every provider wallet with a positive balance to its bank.
-    Returns the references of the payout records created. Per-provider failures
-    never abort the sweep."""
     wallets = session.exec(
         select(ProviderWallet).where(ProviderWallet.balance > 0)
     ).all()
     refs: List[str] = []
     for w in wallets:
-        # Skip providers without bank details (e.g. mechanic / service-center).
-        if not resolve_bank_details(session, w):
-            continue
         amount = round(w.balance, 2)
         if amount <= 0:
+            continue
+        if pw_service.driver_wallet_freeze_reason(session, w.user_id, w.provider_type):
+            audit_emit(
+                "payout.sweep_skipped",
+                trip_id=None,
+                actor="scheduler",
+                payload={
+                    "wallet_reference": w.reference_id,
+                    "reason": "wallet_frozen_active_trip",
+                },
+                severity="info",
+            )
+            continue
+        if not resolve_bank_details(session, w):
+            if w.provider_type in _BANK_MODELS:
+                _record_failed_sweep(
+                    session,
+                    w,
+                    amount,
+                    "Missing or incomplete bank details (account number / IFSC required)",
+                )
             continue
         try:
             rec = execute_payout(

@@ -32,7 +32,6 @@ class OTPService:
     def __init__(self, redis_client: Optional[redis.Redis]):
         self.redis = redis_client
 
-    # ─── primitives ──────────────────────────────────────────────────────────
     def _generate_otp(self) -> str:
         return "".join(secrets.choice("0123456789") for _ in range(self.OTP_LENGTH))
 
@@ -66,7 +65,6 @@ class OTPService:
         except redis.RedisError:
             return False
 
-    # ─── attendance resolution ───────────────────────────────────────────────
     def _resolve_attendance_id(
         self,
         session: Session,
@@ -74,13 +72,6 @@ class OTPService:
         trip_date: date,
         attendance_id: Optional[int],
     ) -> Optional[int]:
-        """Pick the right TripAttendance row for (trip_id, trip_date).
-
-        If ``attendance_id`` is given we trust it. Otherwise we look for the
-        attendance whose ``trip_date`` matches; if multiple match (rare —
-        only if the schema is ever extended to multi-shift days) we pick the
-        earliest ``scheduled_start``.
-        """
         if attendance_id is not None:
             return attendance_id
         att = session.exec(
@@ -101,7 +92,6 @@ class OTPService:
             select(OTPRegistry).where(OTPRegistry.attendance_id == attendance_id)
         ).first()
 
-    # ─── generate ────────────────────────────────────────────────────────────
     def generate_otp(
         self,
         session: Session,
@@ -186,7 +176,6 @@ class OTPService:
                     pass
             return None, f"OTP generation failed: {e}"
 
-    # ─── verify ──────────────────────────────────────────────────────────────
     def verify_otp(
         self,
         session: Session,
@@ -217,8 +206,6 @@ class OTPService:
         else:
             attempts = 0
 
-        # Defense in depth: ensure the caller is the trip's assigned driver,
-        # even if the router accidentally permitted otherwise in the future.
         trip = session.get(Trip, trip_id)
         if not trip:
             return False, "Trip not found"
@@ -269,7 +256,6 @@ class OTPService:
 
         return True, None
 
-    # ─── inspection helpers ──────────────────────────────────────────────────
     def is_otp_verified(
         self,
         session: Session,

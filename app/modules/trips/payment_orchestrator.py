@@ -41,12 +41,7 @@ from app.utils.time_utils import now_ist
 _EPS = 1e-6
 
 
-# --- success dispatch ---------------------------------------------------------
 def on_trip_payment_succeeded(session: Session, payment: Payment) -> None:
-    """Run the trip side effect for a Payment that just reached ``succeeded``.
-
-    Dispatch by ``payment.purpose``. Runs in the caller's transaction; does not
-    commit. Safe to call with no Redis and no request user (the webhook path)."""
     if payment.service_type != "trip":
         return
     trip = session.get(Trip, payment.service_id)
@@ -66,9 +61,7 @@ def on_trip_payment_succeeded(session: Session, payment: Payment) -> None:
     _emit_legacy_event(payment, trip)
 
 
-# --- per-purpose handlers -----------------------------------------------------
 def _handle_driver_acceptance(session: Session, payment: Payment, trip: Trip) -> None:
-    """Driver acceptance fee cleared: lock the trip to this driver and arm it."""
     trip.driver_payment_status = "paid"
     trip.driver_payment_amount = payment.amount
     session.add(trip)
@@ -76,12 +69,6 @@ def _handle_driver_acceptance(session: Session, payment: Payment, trip: Trip) ->
 
 
 def finalize_driver_acceptance(session: Session, trip: Trip) -> None:
-    """Generate the shift schedule and move the trip to active_pending_otp.
-
-    Mirrors the post-payment block of the legacy /driver/{id}/process-payment
-    endpoint so the same thing happens whether the fee settles synchronously
-    (wallet/cash) or asynchronously (platform webhook). Runs without Redis and
-    without committing — the caller owns the transaction."""
     from app.modules.trips.trip_service import TripService
 
     trip_service = TripService()
@@ -136,8 +123,6 @@ def finalize_driver_acceptance(session: Session, trip: Trip) -> None:
     if not ok:
         raise HTTPException(400, f"Status update failed: {err}")
 
-    # advance_20 / full_payment hold in `paused` until the user pays upfront
-    # (or the 1-h auto-convert-to-trip_day scheduler fires).
     if trip.payment_method in ("advance_20", "full_payment"):
         trip.status = "paused"
         trip.is_payment_blocked = True
@@ -146,16 +131,10 @@ def finalize_driver_acceptance(session: Session, trip: Trip) -> None:
 
 
 def _handle_user_upfront(session: Session, payment: Payment, trip: Trip) -> None:
-    """User upfront charge cleared → settle bills + un-block the trip."""
     apply_user_upfront_settlement(session, trip)
 
 
 def apply_user_upfront_settlement(session: Session, trip: Trip) -> None:
-    """Settle any already-generated daily bills under the trip's chosen method
-    and un-block / re-arm the trip. Mirrors the post-payment block of the legacy
-    /pay-upfront endpoint. Idempotent enough to also run on a zero-amount switch
-    (user already overpaid), where the router calls it directly without a charge.
-    Runs in the caller's transaction; does not commit."""
     from app.modules.trips.trip_service import TripService
     from app.modules.trips.billing_service import payment_method_discount_pct
 
@@ -209,8 +188,6 @@ def apply_user_upfront_settlement(session: Session, trip: Trip) -> None:
             session.add(bill)
         running_paid += bill.amount_paid or 0.0
 
-    # Un-block and re-arm: clear the block, flip any payment-paused shift back
-    # to scheduled, and move a paused trip to active_pending_otp.
     trip.is_payment_blocked = False
     for att in session.exec(
         select(TripAttendance).where(
@@ -233,8 +210,6 @@ def apply_user_upfront_settlement(session: Session, trip: Trip) -> None:
 
 
 def _handle_bill_payment(session: Session, payment: Payment, trip: Trip) -> None:
-    """A daily / cancellation_balance / schedule_diff bill was paid: settle the
-    linked TripBill row, lift any OTP-pause, and close out a cancellation."""
     from app.modules.trips.payment_service import PaymentService
 
     bill_id = (payment.extra or {}).get("bill_id")
@@ -256,7 +231,6 @@ def _handle_bill_payment(session: Session, payment: Payment, trip: Trip) -> None
 
     PaymentService(None).unpause_trip_if_clear(session, trip.id)
 
-    # F6: clear the cancellation-pending state once the shortfall is paid.
     if payment.purpose == "cancellation_balance" and trip.status == (
         "cancellation_pending_payment"
     ):
@@ -268,8 +242,6 @@ def _handle_bill_payment(session: Session, payment: Payment, trip: Trip) -> None
 
 
 def _handle_settlement_payment(session: Session, payment: Payment, trip: Trip) -> None:
-    """Final settlement paid: mark it, persist any outstation extras, auto-clear
-    remaining bills, lift pauses, and close a force-billed trip."""
     from app.modules.trips.payment_service import PaymentService
 
     settlement_id = (payment.extra or {}).get("settlement_id")
@@ -294,11 +266,10 @@ def _handle_settlement_payment(session: Session, payment: Payment, trip: Trip) -
         settlement.extra_amount_breakdown = merged
     session.add(settlement)
 
-    # Mark all associated unpaid daily bills as paid (settlement clears them).
     unpaid_bills = session.exec(
         select(TripBill).where(
             TripBill.trip_id == settlement.trip_id,
-            TripBill.is_paid == False,  # noqa: E712
+            TripBill.is_paid == False,
         )
     ).all()
     paid_at_now = now_ist()
@@ -318,7 +289,6 @@ def _handle_settlement_payment(session: Session, payment: Payment, trip: Trip) -
         session.add(trip)
 
 
-# --- refunds ------------------------------------------------------------------
 def refund_trip_amount(
     session: Session,
     trip_id: int,
@@ -328,17 +298,12 @@ def refund_trip_amount(
     actor: str = "system",
     actor_id: Optional[str] = None,
 ) -> float:
-    """Refund ``amount`` to the user by draining their succeeded trip charges
-    oldest-first via the central partial-refund path (wallet→wallet,
-    platform→source). Returns the total actually refunded."""
     from app.modules.payments import service as payment_service
 
     remaining = round(float(amount), 2)
     if remaining <= 0:
         return 0.0
 
-    # Only real money the user paid in is refundable — the "credit" channel is
-    # a ledger adjustment (e.g. a schedule_diff fare reduction), not a charge.
     payments = session.exec(
         select(Payment)
         .where(
@@ -376,7 +341,6 @@ def refund_trip_amount(
     return refunded_total
 
 
-# --- helpers ------------------------------------------------------------------
 def _sum_user_payments(
     session: Session,
     trip_id: int,
@@ -384,11 +348,6 @@ def _sum_user_payments(
     only_purposes: Optional[tuple] = None,
     exclude_purposes: Optional[tuple] = None,
 ) -> float:
-    """Sum of succeeded USER charges on a trip, optionally filtered by purpose.
-
-    Used by the upfront-credit-pool maths. ``succeeded`` and
-    ``partially_refunded`` both count as paid-in; the refunded slice is handled
-    separately where it matters."""
     stmt = select(Payment).where(
         Payment.service_type == "trip",
         Payment.service_id == trip_id,
@@ -410,8 +369,6 @@ _LEGACY_EVENT_BY_PURPOSE = {
 
 
 def _emit_legacy_event(payment: Payment, trip: Trip) -> None:
-    """Re-emit the pre-migration audit event name (with trip_id) so existing
-    log-based dashboards/alerts keep firing alongside the central events."""
     event = _LEGACY_EVENT_BY_PURPOSE.get(payment.purpose or "")
     if not event:
         return

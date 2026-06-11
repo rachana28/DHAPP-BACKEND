@@ -25,8 +25,7 @@ TIER_ESCALATION_AFTER = timedelta(minutes=10)
 def get_driver_score(
     driver: Driver, last_trip_time: datetime, active_offers_count: int
 ) -> float:
-    """Composite rank: rating (0–50) + idle-recency (0–50) − offer load (×25)."""
-    score = (driver.rating or 0) * 10  # rating contributes 0–50
+    score = (driver.rating or 0) * 10
 
     if last_trip_time:
         hours_idle = (now_ist() - last_trip_time).total_seconds() / 3600
@@ -39,7 +38,6 @@ def get_driver_score(
         elif hours_idle > 4:
             score += 10
     else:
-        # No history — boost so a new driver gets engaged early.
         score += 50
 
     if active_offers_count > 0:
@@ -48,11 +46,6 @@ def get_driver_score(
 
 
 def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
-    """Available drivers for the vehicle type, ranked by :func:`get_driver_score`.
-
-    Drivers already engaged on any in-flight trip (``DRIVER_BUSY_STATES``)
-    are excluded so one driver only ever holds one booking at a time.
-    """
     now = now_ist()
     drivers = session.exec(
         select(Driver).where(
@@ -97,7 +90,6 @@ def rank_drivers(session: Session, vehicle_type: str) -> List[Driver]:
 def create_offers_for_tier(
     session: Session, trip_id: int, drivers: List[Driver], tier: int
 ):
-    """Insert pending TripOffer rows for the given drivers at the given tier."""
     for driver in drivers:
         session.add(
             TripOffer(trip_id=trip_id, driver_id=driver.id, status="pending", tier=tier)
@@ -106,14 +98,6 @@ def create_offers_for_tier(
 
 
 def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
-    """Move trip to the next tier if due, or keep searching when the pool is dry.
-
-    D4 (keep searching forever): this NEVER auto-cancels a trip. When the fresh
-    driver pool is exhausted it restarts the offer cycle (re-offering the
-    currently-available drivers) after the escalation interval; when no driver
-    is available at all it simply leaves the trip in `searching` to retry on the
-    next tick. Returns True iff something changed (offers created/restarted).
-    """
     latest_offer = session.exec(
         select(TripOffer)
         .where(TripOffer.trip_id == trip.id)
@@ -140,8 +124,6 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
     if not should_escalate:
         return False
 
-    # If a driver already accepted, stop — the row-lock at accept time will
-    # finalise the deal, no need for another tier.
     accepted = session.exec(
         select(func.count(TripOffer.id)).where(
             TripOffer.trip_id == trip.id,
@@ -155,9 +137,6 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
     next_tier = current_tier + 1
     ranked = rank_drivers(session, trip.vehicle_type)
 
-    # Skip drivers who already have an offer on this trip (any tier, any
-    # status). Re-ranking between tiers can re-surface the same top drivers
-    # and we don't want them to see a duplicate offer they already declined.
     already_offered = set(
         session.exec(
             select(TripOffer.driver_id).where(TripOffer.trip_id == trip.id)
@@ -166,7 +145,6 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
     next_batch = [d for d in ranked if d.id not in already_offered][:TIER_SIZE]
 
     if next_batch:
-        # Earlier-tier pending offers stay alive — first to accept wins.
         create_offers_for_tier(session, trip.id, next_batch, next_tier)
         return True
 
@@ -185,7 +163,6 @@ def attempt_trip_escalation(session: Session, trip: Trip) -> bool:
 
 
 def process_tier_escalation(session: Session) -> int:
-    """Scan all `searching` trips, escalate the ones that are due. Returns count."""
     active_trips = session.exec(select(Trip).where(Trip.status == "searching")).all()
     count = 0
     for trip in active_trips:

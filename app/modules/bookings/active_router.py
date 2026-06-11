@@ -45,7 +45,6 @@ from app.core.models import (
     User,
 )
 from app.core.security import get_current_user
-from app.modules.trips.trip_service import TripService
 
 router = APIRouter(prefix="/bookings", tags=["Bookings"])
 
@@ -68,16 +67,11 @@ def _trips_section(session: Session, user_id) -> List[Dict[str, Any]]:
         .order_by(desc(Trip.booking_time))
         .options(selectinload(Trip.driver))
     ).all()
-    trip_service = TripService()
     out: List[Dict[str, Any]] = []
     for t in rows:
         view = TripReadUser.model_validate(t, from_attributes=True)
         if t.status in _DRIVER_HIDDEN_STATES:
             view.driver = None
-        elif t.driver_id is not None:
-            view.driver_skips_remaining = trip_service.driver_skips_remaining(
-                session, t.id
-            )
         out.append(view.model_dump(mode="json"))
     return out
 

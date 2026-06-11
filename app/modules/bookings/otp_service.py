@@ -32,7 +32,6 @@ def _hash(code: str) -> str:
 
 
 def _purge_db_rows(session: Session, booking_type: str, booking_id: int) -> None:
-    """Delete ALL DB OTP rows for a booking (used on verify success)."""
     rows = session.exec(
         select(BookingOTP).where(
             BookingOTP.booking_type == booking_type,
@@ -68,11 +67,6 @@ def has_active_otp(session: Session, booking_type: str, booking_id: int) -> bool
 def active_otp_view(
     session: Session, booking_type: str, booking_id: int
 ) -> Optional[Tuple[str, "object"]]:
-    """Live (plaintext, expires_at) for an active unverified OTP, or None.
-
-    Used by the user-facing summary API so the customer can read the code
-    without depending on the arrival push being delivered.
-    """
     row = _active_row(session, booking_type, booking_id)
     if row and row.otp_plain:
         return row.otp_plain, row.expires_at
@@ -93,14 +87,8 @@ def is_verified(session: Session, booking_type: str, booking_id: int) -> bool:
 
 
 def generate(session: Session, booking_type: str, booking_id: int) -> str:
-    """Create a fresh OTP, superseding any prior active (unverified) row.
-
-    Returns the plaintext code (delivered to the user out-of-band: pushed by the
-    worker on first issue, or returned to the user app on regeneration).
-    """
     now = now_ist()
 
-    # Expire any prior unverified rows so the invariant "≤1 active row" holds.
     prior = session.exec(
         select(BookingOTP).where(
             BookingOTP.booking_type == booking_type,
@@ -130,8 +118,6 @@ def generate(session: Session, booking_type: str, booking_id: int) -> str:
     session.add(otp)
     session.commit()
 
-    # Redis is primary: store the hash with a TTL equal to the remaining
-    # validity (it self-expires). The DB row above is the secondary/fallback.
     ttl = max(1, int((expires_at - now).total_seconds()))
     otp_redis.store_hash(booking_type, booking_id, otp_hash, ttl)
     return code
@@ -144,7 +130,6 @@ def verify(
     code: str,
     provider_user_id,
 ) -> Tuple[bool, Optional[str]]:
-    """Validate a manually-entered OTP. Returns (ok, error_message)."""
     row = _active_row(session, booking_type, booking_id)
     if not row:
         latest = session.exec(
@@ -165,8 +150,6 @@ def verify(
             "Too many incorrect attempts. Ask the customer to regenerate the OTP.",
         )
 
-    # Redis is primary for the hash; fall back to the DB row when Redis is down
-    # or the key is missing.
     expected_hash = otp_redis.get_hash(booking_type, booking_id) or row.otp_hash
     if _hash(code) != expected_hash:
         row.attempts += 1
@@ -175,7 +158,6 @@ def verify(
         remaining = max(row.max_attempts - row.attempts, 0)
         return False, f"Incorrect OTP. {remaining} attempt(s) left."
 
-    # Success → wipe the OTP from BOTH stores (post-verification deletion).
     otp_redis.delete(booking_type, booking_id)
     _purge_db_rows(session, booking_type, booking_id)
     return True, None

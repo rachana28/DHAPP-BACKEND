@@ -20,21 +20,15 @@ from app.core.models import (
     TripBill,
     TripSettlement,
     Driver,
+    OTPRegistry,
+    User,
 )
 from app.modules.trips.billing_service import payment_method_discount_pct
 from app.services.audit_log import emit_event as audit_emit
-from app.utils.time_utils import today_ist
+from app.utils.time_utils import now_ist, today_ist
 
 
 class TripService:
-    """State machine + skip/attendance helpers for a Trip.
-
-    Happy path: searching → accepted_pending_payment → active_pending_otp →
-    active → ongoing → (completed | auto_completed) → billed → settled.
-    Cancellation, abandon, force-close, and mid-trip shortfall live as side
-    edges — see :attr:`VALID_STATES`.
-    """
-
     VALID_STATES = {
         "searching": ["accepted_pending_payment", "no_drivers_found", "cancelled"],
         "accepted_pending_payment": [
@@ -63,8 +57,6 @@ class TripService:
             "active_pending_otp",
             "cancelled_by_driver",
         ],
-        # `paused` → `billed` is the 48-h force-close path; the final
-        # settlement covers the pending portion only.
         "paused": [
             "ongoing",
             "completed",
@@ -76,16 +68,12 @@ class TripService:
         "auto_completed": ["billed", "active_pending_otp"],
         "billed": ["settled"],
         "skipped": ["billed"],
-        # cancelled_by_user → cancellation_pending_payment when the F6 cancel
-        # maths leave the user owing a shortfall (advance_20 covered less than
-        # served + anti-fraud). User pays via cancellation_balance bill → settled.
         "cancelled_by_user": ["refund_processing", "cancellation_pending_payment"],
         "cancelled_by_driver": ["refund_processing"],
         "refund_processing": ["settled"],
         "cancellation_pending_payment": ["settled"],
     }
 
-    # States in which the assigned driver cannot accept another trip.
     DRIVER_BUSY_STATES = (
         "accepted_pending_payment",
         "payment_in_progress",
@@ -123,14 +111,7 @@ class TripService:
         expected_version: Optional[int] = None,
         commit: bool = True,
     ) -> Tuple[bool, Optional[str]]:
-        """Row-locked, audit-emitted state change with optimistic version check.
-
-        ``commit=False`` lets a caller that already owns an open transaction
-        (e.g. the trip payment orchestrator running inside a payment commit)
-        fold this transition into its own atomic commit."""
         try:
-            # Row-lock serialises parallel transitions (driver end-trip vs.
-            # auto-end scheduler, cancel vs. force-close, etc.).
             trip = session.exec(
                 select(Trip).where(Trip.id == trip_id).with_for_update()
             ).first()
@@ -175,7 +156,6 @@ class TripService:
             return False, f"State transition failed: {str(e)}"
 
     def has_pending_shifts(self, session: Session, trip_id: int) -> bool:
-        """True iff at least one attendance row is still scheduled / paused_payment."""
         row = session.exec(
             select(TripAttendance).where(
                 TripAttendance.trip_id == trip_id,
@@ -187,21 +167,6 @@ class TripService:
     def compute_outstanding_portion(
         self, session: Session, trip: Trip
     ) -> Dict[str, Any]:
-        """Outstanding (not-yet-paid / not-yet-run) portion of a booking.
-
-        Used when the user switches payment method mid-trip: the new upfront is
-        charged on this portion only, so days already completed and paid keep
-        the rate they were billed at.
-
-        Returns a dict with:
-          per_day            - gross fare for one scheduled day
-          remaining_count    - shifts still to run (scheduled / paused_payment)
-          unsettled_bills    - existing daily bills still carrying amount_due > 0
-                               (ordered by bill_date)
-          outstanding_gross  - gross fare still owed (remaining + unsettled days)
-          payments_applied   - user money already paid toward that portion
-          total_attendance   - number of attendance rows (0 before scheduling)
-        """
         fare = trip.fare or 0.0
 
         attendances = session.exec(
@@ -227,11 +192,6 @@ class TripService:
             (b.amount_paid or 0.0) for b in daily_bills if (b.amount_due or 0.0) <= 0
         )
 
-        # advance_20 / full_payment days never have a daily bill — the upfront
-        # credit those completed days consumed is derived from attendance
-        # instead, so the remaining-credit maths stays correct (this exactly
-        # reproduces the old "settled bill amount_paid" the auto-paid advance/
-        # full daily bills used to contribute).
         billed_dates = {b.bill_date for b in daily_bills}
         completed_unbilled = [
             a
@@ -245,8 +205,6 @@ class TripService:
         consumed_advfull = round(per_day_net * len(completed_unbilled), 2)
 
         if total_att == 0:
-            # Pre-scheduling (method chosen before the driver accepted): the
-            # whole fare is still outstanding.
             outstanding_gross = round(fare, 2)
         else:
             outstanding_gross = round(
@@ -436,7 +394,6 @@ class TripService:
             session.rollback()
             return False, f"Attendance record creation failed: {str(e)}"
 
-    # Trip states from which a user-initiated cancel is structurally impossible.
     _NON_CANCELLABLE_STATES = (
         "completed",
         "auto_completed",
@@ -459,33 +416,11 @@ class TripService:
         user_id: Optional[str] = None,
         driver_id: Optional[int] = None,
     ) -> Tuple[bool, Optional[str], bool]:
-        """User-initiated cancellation gate.
-
-        Rules (real-time scenarios):
-          * Driver-initiated cancellations are NOT supported here — drivers must
-            reject offers via /accept-and-pay action="reject" instead.
-          * Terminal / non-cancellable states are blocked.
-          * status == "ongoing" or "active": a shift is physically running, the
-            driver is engaged — block until it ends.
-          * payment_method == "trip_day": cancel allowed in any non-terminal
-            state PROVIDED there is no outstanding daily bill and the trip is
-            not paused for payment. Completed shifts are already paid for, so
-            no refund is owed and no driver is at a loss for those days.
-          * payment_method in ("advance_20", "full_payment"): cancel allowed
-            ONLY if no shift has ever been started (actual_start_time is None
-            and no attendance is marked present). Once any shift is done, the
-            trip must run to completion so the deferred / upfront balance is
-            settled normally.
-
-        Returns:
-            (allowed, reason, has_completed_shift)
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
                 return False, "Trip not found", False
 
-            # Driver flow is no longer supported.
             if driver_id is not None:
                 return (
                     False,
@@ -513,7 +448,6 @@ class TripService:
                     has_completed_shift,
                 )
 
-            # A shift is currently in progress — driver is engaged.
             if trip.status in ("ongoing", "active"):
                 return (
                     False,
@@ -522,27 +456,15 @@ class TripService:
                 )
 
             if trip.payment_method == "trip_day":
-                # Pause due to outstanding daily bill: user must clear the bill first.
                 if trip.is_payment_blocked or trip.status == "paused":
                     return (
                         False,
                         "Trip is paused due to an unpaid bill. Pay the outstanding amount before cancelling.",
                         has_completed_shift,
                     )
-                # Caller (router) does the unpaid-bill check via PaymentService
-                # so the gate here stays free of payment lookups beyond the
-                # trip's own flags.
                 return True, None, has_completed_shift
 
             if trip.payment_method in ("advance_20", "full_payment"):
-                # F6: mid-trip cancellation is now allowed. The cancel
-                # endpoint computes refund = upfront − served_days × per_day
-                # − ₹50 × user_skipped_days. If positive, refund. If negative,
-                # the user owes the shortfall and the trip parks in
-                # `cancellation_pending_payment` until they pay.
-                # Issue 8: while the upfront is still unpaid the trip is paused.
-                # No proceed action (including cancel) is allowed until the user
-                # either pays the upfront or reverts the method to trip-day.
                 if trip.is_payment_blocked or trip.status == "paused":
                     return (
                         False,
@@ -551,42 +473,17 @@ class TripService:
                         "before cancelling.",
                         has_completed_shift,
                     )
-                # Issue 5: upfront paid, no shift ended yet — cancellation IS
-                # allowed. The router applies the ₹50-per-skipped-day deduction
-                # (0 skipped days => full 100% refund).
                 return True, None, has_completed_shift
 
-            # Payment method not yet selected (early states like "searching").
-            # No payment exists, so cancel is safe.
             return True, None, has_completed_shift
 
         except Exception as e:
             return False, f"Cancellation validation failed: {str(e)}", False
 
     def get_selectable_payment_methods(self, session: Session, trip: Trip) -> list:
-        """Payment methods the user may switch this trip TO right now.
-
-        Drives the `selectablePaymentMethod` field of the summary API (Issue 3)
-        so the app only ever offers a legal change:
-
-          * Outstation              -> [] (billed once at trip end, no choice)
-          * current trip_day        -> ["advance_20", "full_payment"]
-          * advance_20, upfront pending -> ["trip_day", "full_payment"]
-          * advance_20, upfront paid    -> ["full_payment"]
-          * full_payment, upfront pending -> ["trip_day", "advance_20"]
-          * full_payment, upfront paid    -> []
-
-        "upfront pending" means the user picked advance_20 / full_payment but
-        has not paid the upfront yet (is_payment_blocked still set) — they are
-        not locked in and may still revert to trip_day (Issue 1).
-
-        Once every shift is done only the final settlement is left, so nothing
-        is selectable.
-        """
         if (trip.hiring_type or "").strip().lower() == "outstation":
             return []
 
-        # All shifts done -> only the final settlement remains.
         attendance_count = len(
             session.exec(
                 select(TripAttendance.id).where(TripAttendance.trip_id == trip.id)
@@ -641,16 +538,12 @@ class TripService:
         except Exception as e:
             return False, f"Marking present failed: {str(e)}"
 
-    # Driver skip cap per booking, measured over a rolling window (calendar-
-    # month gaming → 6 skips in 72h across Nov 30 / Dec 1 / Dec 2). Users
-    # unlimited; skipped_by_system doesn't count — only driver-initiated.
     DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW = 3
     DRIVER_SKIP_WINDOW_DAYS = 30
 
     def count_driver_skips_for_trip_in_window(
         self, session: Session, trip_id: int, ref_date: date
     ) -> int:
-        """Driver-initiated skips in the 30-day window ending at ref_date."""
         window_start = ref_date - timedelta(days=self.DRIVER_SKIP_WINDOW_DAYS - 1)
         rows = session.exec(
             select(TripAttendance.id).where(
@@ -665,7 +558,6 @@ class TripService:
     def driver_skips_remaining(
         self, session: Session, trip_id: int, ref_date: Optional[date] = None
     ) -> int:
-        """Skips left in the 30-day window ending at ref_date (default: today)."""
         ref = ref_date or today_ist()
         used = self.count_driver_skips_for_trip_in_window(session, trip_id, ref)
         return max(0, self.DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW - used)
@@ -697,16 +589,12 @@ class TripService:
                     f"Cannot skip day with status '{attendance.status}'.",
                 )
 
-            # Block skipping a shift that has already physically started.
-            # End-trip is the correct path once OTP has been verified.
             if attendance.user_otp_verified or attendance.driver_otp_verified:
                 return (
                     False,
                     "Cannot skip a day that has already started. Use end-trip instead.",
                 )
 
-            # Driver-initiated skips are capped per 30-day rolling window on
-            # this trip booking; user-initiated skips remain unlimited.
             if marked_by == "driver":
                 used = self.count_driver_skips_for_trip_in_window(
                     session, trip_id, trip_date
@@ -726,8 +614,6 @@ class TripService:
             session.add(attendance)
             session.commit()
 
-            # If this was the last pending shift, push the trip to a terminal
-            # state so it doesn't sit forever in active_pending_otp / paused.
             if not self.has_pending_shifts(session, trip_id):
                 trip = session.get(Trip, trip_id)
                 if trip and trip.status in (
@@ -735,8 +621,6 @@ class TripService:
                     "paused",
                     "ongoing",
                 ):
-                    # If no shift was ever started, the trip closes as `skipped`;
-                    # otherwise it closes as `completed`.
                     has_any_present = session.exec(
                         select(TripAttendance).where(
                             TripAttendance.trip_id == trip_id,
@@ -744,13 +628,115 @@ class TripService:
                         )
                     ).first()
                     target = "completed" if has_any_present else "skipped"
-                    # Allow direct hop from paused/ongoing to skipped/completed.
                     self.transition_trip_state(session, trip_id, target, validate=False)
 
             return True, None
 
         except Exception as e:
             return False, f"Marking absent failed: {str(e)}"
+
+    def build_driver_actions(
+        self, session: Session, trip: Trip, attendances: List[TripAttendance]
+    ) -> Dict[str, Any]:
+        now = now_ist()
+        today = today_ist()
+
+        next_shift_att = next(
+            (
+                a
+                for a in attendances
+                if a.status in ("scheduled", "paused_payment")
+                and not a.user_otp_verified
+            ),
+            None,
+        )
+
+        next_shift = None
+        if next_shift_att is not None:
+            next_shift = {
+                "trip_date": next_shift_att.trip_date,
+                "scheduled_start": next_shift_att.scheduled_start,
+                "scheduled_end": next_shift_att.scheduled_end,
+                "is_today": next_shift_att.trip_date == today,
+            }
+
+        can_verify_otp = bool(
+            trip.status == "active_pending_otp"
+            and not trip.is_payment_blocked
+            and next_shift_att is not None
+            and next_shift_att.scheduled_start - timedelta(minutes=30)
+            <= now
+            <= next_shift_att.scheduled_start + timedelta(hours=12)
+        )
+
+        otp_pending = False
+        if next_shift_att is not None:
+            otp_pending = (
+                session.exec(
+                    select(OTPRegistry).where(
+                        OTPRegistry.attendance_id == next_shift_att.id,
+                        OTPRegistry.verified_at.is_(None),
+                        OTPRegistry.otp_expiry_at > now,
+                    )
+                ).first()
+                is not None
+            )
+
+        skips_remaining = self.driver_skips_remaining(session, trip.id)
+        can_skip = bool(
+            next_shift_att is not None
+            and next_shift_att.trip_date == today
+            and not next_shift_att.driver_otp_verified
+            and trip.status not in ("ongoing", "paused")
+            and not trip.is_payment_blocked
+            and (trip.hiring_type or "").strip().lower() != "outstation"
+            and skips_remaining > 0
+        )
+
+        present_any = any(a.status == "present" for a in attendances)
+        can_withdraw = bool(
+            not present_any
+            and trip.status
+            in ("accepted_pending_payment", "active_pending_otp", "paused")
+        )
+        can_abandon = bool(
+            present_any
+            and trip.status in ("active_pending_otp", "active", "ongoing", "paused")
+        )
+
+        open_bills = session.exec(
+            select(TripBill)
+            .where(
+                TripBill.trip_id == trip.id,
+                TripBill.bill_type.in_(
+                    ("daily_bill", "advance_recovery", "schedule_diff")
+                ),
+                TripBill.amount_due > 0,
+            )
+            .order_by(TripBill.bill_date)
+        ).all()
+        bill_to_collect = round(sum(b.amount_due or 0.0 for b in open_bills), 2)
+
+        return {
+            "next_shift": next_shift,
+            "can_verify_otp": can_verify_otp,
+            "otp_pending": otp_pending,
+            "can_skip": can_skip,
+            "skips_remaining": skips_remaining,
+            "can_end": trip.status == "ongoing",
+            "can_withdraw": can_withdraw,
+            "can_abandon": can_abandon,
+            "bill_to_collect": bill_to_collect,
+            "open_bills": [
+                {
+                    "bill_id": b.id,
+                    "bill_type": b.bill_type,
+                    "bill_date": b.bill_date,
+                    "amount_due": b.amount_due,
+                }
+                for b in open_bills
+            ],
+        }
 
     def get_trip_summary(
         self, session: Session, trip_id: int, is_driver: bool
@@ -772,9 +758,6 @@ class TripService:
                 [a for a in attendances if a.status in ("scheduled", "paused_payment")]
             )
 
-            # Source of truth: attendance rows. Trip-level scheduled/actual fields
-            # rotate to the *current* shift, so they don't represent the booking's
-            # overall start — and they may be null before the first shift fires.
             if attendances:
                 total_days = len(attendances)
                 first_att = attendances[0]
@@ -800,13 +783,9 @@ class TripService:
                 actual_start = min(actual_starts) if actual_starts else None
                 actual_end = max(actual_ends) if actual_ends else None
             else:
-                # Attendance rows aren't created until the driver-payment callback
-                # runs. Synthesize the planned schedule so summaries before that
-                # point still show meaningful totals/timings.
                 total_days = self._expected_total_days(
                     trip.start_date, trip.end_date, trip.selected_days
                 )
-                # No attendance rows yet => every planned day is pending.
                 pending_count = total_days
                 scheduled_start = trip.scheduled_start_time or self.get_trip_start_time(
                     trip.shift_details, trip.start_date
@@ -827,16 +806,11 @@ class TripService:
                 actual_start = trip.actual_start_time
                 actual_end = trip.actual_end_time
 
-            # Final fallback: never return null for scheduled_start when start_date exists.
             if not scheduled_start and trip.start_date:
                 scheduled_start = self.get_trip_start_time(
                     trip.shift_details, trip.start_date
                 ) or datetime.combine(trip.start_date, datetime.min.time())
 
-            # Include refunded/partially_refunded here so total_user_paid stays
-            # the GROSS amount paid (matching the legacy success-row sum, which
-            # was never reduced by a refund) and total_amount_refunded can be
-            # derived from each charge's refunded_amount below.
             _paid_states = ["succeeded", "partially_refunded", "refunded"]
             user_payments = session.exec(
                 select(Payment).where(
@@ -858,11 +832,6 @@ class TripService:
 
             user_paid = sum(p.amount for p in user_payments)
 
-            # Financials are derived from the actual daily bills + final
-            # settlement, so they stay correct after a mid-trip payment-method
-            # switch and reflect the per-bill discounts baked in by
-            # generate_daily_bill (advance_20 2% / full_payment 5% /
-            # outstation 3%).
             daily_bills = session.exec(
                 select(TripBill).where(
                     TripBill.trip_id == trip_id,
@@ -873,9 +842,6 @@ class TripService:
                 select(TripSettlement).where(TripSettlement.trip_id == trip_id)
             ).first()
 
-            # Upfront still owed: only while the trip is blocked awaiting an
-            # advance_20 / full_payment upfront (initial choice or a mid-trip
-            # switch) — charged on the still-outstanding portion only.
             upfront_amount_due = 0.0
             if trip.is_payment_blocked and trip.payment_method in (
                 "advance_20",
@@ -892,15 +858,11 @@ class TripService:
                     ),
                 )
 
-            # Amount still due: the final settlement balance once generated,
-            # otherwise the sum of unpaid daily bills raised so far.
             if settlement is not None:
                 amount_due = round(settlement.remaining_due or 0.0, 2)
             else:
                 amount_due = round(sum((b.amount_due or 0.0) for b in daily_bills), 2)
 
-            # Collect any user-supplied notes captured at payment time so the
-            # summary can show what the user wrote alongside each payment.
             payment_notes: List[Dict[str, Any]] = []
             for b in daily_bills:
                 if b.payment_note:
@@ -934,31 +896,14 @@ class TripService:
                 "present_days": present_count,
                 "absent_days": absent_count,
                 "pending_days": pending_count,
-                "total_user_paid": user_paid,
                 "scheduled_start": scheduled_start,
                 "scheduled_end": scheduled_end,
                 "actual_start": actual_start,
                 "actual_end": actual_end,
                 "fare": trip.fare,
                 "fare_breakdown": trip.fare_breakdown,
-                "amount_due": amount_due,
-                "payment_notes": payment_notes,
             }
 
-            if trip.payment_method in ("advance_20", "full_payment"):
-                result["upfront_amount_due"] = upfront_amount_due
-
-            # Total refunded to the user — surfaced only for a cancelled trip.
-            # On the centralized ledger a refund is the ``refunded_amount`` on
-            # the user's original charge (full or partial), not a separate row;
-            # driver-fee refunds carry payer_type="driver" and are excluded here.
-            if (trip.status or "").startswith("cancel"):
-                result["total_amount_refunded"] = round(
-                    sum(p.refunded_amount or 0.0 for p in user_payments), 2
-                )
-
-            # Outstation trips are point-to-point, so the booked route
-            # (locations + coordinates) is part of the trip summary.
             if (trip.hiring_type or "").strip().lower() == "outstation":
                 result["start_location"] = trip.start_location
                 result["end_location"] = trip.end_location
@@ -966,21 +911,37 @@ class TripService:
                 result["start_lng"] = trip.start_lng
                 result["end_lat"] = trip.end_lat
                 result["end_lng"] = trip.end_lng
-                # Extra amount the user voluntarily paid on top of the
-                # settlement remaining_due (toll/parking/food/etc.).
+
+            if is_driver:
+                result["total_driver_paid"] = sum(p.amount for p in driver_payments)
+                rider = session.get(User, trip.user_id)
+                result["user"] = {
+                    "full_name": rider.full_name if rider else None,
+                    "avatar_url": rider.avatar_url if rider else None,
+                }
+                result["actions"] = self.build_driver_actions(
+                    session, trip, attendances
+                )
+                return result
+
+            result["total_user_paid"] = user_paid
+            result["amount_due"] = amount_due
+            result["payment_notes"] = payment_notes
+
+            if trip.payment_method in ("advance_20", "full_payment"):
+                result["upfront_amount_due"] = upfront_amount_due
+
+            if (trip.status or "").startswith("cancel"):
+                result["total_amount_refunded"] = round(
+                    sum(p.refunded_amount or 0.0 for p in user_payments), 2
+                )
+
+            if (trip.hiring_type or "").strip().lower() == "outstation":
                 result["extra_amount_paid"] = round(
                     (settlement.extra_amount_paid or 0.0) if settlement else 0.0,
                     2,
                 )
 
-            if is_driver:
-                result["total_driver_paid"] = sum(p.amount for p in driver_payments)
-
-            # Driver details — surfaced once the driver has accepted AND paid
-            # the acceptance fee. Issue 6: the trip's own driver_payment_status
-            # is the primary signal (set to "paid" in driver_accept_payment),
-            # with a successful "driver_acceptance" transaction as a fallback —
-            # so the driver block reliably appears in the summary.
             driver_detail: Dict[str, Any] = {}
             driver_paid_acceptance = trip.driver_payment_status == "paid" or any(
                 p.purpose == "driver_acceptance" for p in driver_payments
@@ -1002,8 +963,6 @@ class TripService:
                     }
             result["driver"] = driver_detail
 
-            # Issue 3: payment methods the user may switch to right now, given
-            # the current method and whether the upfront has been paid.
             result["selectablePaymentMethod"] = self.get_selectable_payment_methods(
                 session, trip
             )

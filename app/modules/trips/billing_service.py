@@ -7,8 +7,10 @@ discount is baked into the daily bill total so the user-visible amount is
 the actual amount due, not gross.
 """
 
+import math
 from datetime import date
 
+from app.utils.notifications import notify_safe
 from app.utils.time_utils import today_ist, now_ist
 from typing import Optional, Tuple, Dict, Any
 from sqlmodel import Session, select
@@ -23,22 +25,12 @@ from app.core.models import (
     PricingComponentBreakdown,
 )
 
-# Trip charges count as "paid in" while succeeded or partially refunded — a
-# partial refund leaves the original charge amount intact on the ledger.
 _PAID_IN_STATES = ["succeeded", "partially_refunded"]
 
 
 def payment_method_discount_pct(
     hiring_type: Optional[str], payment_method: Optional[str]
 ) -> float:
-    """Discount % baked into a trip's billing for the given payment method.
-
-    Outstation trips are billed once at the end of the trip and always carry a
-    flat 3% discount regardless of payment method. For every other hiring type:
-      * full_payment -> 5%
-      * advance_20   -> 2%
-      * trip_day / unset -> 0%
-    """
     if (hiring_type or "").strip().lower() == "outstation":
         return 3.0
     if payment_method == "full_payment":
@@ -49,35 +41,14 @@ def payment_method_discount_pct(
 
 
 class BillingService:
-    """Generate per-day bills (trip_day) and the final settlement row."""
-
     def calculate_daily_bill_components(
         self, session: Session, trip_id: int, trip_date: date
     ) -> Tuple[Dict[str, float], float, Optional[str]]:
-        """
-        Calculate billing components for a specific day.
-
-        (Derives from trip.fare_breakdown instead of hardcoded assumptions)
-
-        For multi-day trips:
-          - trip.fare is the TOTAL for all days
-          - trip.fare_breakdown contains the per-component split (e.g., Driver Allowance (N days), ...)
-          - daily_total = trip.fare / num_days (from attendance count)
-
-        Components:
-        - Base fare (prorated daily)
-        - Vehicle allowance (prorated daily)
-        - Taxes (prorated daily)
-
-        Returns:
-            Tuple of (components_dict, total_amount, error_message)
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
                 return {}, 0.0, "Trip not found"
 
-            # Get all attendance records for this trip to calculate per-day amount
             attendances = session.exec(
                 select(TripAttendance).where(TripAttendance.trip_id == trip_id)
             ).all()
@@ -86,15 +57,9 @@ class BillingService:
             if num_days == 0:
                 return {}, 0.0, "No attendance records found for trip"
 
-            # If trip.fare and fare_breakdown exist, derive daily components
             if trip.fare and trip.fare_breakdown:
-                # Simple pro-rata: daily_total = total / num_days
                 daily_total = trip.fare / num_days
 
-                # fare_breakdown is the full dict produced by pricing_calculator
-                # (keys: total, subtotal, tax, currency, components, meta). The
-                # itemised component list lives at fare_breakdown["components"].
-                # Older rows may have stored the bare list directly.
                 breakdown = trip.fare_breakdown
                 comp_list = None
                 if isinstance(breakdown, dict):
@@ -119,14 +84,11 @@ class BillingService:
                             daily_amount = amt / num_days if num_days > 0 else 0
                             components[comp["name"]] = daily_amount
 
-                # Fallback if component list was empty/unparseable: keep the
-                # daily total visible as a single line so the bill is never blank.
                 if not components:
                     components["Base Fare"] = daily_total
 
                 return components, daily_total, None
 
-            # Fallback if fare_breakdown is not populated (shouldn't happen with new engine)
             if trip.fare:
                 daily_fare = trip.fare / num_days
                 components = {"Base Fare": daily_fare}
@@ -140,29 +102,14 @@ class BillingService:
     def generate_daily_bill(
         self, session: Session, trip_id: int, trip_date: date
     ) -> Tuple[bool, Optional[int], Optional[str]]:
-        """
-        Generate a daily bill for a trip day
-
-        (auto-mark bill is_paid=True when amount_due == 0 at generation time,
-        so advance_20 and full_payment upfront payments don't create unpaid bills.)
-
-        Returns:
-            Tuple of (success, bill_id, error_message)
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
                 return False, None, "Trip not found"
 
-            # Daily bills are a trip_day-only mechanism. advance_20 and
-            # full_payment are settled via the upfront payment plus the final
-            # settlement (earnings are prorated from attendance in
-            # generate_final_settlement), so no per-day TripBill row is ever
-            # created for them.
             if trip.payment_method in ("advance_20", "full_payment"):
                 return True, None, None
 
-            # Check if bill already exists for this day
             existing_bill = session.exec(
                 select(TripBill).where(
                     TripBill.trip_id == trip_id,
@@ -174,7 +121,6 @@ class BillingService:
             if existing_bill:
                 return False, existing_bill.id, "Bill already exists for this day"
 
-            # Calculate components (gross — before any payment-method discount)
             components, gross_amount, error = self.calculate_daily_bill_components(
                 session, trip_id, trip_date
             )
@@ -182,9 +128,6 @@ class BillingService:
             if error:
                 return False, None, error
 
-            # Payment-method discount is baked into the bill so total_amount is
-            # always the net amount actually owed for the day:
-            #   outstation 3% (flat) · full_payment 5% · advance_20 2% · trip_day 0%
             discount_pct = payment_method_discount_pct(
                 trip.hiring_type, trip.payment_method
             )
@@ -208,10 +151,6 @@ class BillingService:
                     TripBill.bill_type == "daily_bill",
                 )
             ).all()
-            # trip_day daily bills are cleared with their own cash (a
-            # "trip_day_bill" transaction), not from the advance/full upfront
-            # pool. Exclude that cash so a mid-trip payment-method switch keeps
-            # the remaining-credit maths correct for the days billed afterwards.
             trip_day_cash = sum(
                 p.amount
                 for p in session.exec(
@@ -235,7 +174,6 @@ class BillingService:
 
             is_paid = amount_due == 0
 
-            # Build the JSON-friendly components list (uniform schema across the system)
             components_list = [
                 {
                     "name": name,
@@ -246,8 +184,6 @@ class BillingService:
                 }
                 for name, amount in components.items()
             ]
-            # Surface the payment-method discount as its own line so the
-            # component breakdown still sums to total_amount.
             if discount_amount > 0:
                 components_list.append(
                     {
@@ -257,7 +193,6 @@ class BillingService:
                     }
                 )
 
-            # Create bill
             bill = TripBill(
                 trip_id=trip_id,
                 user_id=trip.user_id,
@@ -270,12 +205,12 @@ class BillingService:
                 discount_percentage=discount_pct or None,
                 discount_amount=discount_amount,
                 is_paid=is_paid,
-                paid_at=now_ist() if is_paid else None,  # Also set paid_at if auto-paid
+                paid_at=now_ist() if is_paid else None,
                 is_generated=True,
                 components=components_list,
             )
             session.add(bill)
-            session.flush()  # need bill.id for component FK linkage
+            session.flush()
 
             for entry in components_list:
                 pricing_component = PricingComponentBreakdown(
@@ -296,24 +231,120 @@ class BillingService:
         except Exception as e:
             return False, None, f"Daily bill generation failed: {str(e)}"
 
+    def check_advance_recovery(self, session: Session, trip_id: int) -> Optional[int]:
+        trip = session.get(Trip, trip_id)
+        if not trip or trip.payment_method != "advance_20":
+            return None
+        if trip.is_payment_blocked or not trip.driver_id:
+            return None
+        if trip.status not in ("active_pending_otp", "active", "ongoing", "paused"):
+            return None
+
+        existing = session.exec(
+            select(TripBill).where(
+                TripBill.trip_id == trip_id,
+                TripBill.bill_type == "advance_recovery",
+            )
+        ).first()
+        if existing:
+            return existing.id
+
+        attendances = session.exec(
+            select(TripAttendance).where(TripAttendance.trip_id == trip_id)
+        ).all()
+        total = len(attendances)
+        if total <= 1:
+            return None
+        if not any(a.status in ("scheduled", "paused_payment") for a in attendances):
+            return None
+        concluded = sum(
+            1
+            for a in attendances
+            if a.status
+            in ("present", "skipped_by_user", "skipped_by_driver", "skipped_by_system")
+        )
+        if concluded < math.ceil(total / 2):
+            return None
+
+        fare = float(trip.fare or 0.0)
+        if fare <= 0:
+            return None
+        discount_pct = payment_method_discount_pct(
+            trip.hiring_type, trip.payment_method
+        )
+        per_day_net = (fare / total) * (1 - discount_pct / 100.0)
+        expected_net_total = round(per_day_net * total, 2)
+
+        total_user_paid = sum(
+            p.amount
+            for p in session.exec(
+                select(Payment).where(
+                    Payment.service_type == "trip",
+                    Payment.service_id == trip_id,
+                    Payment.payer_type == "user",
+                    Payment.status.in_(_PAID_IN_STATES),
+                )
+            ).all()
+        )
+        remaining = round(expected_net_total - total_user_paid, 2)
+        amount = round(remaining / 2.0, 2)
+        if amount <= 0:
+            return None
+
+        bill = TripBill(
+            trip_id=trip_id,
+            user_id=trip.user_id,
+            driver_id=trip.driver_id,
+            bill_type="advance_recovery",
+            bill_date=today_ist(),
+            total_amount=amount,
+            amount_paid=0.0,
+            amount_due=amount,
+            discount_percentage=discount_pct or None,
+            discount_amount=0.0,
+            is_generated=True,
+            is_paid=False,
+            notes=(
+                f"Mid-trip recovery: half of the remaining balance after "
+                f"{concluded}/{total} scheduled days concluded."
+            ),
+            components=[
+                {
+                    "name": "Mid-trip Recovery (half of remaining balance)",
+                    "amount": amount,
+                    "percentage": 100.0,
+                }
+            ],
+        )
+        session.add(bill)
+        session.commit()
+        session.refresh(bill)
+
+        notify_safe(
+            session,
+            [trip.user_id],
+            "Mid-trip payment due",
+            (
+                f"Half of your trip's remaining balance (₹{amount:.2f}) is now "
+                f"due. Pay it to keep your upcoming shifts active."
+            ),
+            {
+                "type": "advance_recovery_bill",
+                "trip_id": trip.id,
+                "bill_id": bill.id,
+                "amount": amount,
+            },
+        )
+        return bill.id
+
     def generate_final_settlement(
         self, session: Session, trip_id: int
     ) -> Tuple[bool, Optional[int], Optional[str]]:
-        """
-        Generate final settlement after all trip days complete
-
-        Returns:
-            Tuple of (success, settlement_id, error_message)
-        """
         try:
             trip = session.get(Trip, trip_id)
             if not trip:
                 return False, None, "Trip not found"
 
-            # Idempotency under concurrency: lock the trip row so two parallel
-            # settle paths (driver end-trip vs auto-end vs daily-settlement
-            # scheduler) cannot both pass the existence check and create
-            # duplicate settlements. The lock is released on commit/rollback.
             session.exec(
                 select(Trip).where(Trip.id == trip_id).with_for_update()
             ).first()
@@ -329,22 +360,14 @@ class BillingService:
                     "Settlement already exists for this trip",
                 )
 
-            # Get all attendance records
             attendances = session.exec(
                 select(TripAttendance).where(TripAttendance.trip_id == trip_id)
             ).all()
 
-            # Count trip statuses
             present_count = len([a for a in attendances if a.status == "present"])
             absent_count = len([a for a in attendances if "skipped" in a.status])
             total_trips = len(attendances)
 
-            # Calculate total earned.
-            #   * trip_day days are billed per-day -> use each daily bill total
-            #     (preserves per-day precision, incl. outstation's flat 3%).
-            #   * advance_20 / full_payment days carry NO daily bill -> prorate
-            #     them from trip.fare at the method's discount, so the
-            #     remaining balance is still charged correctly at settlement.
             daily_bills = session.exec(
                 select(TripBill).where(
                     TripBill.trip_id == trip_id, TripBill.bill_type == "daily_bill"
@@ -367,7 +390,6 @@ class BillingService:
                 per_day_net = per_day_gross * (1 - discount_pct / 100.0)
                 total_earned += per_day_net * len(unbilled_present)
 
-            # Calculate payments
             user_payments = session.exec(
                 select(Payment).where(
                     Payment.service_type == "trip",
@@ -389,15 +411,40 @@ class BillingService:
             total_user_paid = sum(p.amount for p in user_payments)
             total_driver_paid = sum(p.amount for p in driver_payments)
 
-            # Daily bills already carry their payment-method discount inside
-            # total_amount (see generate_daily_bill / payment_method_discount_pct),
-            # so the summed earnings are already net — nothing more to deduct.
             final_earned = round(total_earned, 2)
 
-            # Calculate remaining balance
             remaining_due = max(0, final_earned - total_user_paid)
 
-            # Create settlement
+            net_user_paid = round(
+                sum(p.amount - (p.refunded_amount or 0.0) for p in user_payments), 2
+            )
+            refund_amount = 0.0
+            if remaining_due <= 0 and net_user_paid > final_earned:
+                from app.modules.trips import payment_orchestrator
+
+                try:
+                    refund_amount = payment_orchestrator.refund_trip_amount(
+                        session,
+                        trip_id,
+                        round(net_user_paid - final_earned, 2),
+                        "Trip settlement refund (paid more than earned)",
+                    )
+                except Exception:
+                    session.rollback()
+                    refund_amount = 0.0
+                    session.exec(
+                        select(Trip).where(Trip.id == trip_id).with_for_update()
+                    ).first()
+                    raced = session.exec(
+                        select(TripSettlement).where(TripSettlement.trip_id == trip_id)
+                    ).first()
+                    if raced:
+                        return (
+                            False,
+                            raced.id,
+                            "Settlement already exists for this trip",
+                        )
+
             settlement = TripSettlement(
                 trip_id=trip_id,
                 user_id=trip.user_id,
@@ -410,6 +457,7 @@ class BillingService:
                 total_earned=final_earned,
                 total_paid_upfront=total_user_paid,
                 remaining_due=remaining_due,
+                refund_amount=refund_amount,
                 user_payment_status="pending" if remaining_due > 0 else "paid",
                 driver_payment_status="paid",
                 settlement_date=today_ist(),
@@ -426,18 +474,11 @@ class BillingService:
     def get_bill_details(
         self, session: Session, bill_id: int
     ) -> Optional[Dict[str, Any]]:
-        """
-        Get detailed bill information
-
-        Returns:
-            Dict with bill details or None
-        """
         try:
             bill = session.get(TripBill, bill_id)
             if not bill:
                 return None
 
-            # Get components
             components_records = session.exec(
                 select(PricingComponentBreakdown).where(
                     PricingComponentBreakdown.bill_id == bill_id
@@ -465,12 +506,6 @@ class BillingService:
     def get_settlement_details(
         self, session: Session, settlement_id: int
     ) -> Optional[Dict[str, Any]]:
-        """
-        Get detailed settlement information
-
-        Returns:
-            Dict with settlement details or None
-        """
         try:
             settlement = session.get(TripSettlement, settlement_id)
             if not settlement:

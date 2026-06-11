@@ -1,3 +1,11 @@
+"""Driver profile API.
+
+Self-service endpoints for the authenticated driver (profile read/update,
+profile picture, labelled KYC documents, bank payout details, passbook) plus
+the public driver directory (list, detail, reviews) consumed by the user app.
+/me responses are short-TTL cached and invalidated on every write.
+"""
+
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.encoders import jsonable_encoder
@@ -32,11 +40,7 @@ def _driver_me_key(current_driver: Driver) -> str:
 def read_current_driver_profile(
     current_driver: Driver = Depends(get_current_active_driver),
 ):
-    """
-    Get the full profile for the currently authenticated driver.
-
-    Redis-cached; invalidated on profile/picture/document writes below.
-    """
+    """Get the full profile for the currently authenticated driver."""
     key = _driver_me_key(current_driver)
     cached = cache.cache_get_json(key)
     if cached is not None:
@@ -56,9 +60,7 @@ def update_current_driver_profile(
     driver_update: DriverUpdate,
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Update the profile for the currently authenticated driver.
-    """
+    """Update the profile for the currently authenticated driver."""
     update_data = driver_update.model_dump(exclude_unset=True)
 
     for key, value in update_data.items():
@@ -71,7 +73,6 @@ def update_current_driver_profile(
     session.commit()
     session.refresh(current_driver)
 
-    # Invalidate cache
     if redis_client:
         redis_client.delete("drivers")
         redis_client.delete(f"driver_{current_driver.id}")
@@ -87,15 +88,11 @@ async def update_driver_profile_picture(
     current_driver: Driver = Depends(get_current_active_driver),
     file: UploadFile = File(...),
 ):
-    """
-    Update the profile picture for the currently authenticated user by uploading to Cloudflare R2.
-    """
-    # Upload to R2 and get the public URL
+    """Update the profile picture for the currently authenticated user by uploading to Cloudflare R2."""
     public_url = await upload_profile_picture_to_r2(
         file, "driver", str(current_driver.id)
     )
 
-    # Save the R2 URL to the database
     current_driver.profile_picture_url = public_url
     session.add(current_driver)
     session.commit()
@@ -110,9 +107,7 @@ def read_drivers(
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Get a list of all drivers with their public profiles.
-    """
+    """Get a list of all drivers with their public profiles."""
     if redis_client:
         cached_drivers = redis_client.get("drivers")
         if cached_drivers:
@@ -129,7 +124,6 @@ def read_drivers(
         )
 
     if redis_client:
-        # Correctly serialize the list of Pydantic models
         redis_client.set(
             "drivers", json.dumps(jsonable_encoder(public_drivers)), ex=3600
         )
@@ -143,9 +137,7 @@ def read_driver(
     session: Session = Depends(get_session),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """
-    Get a single driver's public profile.
-    """
+    """Get a single driver's public profile."""
     if redis_client:
         cached_driver = redis_client.get(f"driver_{driver_id}")
         if cached_driver:
@@ -176,9 +168,7 @@ def get_driver_reviews(
     page: int = Query(1, gt=0),
     limit: int = Query(5, gt=0, le=50),
 ):
-    """
-    Get reviews for a specific driver with pagination.
-    """
+    """Get reviews for a specific driver with pagination."""
     driver = get_by_reference(session, Driver, driver_id)
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
@@ -202,12 +192,7 @@ async def upload_verification_document(
     doc_type: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """
-    Upload a labelled KYC document. ``doc_type`` must be one of the six fixed
-    requirements (aadhar, pan, license, rc, puc, insurance). Each requirement
-    holds exactly one document — re-uploading the same type REPLACES the
-    previous file (no duplicates).
-    """
+    """Upload a labelled KYC document (doc_type from the fixed checklist)."""
     doc_type = (doc_type or "").strip().lower()
     if doc_type not in PROVIDER_DOCUMENT_TYPES:
         raise HTTPException(
@@ -219,8 +204,6 @@ async def upload_verification_document(
         file, f"kyc_documents/{doc_type}", str(current_driver.id)
     )
 
-    # Replace the slot for this requirement. Copy the dict so SQLAlchemy detects
-    # the JSON mutation and persists it.
     current_docs = dict(current_driver.verification_documents or {})
     current_docs[doc_type] = public_url
     current_driver.verification_documents = current_docs

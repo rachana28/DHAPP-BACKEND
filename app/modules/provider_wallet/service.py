@@ -38,12 +38,11 @@ from app.utils.id_generator import (
 )
 from app.utils.time_utils import now_ist
 
-# --- SystemConfig keys + defaults (admin-tunable via /admin/system-config) ---
 PROVIDER_WALLET_MAX_BALANCE_KEY = "provider_wallet_max_balance"
 PROVIDER_CASHOUT_MIN_KEY = "provider_cashout_min"
 PROVIDER_TOPUP_MIN_KEY = "provider_topup_min"
 PROVIDER_TOPUP_MAX_KEY = "provider_topup_max"
-DEFAULT_PROVIDER_WALLET_MAX_BALANCE = 100000.0  # ₹1 lakh
+DEFAULT_PROVIDER_WALLET_MAX_BALANCE = 100000.0
 DEFAULT_PROVIDER_CASHOUT_MIN = 100.0
 DEFAULT_PROVIDER_TOPUP_MIN = 1.0
 DEFAULT_PROVIDER_TOPUP_MAX = 100000.0
@@ -61,7 +60,32 @@ def _get_config_float(session: Session, key: str, default: float) -> float:
     return default
 
 
-# --- wallet lifecycle --------------------------------------------------------
+def driver_wallet_freeze_reason(
+    session: Session, user_id: uuid.UUID, provider_type: str
+) -> Optional[str]:
+    if provider_type != "driver":
+        return None
+    from app.core.models import Driver, Trip
+    from app.modules.trips.trip_service import TripService
+
+    row = session.exec(
+        select(Trip.id)
+        .join(Driver, Driver.id == Trip.driver_id)
+        .where(
+            Driver.user_id == user_id,
+            Trip.status.in_(TripService.DRIVER_BUSY_STATES),
+            Trip.payment_method.in_(("advance_20", "full_payment")),
+        )
+    ).first()
+    if row is None:
+        return None
+    return (
+        "Wallet top-ups and withdrawals are locked while you have an active "
+        "advance/full-payment trip. They unlock automatically when the trip "
+        "is completed."
+    )
+
+
 def get_or_create_provider_wallet(
     session: Session, user_id: uuid.UUID, provider_type: str
 ) -> ProviderWallet:
@@ -114,7 +138,6 @@ def _new_txn(
     return txn
 
 
-# --- credits / debits (no commit — caller owns the transaction) --------------
 def credit(
     session: Session,
     user_id: uuid.UUID,
@@ -129,9 +152,6 @@ def credit(
     idempotency_key: Optional[str] = None,
     enforce_cap: bool = True,
 ) -> ProviderWalletTransaction:
-    """Credit the provider wallet. If the wallet is in deficit (negative
-    balance from a prior admin deduction), the incoming money FIRST repays the
-    deficit (a ``recovery`` txn) and only the remainder raises the balance."""
     amount = round(float(amount), 2)
     if amount <= 0:
         raise HTTPException(400, "Credit amount must be positive")
@@ -151,7 +171,6 @@ def credit(
 
     primary: Optional[ProviderWalletTransaction] = None
 
-    # Negative-balance recovery: repay the deficit first.
     if wallet.balance < -_EPS:
         recovered = round(min(amount, -wallet.balance), 2)
         wallet.balance = round(wallet.balance + recovered, 2)
@@ -206,8 +225,6 @@ def debit(
     related_service_reference_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> ProviderWalletTransaction:
-    """Debit the provider wallet (cash-out, payout, acceptance fee). Requires a
-    sufficient POSITIVE balance — fraud guard for withdrawals."""
     amount = round(float(amount), 2)
     if amount <= 0:
         raise HTTPException(400, "Debit amount must be positive")
@@ -245,8 +262,6 @@ def admin_deduct(
     *,
     note: Optional[str] = None,
 ) -> ProviderWalletTransaction:
-    """Admin fraud/issue deduction. ALLOWED to push the balance negative — the
-    deficit is recovered out of future credits (see ``credit``)."""
     amount = round(float(amount), 2)
     if amount <= 0:
         raise HTTPException(400, "Deduction amount must be positive")
@@ -291,9 +306,6 @@ def debit_clawback(
     related_service_reference_id: Optional[str] = None,
     note: Optional[str] = None,
 ) -> ProviderWalletTransaction:
-    """Claw back money from the provider wallet when a payment is refunded.
-    ALLOWED to push the balance negative (the provider may already have been
-    paid out); the deficit is recovered out of future credits."""
     amount = round(float(amount), 2)
     if amount <= 0:
         raise HTTPException(400, "Clawback amount must be positive")
@@ -324,8 +336,6 @@ def reverse_debit(
     payout_reference: Optional[str] = None,
     note: Optional[str] = None,
 ) -> ProviderWalletTransaction:
-    """Re-credit the wallet after a bounced payout/cash-out (money never left).
-    Bypasses the cap and deficit-recovery split — it is a pure reversal."""
     amount = round(float(amount), 2)
     wallet = _lock_wallet(session, user_id, provider_type)
     wallet.balance = round(wallet.balance + amount, 2)
@@ -343,7 +353,6 @@ def reverse_debit(
     )
 
 
-# --- top-up (via gateway) ----------------------------------------------------
 def create_topup_intent(
     session: Session,
     ctx_user_id: uuid.UUID,
@@ -352,8 +361,6 @@ def create_topup_intent(
     method: str = "card",
     idempotency_key: Optional[str] = None,
 ) -> Tuple[ProviderWalletTransaction, Optional[str]]:
-    """Start a provider wallet top-up: a gateway intent + a PENDING credit txn.
-    Settlement arrives on the gateway webhook (confirm_topup)."""
     if idempotency_key:
         existing = session.exec(
             select(ProviderWalletTransaction).where(
@@ -378,6 +385,10 @@ def create_topup_intent(
         raise HTTPException(400, f"Minimum top-up is ₹{min_t:.0f}")
     if amount > max_t + _EPS:
         raise HTTPException(400, f"Maximum top-up is ₹{max_t:.0f}")
+
+    freeze_reason = driver_wallet_freeze_reason(session, ctx_user_id, provider_type)
+    if freeze_reason:
+        raise HTTPException(403, freeze_reason)
 
     wallet = get_or_create_provider_wallet(session, ctx_user_id, provider_type)
     if not wallet.is_active:
@@ -422,8 +433,6 @@ def create_topup_intent(
 
 
 def confirm_topup(session: Session, gateway_intent_id: str) -> bool:
-    """Settle a pending provider top-up by its gateway intent id. Idempotent.
-    Returns True when a matching provider top-up txn was found."""
     txn = session.exec(
         select(ProviderWalletTransaction)
         .where(
@@ -463,8 +472,6 @@ def confirm_topup(session: Session, gateway_intent_id: str) -> bool:
     txn.updated_at = now_ist()
     session.add(wallet)
     session.add(txn)
-    # The top-up money physically arrives in the merchant bank as provider-owed
-    # (it backs the provider's own digital balance).
     from app.services import merchant_bank
 
     merchant_bank.credit_provider_owed(
@@ -486,10 +493,6 @@ def confirm_topup(session: Session, gateway_intent_id: str) -> bool:
 
 
 def simulate_topup_settlement(gateway_intent_id: str, amount: float) -> None:
-    """Mock async settlement for a provider top-up (FastAPI BackgroundTask, own
-    session). Routes a signed success event through the shared payment webhook
-    handler, which falls back to ``confirm_topup`` when no Payment matches.
-    Replace with the real gateway webhook once integrated."""
     from app.core.database import engine
     from app.modules.payments.service import handle_webhook
 

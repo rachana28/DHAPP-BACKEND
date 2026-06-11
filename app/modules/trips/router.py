@@ -1,3 +1,23 @@
+"""Driver-hiring trip API (Daily / Monthly / Outstation).
+
+User-app endpoints: fare estimate + booking (day-count limits enforced:
+Monthly 4-21 scheduled days per calendar month, Daily <=21/month, Outstation
+1-10 days with a mandatory '(HH:MM)' start time in shift_details), payment
+method selection (trip_day / advance_20 / full_payment), upfront payment,
+OTP request, skip-day, end-trip, cancel with refund/shortfall maths,
+modify-schedule, bills (daily / advance_recovery / cancellation_balance) and
+final-settlement payment.
+
+Driver-app endpoints: offers, accept-and-pay (acceptance fee), process-payment,
+withdraw (pre-shift), abandon (post-shift), verify-otp, skip-day (3 per 30-day
+window), active-bookings, and offline cash collection (mark-paid-by-driver).
+
+GET /{trip_id}/summary is role-aware: the user view carries payment internals
+and the public driver block; the driver view carries only the rider's
+name/avatar plus an `actions` block (can_verify_otp, can_skip, bills to
+collect, ...) for the current-trip screen. Responses use reference ids only.
+"""
+
 import redis
 from datetime import date, timedelta
 from fastapi import (
@@ -52,6 +72,7 @@ from app.modules.trips.trip_service import TripService
 from app.modules.trips.billing_service import BillingService
 from app.modules.trips.pricing_calculator import (
     calculate_fare,
+    validate_day_counts,
     validate_pricing_inputs,
 )
 from app.utils.time_utils import now_ist, today_ist, to_ist_naive
@@ -69,11 +90,6 @@ router = APIRouter(prefix="/trips", tags=["Trips"])
 
 
 def _trip_read_driver(t: Trip, skips_remaining: Optional[int]) -> TripReadDriver:
-    """Marshal a Trip into the driver-app view.
-
-    Never leaks the user UUID, internal flags, or customer phone/address
-    (UserPublicForDriver carries only name + avatar).
-    """
     return TripReadDriver(
         reference_id=t.reference_id,
         **{
@@ -93,8 +109,6 @@ def _trip_read_driver(t: Trip, skips_remaining: Optional[int]) -> TripReadDriver
 
 TIER_SIZE = 3
 
-# Channels a user/driver may use for an ONLINE trip charge. Physical cash on a
-# daily bill is recorded separately via /bill/{id}/mark-paid-by-driver.
 _ONLINE_PAY_CHANNELS = ("platform", "wallet")
 
 
@@ -107,8 +121,6 @@ _DRIVER_FEE_CHANNELS = {"platform", "upi", "provider_wallet"}
 
 
 def _validate_driver_channel(channel: str) -> None:
-    """Drivers pay the acceptance fee by card (``platform``), UPI (``upi``) or
-    their own provider wallet (``provider_wallet``)."""
     if channel not in _DRIVER_FEE_CHANNELS:
         raise HTTPException(
             400,
@@ -118,9 +130,6 @@ def _validate_driver_channel(channel: str) -> None:
 
 
 def _maybe_schedule_platform_settlement(background_tasks, payment) -> None:
-    """For a pending gateway charge (card/UPI), deliver the mock gateway webhook
-    shortly after (a real gateway calls /payments/webhook out of band). No-op
-    for the synchronous wallet/cash channels, which already settled inline."""
     if (
         payment is not None
         and payment.channel in ("platform", "upi")
@@ -149,6 +158,16 @@ def estimate_fare_for_booking(
         end_lat=fare_req.end_lat,
         end_lng=fare_req.end_lng,
         end_location=fare_req.end_location,
+        shift_details=fare_req.shift_details,
+    )
+    if not ok:
+        raise HTTPException(400, err)
+
+    ok, err = validate_day_counts(
+        hiring_type=fare_req.hiring_type,
+        start_date=fare_req.start_date,
+        end_date=fare_req.end_date,
+        selected_days=fare_req.selected_days,
     )
     if not ok:
         raise HTTPException(400, err)
@@ -185,8 +204,6 @@ def create_booking_request(
     if not trip_in.vehicle_type:
         raise HTTPException(400, "Vehicle type is required.")
 
-    # Defensive guard: tow and mechanic bookings live in their own tables now
-    # and must be created via /tow-trips/book-request or /mechanic-trips/book-request.
     if (trip_in.hiring_type or "").strip() in ("Tow Service", "Mechanic Service"):
         target = (
             "/tow-trips/book-request"
@@ -217,8 +234,8 @@ def create_booking_request(
     if in_flight:
         raise HTTPException(
             409,
-            f"You already have an active trip (id={in_flight.id}, status={in_flight.status}). "
-            "Complete or cancel it before booking another.",
+            f"You already have an active trip (id={in_flight.reference_id}, "
+            f"status={in_flight.status}). Complete or cancel it before booking another.",
         )
 
     payment_service = PaymentService(None)
@@ -233,18 +250,13 @@ def create_booking_request(
         )
         raise HTTPException(409, msg)
 
-    # D6: platform-wide gate — an unpaid PAST-DUE settlement from ANY service
-    # (trip or service-center) blocks new bookings until cleared (grace until
-    # due_date). Complements the stricter trip-only check above.
     raise_if_unpaid_past_due(session, current_user.id)
 
     trip_data = trip_in.model_dump()
 
     trip_data["driver_id"] = None
-    # tow_truck_driver_id no longer exists on Trip — tow trips live in TowTrip
     trip_data.pop("tow_truck_driver_id", None)
 
-    # (Daily / Monthly / Outstation).
     if not trip_data.get("start_date") or not trip_data.get("end_date"):
         raise HTTPException(400, "start_date and end_date are required.")
 
@@ -300,6 +312,16 @@ def create_booking_request(
         end_lat=trip_data.get("end_lat"),
         end_lng=trip_data.get("end_lng"),
         end_location=trip_data.get("end_location"),
+        shift_details=trip_data.get("shift_details"),
+    )
+    if not ok:
+        raise HTTPException(400, err)
+
+    ok, err = validate_day_counts(
+        hiring_type=trip_data.get("hiring_type"),
+        start_date=trip_data.get("start_date"),
+        end_date=trip_data.get("end_date"),
+        selected_days=trip_data.get("selected_days"),
     )
     if not ok:
         raise HTTPException(400, err)
@@ -332,8 +354,6 @@ def create_booking_request(
     trip_data["user_id"] = current_user.id
     trip_data["status"] = "searching"
 
-    # Every booking starts on trip_day so the driver can accept + pay the
-    # acceptance fee immediately. User can upgrade later via /select-payment-method.
     trip_data["payment_method"] = "trip_day"
 
     db_trip = Trip.model_validate(trip_data)
@@ -348,10 +368,6 @@ def create_booking_request(
     ranked_drivers = rank_drivers(session, trip_in.vehicle_type)
 
     if not ranked_drivers:
-        # D4: keep searching forever — never auto-give-up. With no driver
-        # available right now the trip stays in `searching` (no offers yet); the
-        # per-minute re-search scheduler seeds tier-1 offers as soon as a driver
-        # becomes available. (`no_drivers_found` is no longer set here.)
         return db_trip
 
     tier_1_drivers = ranked_drivers[:TIER_SIZE]
@@ -382,8 +398,6 @@ def get_my_bookings(
             .limit(limit)
             .options(selectinload(Trip.user))
         ).all()
-        # Skip allowance is scoped per trip booking — surface each trip's own
-        # remaining count.
         trip_service = TripService()
         return [
             _trip_read_driver(t, trip_service.driver_skips_remaining(session, t.id))
@@ -409,17 +423,12 @@ def get_my_bookings(
             .options(selectinload(Trip.driver))
         ).all()
 
-        trip_service = TripService()
         result: list = []
 
         for t in ride_rows:
             view = TripReadUser.model_validate(t, from_attributes=True)
             if t.status in DRIVER_HIDDEN_STATES:
                 view.driver = None
-            elif t.driver_id is not None:
-                view.driver_skips_remaining = trip_service.driver_skips_remaining(
-                    session, t.id
-                )
             result.append(view)
 
         return result
@@ -432,9 +441,7 @@ def get_driver_active_bookings(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """Driver-app polling target: only the driver's currently-engaged trips
-    (DRIVER_BUSY_STATES). Lighter than `my-bookings` and short-TTL cached so
-    frequent polling doesn't sweep the table. No customer phone/address."""
+    """Driver-app polling target: the driver's currently-engaged trips only."""
     if current_user.role != "driver":
         return []
     driver = session.exec(
@@ -475,19 +482,7 @@ def cancel_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """User-initiated cancellation. Drivers reject offers / withdraw / abandon
-    via their own endpoints.
-
-    trip_day: cancel anywhere outside ongoing/paused-with-unpaid. Completed
-    shifts stay paid, future shifts voided, driver acceptance fee refunded
-    only if no shift was served.
-
-    advance_20 / full_payment: mid-trip cancellation allowed (F6). The
-    settlement formula refunds the difference; if the user ran more days
-    than the upfront covered, the trip lands in
-    ``cancellation_pending_payment`` with a ``cancellation_balance`` bill.
-    """
-    # Row-lock so cancel doesn't interleave with driver-side OTP / end-trip.
+    """User-initiated cancellation with refund/shortfall maths (F6)."""
     trip = session.exec(
         select(Trip).where(Trip.reference_id == trip_id).with_for_update()
     ).first()
@@ -506,7 +501,6 @@ def cancel_trip(
 
     payment_service = PaymentService(redis_client)
 
-    # trip_day: settle outstanding daily bill before cancelling.
     if trip.payment_method == "trip_day" and payment_service.trip_has_unpaid_bills(
         session, trip_id
     ):
@@ -515,10 +509,6 @@ def cancel_trip(
             "Pay the outstanding daily bill before cancelling the remaining shifts.",
         )
 
-    # F6 refund maths for advance_20 / full_payment:
-    #   net = upfront − served_days × per_day_rate − ₹50 × user_skipped_days
-    #   net > 0 → refund; net < 0 → cancellation_balance bill + park in
-    #   cancellation_pending_payment until paid. trip_day has no refund.
     user_refund = 0.0
     cancellation_deduction = 0.0
     shortfall_amount = 0.0
@@ -544,8 +534,6 @@ def cancel_trip(
             if not ok:
                 raise HTTPException(400, err or "Refund failed")
         elif shortfall_amount > 0:
-            # User owes a balance — block them via a cancellation_balance bill
-            # until paid. The trip parks in `cancellation_pending_payment`.
             from datetime import date as _date
 
             bill = TripBill(
@@ -574,8 +562,6 @@ def cancel_trip(
             session.flush()
             cancellation_bill_id = bill.id
 
-    # Driver acceptance fee refunded only if no shift was ever served — once
-    # a shift completes the driver has earned the fee.
     driver_refund = 0.0
     if trip.driver_id and not has_completed_shift:
         driver_refund = payment_service.calculate_driver_fee_refund(
@@ -620,7 +606,6 @@ def cancel_trip(
 
     cancelled_driver_id = trip.driver_id
 
-    # Tear down pending offers so the freed driver can be ranked elsewhere.
     for offer in session.exec(
         select(TripOffer).where(TripOffer.trip_id == trip.id)
     ).all():
@@ -675,7 +660,6 @@ def cancel_trip(
         "cancellation_deduction": cancellation_deduction,
         "shortfall_amount": shortfall_amount,
         "cancellation_bill_id": cancellation_bill_id,
-        "driver_refund_amount": driver_refund,
         "trip_status": trip.status,
         "settlement_id": settlement_id,
     }
@@ -692,9 +676,6 @@ def get_driver_offers(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    # Only surface offers that are still actionable: pending AND whose trip is
-    # still searching for a driver (skip offers for trips already taken/cancelled
-    # so the poll returns only relevant data). Capped for a lean payload.
     statement = (
         select(TripOffer)
         .join(Trip, TripOffer.trip_id == Trip.id)
@@ -722,8 +703,6 @@ def reject_trip_offer(
     if not driver:
         raise HTTPException(403, "Not authorized")
 
-    # Lock the offer row so a concurrent escalation pass can't delete it
-    # mid-update.
     offer = session.exec(
         select(TripOffer).where(TripOffer.id == offer_id).with_for_update()
     ).first()
@@ -737,8 +716,6 @@ def reject_trip_offer(
     session.add(offer)
     session.commit()
 
-    # Re-fetch the trip with a row lock before escalating so two parallel
-    # rejects can't both trigger escalation for the same trip.
     trip = session.exec(
         select(Trip).where(Trip.id == offer.trip_id).with_for_update()
     ).first()
@@ -759,24 +736,7 @@ def modify_trip_schedule(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """Monthly-only: change ``selected_days`` and/or extend ``end_date`` (F12).
-
-    Allowed when:
-      * trip.hiring_type is Monthly, AND
-      * trip.status ∈ {``active_pending_otp``, ``paused``} (not currently
-        running a shift), AND
-      * next scheduled shift starts at least 24h from now.
-
-    On success:
-      * Future ``scheduled`` attendance rows are deleted and recomputed against
-        the new schedule. Past ``present`` / ``skipped_*`` rows are preserved.
-      * The fare is recomputed with the current pricing engine; ``trip.fare``
-        and ``trip.fare_breakdown`` are updated.
-      * If the new fare exceeds the old fare, a ``schedule_diff`` bill is
-        raised for the difference (user must pay before the new schedule's
-        first new shift gets an OTP). If lower, the diff is recorded as
-        ``payment_note`` and credited at final settlement.
-    """
+    """Monthly-only: change ``selected_days`` and/or extend ``end_date`` (F12)."""
     from datetime import date as _date
 
     trip = session.exec(
@@ -820,8 +780,16 @@ def modify_trip_schedule(
     if new_end_date < (trip.start_date or _date.today()):
         raise HTTPException(400, "end_date cannot precede trip.start_date")
 
-    # Recompute fare with the new schedule. Booking time stays the original so
-    # the night-surcharge basis (shift start, F3) reflects the locked shift hour.
+    window_start = max(trip.start_date or today_ist(), today_ist())
+    ok, err = validate_day_counts(
+        hiring_type=trip.hiring_type,
+        start_date=window_start,
+        end_date=new_end_date,
+        selected_days=new_selected_days,
+    )
+    if not ok:
+        raise HTTPException(400, err)
+
     fare_quote = calculate_fare(
         session,
         redis_client,
@@ -845,9 +813,6 @@ def modify_trip_schedule(
     old_fare = float(trip.fare or 0.0)
     fare_diff = round(new_fare - old_fare, 2)
 
-    # Drop future scheduled attendances; the new ones get rebuilt below. Any
-    # OTPRegistry rows tied to these attendances are removed too so we don't
-    # leave dangling FK references on the unverified shifts.
     pending_future = session.exec(
         select(TripAttendance).where(
             TripAttendance.trip_id == trip_id,
@@ -867,18 +832,14 @@ def modify_trip_schedule(
         session.delete(a)
     session.flush()
 
-    # Recompute the shift "from-when" anchor.
     schedule_anchor_start_dt = trip.scheduled_start_time or now_ist()
     trip_service_inst = TripService()
     if next_att:
-        # Preserve the shift clock from the next scheduled attendance so the
-        # new schedule starts at the same hour each day.
         anchor_dt = next_att.scheduled_start
     else:
         anchor_dt = schedule_anchor_start_dt
     duration_hours = trip.trip_duration_hours or 8
 
-    # New attendance range: from tomorrow (anchor day) through new_end_date.
     start_for_new = max(anchor_dt.date(), today_ist())
     ok, err = trip_service_inst.create_trip_attendance_records(
         session,
@@ -902,7 +863,6 @@ def modify_trip_schedule(
 
     diff_bill_id = None
     if fare_diff > 0:
-        # Raise a schedule_diff bill the user must pay before the next OTP.
         bill = TripBill(
             trip_id=trip_id,
             user_id=trip.user_id,
@@ -928,12 +888,6 @@ def modify_trip_schedule(
         session.flush()
         diff_bill_id = bill.id
     elif fare_diff < 0:
-        # User is owed a credit (fare reduced). Recorded on the central ledger
-        # as a succeeded "credit"-channel Payment so the settlement maths (which
-        # sums the user's succeeded charges into total_paid_upfront) picks it up
-        # and reduces remaining_due — no separate refund flow needed today. The
-        # "credit" channel marks it as a ledger adjustment (no real money in),
-        # so it is never itself refunded by the cancel/abandon flow.
         session.add(
             Payment(
                 reference_id=generate_reference_id(session, PAYMENT),
@@ -985,14 +939,7 @@ def select_payment_method(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """Select or change the trip's payment method.
-
-    Allowed moves: trip_day -> advance_20 / full_payment, and advance_20 ->
-    full_payment. A trip can never move back to trip_day, and full_payment is
-    final. advance_20 / full_payment require an upfront payment (see
-    /pay-upfront) computed on the still-outstanding portion of the booking, so
-    a mid-trip switch never re-charges shifts already completed and paid.
-    """
+    """Select or change the trip's payment method."""
     trip = session.exec(
         select(Trip).where(Trip.reference_id == trip_id).with_for_update()
     ).first()
@@ -1006,8 +953,6 @@ def select_payment_method(
     if payment_method not in ("trip_day", "advance_20", "full_payment"):
         raise HTTPException(400, "Invalid payment method")
 
-    # Outstation is billed once at the end of the trip with a flat 3% discount —
-    # there is no payment-method choice for it.
     if (trip.hiring_type or "").strip().lower() == "outstation":
         raise HTTPException(
             400,
@@ -1017,22 +962,18 @@ def select_payment_method(
 
     current = trip.payment_method
 
-    # An advance/full upfront that hasn't been paid yet can revert to trip_day
-    # — the user isn't locked in until the actual upfront charge clears.
     upfront_pending = bool(trip.is_payment_blocked) and current in (
         "advance_20",
         "full_payment",
     )
 
-    # Transitions: unset → any; otherwise upgrades only, plus unpaid advance/
-    # full → trip_day revert.
     if current is None:
         allowed = {"trip_day", "advance_20", "full_payment"}
     elif current == "trip_day":
         allowed = {"advance_20", "full_payment"}
     elif current == "advance_20":
         allowed = {"trip_day", "full_payment"} if upfront_pending else {"full_payment"}
-    else:  # full_payment
+    else:
         allowed = {"trip_day", "advance_20"} if upfront_pending else set()
 
     if payment_method == current:
@@ -1055,8 +996,6 @@ def select_payment_method(
             f"Cannot change payment method from '{current}' to '{payment_method}'.",
         )
 
-    # Timing: never change while a shift is physically running, or once the
-    # trip has closed.
     if trip.status in ("ongoing", "active"):
         raise HTTPException(
             400,
@@ -1078,8 +1017,6 @@ def select_payment_method(
 
     trip_service = TripService()
 
-    # Once every shift is done, only the final settlement is left — it must be
-    # paid with the method already in effect.
     attendance_count = len(
         session.exec(
             select(TripAttendance.id).where(TripAttendance.trip_id == trip_id)
@@ -1092,15 +1029,11 @@ def select_payment_method(
             "payment method.",
         )
 
-    # Setting (or reverting to) trip_day needs no upfront step.
     if payment_method == "trip_day":
         trip.payment_method = "trip_day"
         trip.state_version += 1
         session.add(trip)
         session.commit()
-        # Reverting from an unpaid upfront must lift the upfront pause —
-        # unpause_trip_if_clear re-arms OTP, but only when no daily bill is
-        # actually outstanding (else trip stays paused for that bill).
         PaymentService(None).unpause_trip_if_clear(session, trip_id)
         session.commit()
         session.refresh(trip)
@@ -1116,7 +1049,6 @@ def select_payment_method(
             "bills before switching to advance_20 / full_payment.",
         )
 
-    # advance_20 / full_payment — compute upfront on the outstanding portion only.
     portion = trip_service.compute_outstanding_portion(session, trip)
     outstanding_gross = portion["outstanding_gross"]
     if outstanding_gross <= 0:
@@ -1126,8 +1058,6 @@ def select_payment_method(
 
     if payment_method == "advance_20":
         upfront = round(0.20 * outstanding_gross, 2)
-        # Anti-fraud: the 20% upfront must at least cover the most recent
-        # pending shift bill, so a switch can't be used to dodge an unpaid day.
         unsettled = portion["unsettled_bills"]
         if unsettled:
             most_recent_due = unsettled[-1].amount_due or 0.0
@@ -1151,9 +1081,6 @@ def select_payment_method(
 
     trip.payment_method = payment_method
     trip.is_payment_blocked = True
-    # Pause the active trip until the upfront is paid. Earlier states
-    # (searching / accepted_pending_payment / payment_in_progress) belong to
-    # driver acceptance and must not be disturbed.
     if trip.status == "active_pending_otp":
         trip.status = "paused"
     trip.state_version += 1
@@ -1184,21 +1111,7 @@ def user_pay_upfront(
     ),
     idem: IdempotencyGuard = Depends(idempotent("upfront.pay", ["trip_id"])),
 ):
-    """User upfront payment for an advance_20 / full_payment trip.
-
-    The amount is computed on the still-outstanding portion of the booking
-    (remaining shifts + any unpaid completed shift), so:
-      * a fresh booking pays 20% / 95% of the whole fare, and
-      * a mid-trip switch pays only for what is left, crediting whatever the
-        user already paid.
-
-    ``channel`` is "wallet" (settles instantly) or "platform" (gateway card;
-    returns a client_secret and settles on the webhook). On success the
-    centralized orchestrator settles any unpaid completed-shift bills under the
-    new method and un-blocks / un-pauses the trip — for platform that happens
-    when the gateway confirms. trip_day has no upfront step (collected per day
-    via /bill/{id}/pay).
-    """
+    """User upfront payment for an advance_20 / full_payment trip."""
     if idem.cached_response is not None:
         return idem.cached_response
     _validate_online_channel(channel)
@@ -1242,8 +1155,6 @@ def user_pay_upfront(
         if err:
             raise HTTPException(400, err)
         if client_secret:
-            # Platform charge: bill-settlement + un-block run on the gateway
-            # webhook via the orchestrator hook, not synchronously here.
             _maybe_schedule_platform_settlement(background_tasks, payment)
             response = {
                 "message": "Upfront payment initiated. Confirm with the client "
@@ -1258,12 +1169,7 @@ def user_pay_upfront(
             }
             idem.store(response)
             return response
-        # Wallet: settled synchronously; the orchestrator already settled the
-        # bills + un-blocked the trip inside the payment commit.
     else:
-        # Nothing left to charge (mid-trip switch where the user already
-        # overpaid): still settle outstanding bills under the new method and
-        # un-block the trip.
         from app.modules.trips import payment_orchestrator
 
         payment_orchestrator.apply_user_upfront_settlement(session, trip)
@@ -1289,9 +1195,6 @@ def driver_accept_and_initiate_payment(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    # Row-lock the driver so two concurrent accepts by the same driver are
-    # serialized — this is what makes the one-driver-one-trip check below race
-    # free.
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id).with_for_update()
     ).first()
@@ -1353,17 +1256,12 @@ def driver_accept_and_initiate_payment(
         }
 
     elif action == "accept":
-        # Status guard under the row lock — another writer may have just
-        # transitioned the trip out from under us before we got the lock.
         if trip.status not in ("searching", "accepted_pending_payment"):
             raise HTTPException(
                 400,
                 f"Trip cannot be accepted in status '{trip.status}'.",
             )
 
-        # One driver = one active trip. Block accepting a new booking while the
-        # driver still has another in-flight trip. The driver row is locked
-        # above, so two concurrent accepts cannot both slip past this check.
         busy_trip = session.exec(
             select(Trip).where(
                 Trip.driver_id == driver.id,
@@ -1374,7 +1272,7 @@ def driver_accept_and_initiate_payment(
         if busy_trip:
             raise HTTPException(
                 409,
-                f"You already have an active trip (id={busy_trip.id}, "
+                f"You already have an active trip (id={busy_trip.reference_id}, "
                 f"status={busy_trip.status}). Complete it before accepting another.",
             )
 
@@ -1415,8 +1313,6 @@ def driver_accept_and_initiate_payment(
         session.add(trip)
         session.commit()
 
-        # Bust the driver-availability cache so this driver is no longer
-        # eligible for ranking on other in-flight trips while they hold this one.
         redis_client.delete(f"driver_{driver.id}")
 
         return {
@@ -1445,19 +1341,7 @@ def driver_process_payment(
     ),
     idem: IdempotencyGuard = Depends(idempotent("driver.process_payment", ["trip_id"])),
 ):
-    """Driver pays the acceptance fee to lock the trip.
-
-    The fee is payable by card (``channel="platform"``), UPI (``channel="upi"``)
-    or the driver's own provider wallet (``channel="provider_wallet"``). Card/UPI
-    return a ``client_secret`` and settle asynchronously on the gateway webhook,
-    which then arms the trip via the centralized orchestrator — generating the
-    shift schedule and moving it to active_pending_otp (or ``paused`` for
-    advance_20/full_payment until the user pays upfront). The provider-wallet
-    channel settles synchronously. The trip stays ``accepted_pending_payment``
-    until settlement (the payment-timeout scheduler skips a trip with a pending
-    fee, so it won't be auto-rejected meanwhile). An optional
-    ``card_reference_id`` may reference one of the driver's own saved cards.
-    """
+    """Driver pays the acceptance fee to lock the trip."""
     if idem.cached_response is not None:
         return idem.cached_response
     _validate_driver_channel(channel)
@@ -1467,8 +1351,6 @@ def driver_process_payment(
     if not driver:
         raise HTTPException(403, "Only drivers can perform this action")
 
-    # Row-lock the trip so this path can't interleave with the payment-timeout
-    # scheduler between our status check and our state mutation.
     trip = session.exec(
         select(Trip).where(Trip.reference_id == trip_id).with_for_update()
     ).first()
@@ -1481,9 +1363,6 @@ def driver_process_payment(
             400, f"Trip status is {trip.status}, cannot process payment now"
         )
 
-    # Payment method is optional at booking time. Default it to trip-day so the
-    # trip can proceed without waiting on the user — the user can still switch
-    # to advance_20 / full_payment later via /select-payment-method.
     if not trip.payment_method:
         trip.payment_method = "trip_day"
         session.add(trip)
@@ -1501,10 +1380,6 @@ def driver_process_payment(
     if error:
         raise HTTPException(400, f"Payment failed: {error}")
 
-    # Driver fees are gateway-only (no wallet) and settle asynchronously; the
-    # orchestrator arms the trip on the gateway webhook (finalize_driver_
-    # acceptance). create_trip_payment_intent always returns a client_secret for
-    # the platform channel.
     try:
         redis_client.delete(f"driver_payment_timer:{trip.id}:{driver.id}")
     except Exception:
@@ -1533,22 +1408,7 @@ def driver_withdraw_from_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """Driver backs out of an accepted trip BEFORE any shift has started (F5).
-
-    Refund rule (driver acceptance fee, ₹100 today):
-      * any attendance already marked ``present`` (driver served ≥1 shift)
-        → 403, no refund. Use ``/driver/{trip_id}/abandon`` for emergencies.
-      * else if now is more than 5 h before the FIRST shift's scheduled_start
-        → full refund.
-      * else (within 5 h of the first shift, no shift completed)
-        → no driver refund. The fee stays with the platform (not the user) as
-        a no-show penalty.
-
-    In all withdraw cases the trip returns to ``searching`` and escalation
-    fires so a replacement driver can pick it up. If the user had paid an
-    advance_20 / full_payment upfront, that upfront stays held on the trip;
-    the user's mid-trip cancel flow (F6) handles any subsequent refund.
-    """
+    """Driver backs out of an accepted trip BEFORE any shift has started (F5)."""
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id).with_for_update()
     ).first()
@@ -1574,7 +1434,6 @@ def driver_withdraw_from_trip(
             "Use the in-shift skip flow instead.",
         )
 
-    # Block withdraw if any shift has actually been served.
     served = session.exec(
         select(TripAttendance).where(
             TripAttendance.trip_id == trip_id,
@@ -1601,8 +1460,6 @@ def driver_withdraw_from_trip(
         five_h_before = first_att.scheduled_start - timedelta(hours=5)
         eligible_for_refund = now_ist() < five_h_before
     else:
-        # No attendance rows yet (driver hasn't paid acceptance) — treat as
-        # the most generous case for the driver.
         eligible_for_refund = True
 
     payment_service = PaymentService(redis_client)
@@ -1622,7 +1479,6 @@ def driver_withdraw_from_trip(
         trip.driver_payment_status = "unpaid"
         trip.driver_payment_amount = None
 
-    # Mark the driver's own offer rejected so the dashboard reflects the exit.
     own_offer = session.exec(
         select(TripOffer)
         .where(TripOffer.trip_id == trip_id, TripOffer.driver_id == driver.id)
@@ -1634,10 +1490,6 @@ def driver_withdraw_from_trip(
 
     trip.driver_id = None
     trip.driver_accepted_at = None
-    # Route through the state service so the transition is audit-logged and
-    # state_version bumps in lockstep with concurrent writers. validate=False
-    # because `paused`→`searching` and `active_pending_otp`→`searching` are
-    # withdraw-only edges not present in the normal lifecycle matrix.
     trip_service_inst = TripService()
     success, terr = trip_service_inst.transition_trip_state(
         session, trip_id, "searching", validate=False
@@ -1648,7 +1500,6 @@ def driver_withdraw_from_trip(
     session.add(trip)
     session.commit()
 
-    # Free this driver from any Redis-cached availability snapshot.
     try:
         redis_client.delete(f"driver_{driver.id}")
     except Exception:
@@ -1688,20 +1539,7 @@ def driver_abandon_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """Driver permanently exits a multi-day booking after serving ≥1 shift (F11).
-
-    Use when illness / emergency makes continuing impossible. Distinct from
-    :func:`driver_withdraw_from_trip` (pre-shift) and from the per-day skip
-    flow (max 3 / 30 days). The driver does NOT get an acceptance-fee refund —
-    that fee was for taking the booking, which they did.
-
-    User refund: ``unused_days × per_day_rate`` (capped at total user-paid).
-    No anti-fraud deduction since the user is not at fault.
-
-    Trip closes as ``cancelled_by_driver`` → ``refund_processing`` → ``settled``.
-    Future shifts are voided (status ``skipped_by_system``) so the user does
-    not get billed and the driver is freed for new bookings.
-    """
+    """Driver permanently exits a multi-day booking after serving ≥1 shift (F11)."""
     driver = session.exec(
         select(Driver).where(Driver.user_id == current_user.id).with_for_update()
     ).first()
@@ -1739,8 +1577,6 @@ def driver_abandon_trip(
     payment_service = PaymentService(redis_client)
     refund_amount = payment_service.calculate_driver_abandon_refund(session, trip_id)
 
-    # Void any not-yet-served shifts so the user does not get billed and the
-    # state machine has a clean way to close the trip.
     pending_atts = session.exec(
         select(TripAttendance).where(
             TripAttendance.trip_id == trip_id,
@@ -1768,12 +1604,8 @@ def driver_abandon_trip(
             reason=reason or "Driver abandoned booking",
         )
         if not refund_ok:
-            # Refund failure leaves the trip in cancelled_by_driver so ops can
-            # reconcile via the audit log + the Payment ledger.
             raise HTTPException(502, refund_err or "Refund gateway error")
 
-        # Bump trip into the refund-processing → settled terminal chain so the
-        # user-facing summary shows the closed loop.
         trip_service_inst.transition_trip_state(
             session, trip_id, "refund_processing", validate=False
         )
@@ -1781,8 +1613,6 @@ def driver_abandon_trip(
             session, trip_id, "settled", validate=False
         )
     else:
-        # Nothing to refund (trip_day or advance_20 with no unused capacity);
-        # short-circuit straight to settled so the trip closes cleanly.
         trip_service_inst.transition_trip_state(
             session, trip_id, "refund_processing", validate=False
         )
@@ -1795,7 +1625,6 @@ def driver_abandon_trip(
     session.add(driver)
     session.commit()
 
-    # Free the driver from any cached availability snapshot.
     try:
         redis_client.delete(f"driver_{driver.id}")
     except Exception:
@@ -1858,16 +1687,20 @@ def request_otp_for_trip(
         raise HTTPException(400, "Trip schedule not set")
 
     if trip.is_payment_blocked:
+        if PaymentService(None).trip_has_unpaid_bills(session, trip.id):
+            raise HTTPException(
+                400,
+                "Trip is paused — settle the outstanding bill before requesting today's OTP.",
+            )
         if trip.payment_method in ("advance_20", "full_payment"):
             raise HTTPException(
                 400,
                 f"Trip is paused — complete {trip.payment_method} upfront payment before requesting OTP.",
             )
-        else:
-            raise HTTPException(
-                400,
-                "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
-            )
+        raise HTTPException(
+            400,
+            "Trip is paused — settle outstanding daily bills before requesting today's OTP.",
+        )
 
     attendances_raw = session.exec(
         select(TripAttendance)
@@ -1883,7 +1716,6 @@ def request_otp_for_trip(
     valid_attendance = None
     now = now_ist()
     for att in attendances:
-        # Generous 12-hour expiry window matching OTPService
         expiry_time = att.scheduled_start + timedelta(hours=12)
         if now > expiry_time:
             att.status = "skipped_by_system"
@@ -1909,8 +1741,6 @@ def request_otp_for_trip(
             400,
             f"OTP can only be requested within 30 minutes of the scheduled trip start time ({attendance.scheduled_start.strftime('%I:%M %p %d-%b')}).",
         )
-    # Upper bound: don't hand out an OTP for a shift whose 12-hour window has
-    # already lapsed. The expiry sweeper will mark it skipped_by_system shortly.
     if now > attendance.scheduled_start + timedelta(hours=12):
         raise HTTPException(
             400,
@@ -2022,9 +1852,6 @@ def verify_otp_for_trip(
     trip_service.transition_trip_state(session, trip_id, "ongoing", validate=False)
 
     verify_now = now_ist()
-    # Set trip-level actual_start_time only the FIRST time a shift is verified.
-    # Per-day starts are tracked on TripAttendance.actual_start; the trip-level
-    # field should reflect when the booking actually began.
     if trip.actual_start_time is None:
         trip.actual_start_time = verify_now
 
@@ -2085,8 +1912,6 @@ def skip_trip_day(
             raise HTTPException(403, "Not authorized")
         marked_by = "driver"
 
-    # Paused trips (unpaid upfront or daily bill) freeze all forward actions
-    # including skip — settle the balance first.
     if trip.is_payment_blocked or trip.status == "paused":
         raise HTTPException(
             400,
@@ -2094,8 +1919,6 @@ def skip_trip_day(
             "amount before skipping a day.",
         )
 
-    # Outstation trips are a single continuous booking with one OTP and no
-    # per-day shifts — there is nothing to skip. Use cancellation instead.
     if (trip.hiring_type or "").strip().lower() == "outstation":
         raise HTTPException(
             400,
@@ -2104,21 +1927,15 @@ def skip_trip_day(
 
     today = today_ist()
 
-    # Cannot skip a past day.
     if trip_date < today:
         raise HTTPException(400, "Cannot skip a past trip day.")
 
-    # Skip is a same-day action. To drop a future day, use the cancellation
-    # flow — preventing users/drivers from pre-emptively voiding shifts that
-    # are still days away (e.g. tomorrow's shift right after today's ended).
     if trip_date != today:
         raise HTTPException(
             400,
             "Skip is only allowed for today's shift. To remove a future day, cancel the trip.",
         )
 
-    # Driver-only restriction: once a shift is in progress (OTP verified, trip
-    # ongoing) the correct action is end-trip, not skip.
     if not is_user and trip.status == "ongoing":
         raise HTTPException(
             400,
@@ -2133,9 +1950,12 @@ def skip_trip_day(
     if not success:
         raise HTTPException(400, error)
 
-    # If that was the last unfinished shift, generate the final settlement
-    # immediately so the user has something to pay against without waiting
-    # for the daily settlement scheduler.
+    billing_service = BillingService()
+    try:
+        billing_service.check_advance_recovery(session, trip_id)
+    except Exception:
+        pass
+
     settlement_id = None
     pending = session.exec(
         select(TripAttendance).where(
@@ -2144,7 +1964,6 @@ def skip_trip_day(
         )
     ).first()
     if not pending:
-        billing_service = BillingService()
         ok, sid, _ = billing_service.generate_final_settlement(session, trip_id)
         if ok or sid:
             settlement_id = sid
@@ -2165,16 +1984,8 @@ def end_trip(
     current_user: User = Depends(get_current_user),
     redis_client: redis.Redis = Depends(get_redis),
 ):
-    """End the current shift — USER-ONLY.
-
-    Issue 2: a driver must NOT be able to end a trip — a driver ending early
-    after the user has already paid would be fraud. Once the OTP is verified
-    the user may end the trip whenever they need, up to the shift's scheduled
-    end time. If the user never ends it, auto_end_trip_scheduler closes the
-    shift automatically once scheduled_end_time passes, so the daily bill /
-    next shift can still proceed.
-    """
-    _ = notes  # currently unused; retained as accepted body field for the app
+    """End the current shift — USER-ONLY."""
+    _ = notes
 
     trip = get_by_reference(session, Trip, trip_id)
     trip_id = trip.id if trip else trip_id
@@ -2238,8 +2049,6 @@ def end_trip(
     session.add(trip)
     session.commit()
 
-    # Stamp per-day actual_end on the closing attendance row so summaries
-    # and analytics see when each shift actually ended.
     trip_service.mark_trip_day_present(session, trip_id, shift_date, actual_end=end_now)
 
     billing_service = BillingService()
@@ -2274,12 +2083,12 @@ def end_trip(
         except Exception:
             pass
 
-    # trip_day + future shifts: do NOT leave the trip in active_pending_otp
-    # while today's daily bill is unpaid. Otherwise the user app loads
-    # tomorrow's OTP screen and the bill-payment UI disappears. Hold the
-    # trip in `paused` until /bill/{id}/pay clears the unpaid bill, at which
-    # point unpause_trip_if_clear flips it back to active_pending_otp.
-    if has_future_shifts and trip.payment_method == "trip_day":
+    try:
+        billing_service.check_advance_recovery(session, trip_id)
+    except Exception:
+        pass
+
+    if has_future_shifts:
         payment_service = PaymentService(redis_client)
         if payment_service.trip_has_unpaid_bills(session, trip_id):
             trip.status = "paused"
@@ -2288,10 +2097,6 @@ def end_trip(
             session.add(trip)
             session.commit()
 
-    # On the last shift, generate the final settlement inline so the user
-    # has a payable record immediately (advance_20 / full_payment leftover
-    # balance, or a zero-due close-out for trip_day). Without this the
-    # frontend would have to wait for daily_settlement_scheduler to fire.
     settlement_id = None
     if not has_future_shifts:
         ok, sid, _ = billing_service.generate_final_settlement(session, trip_id)
@@ -2366,6 +2171,7 @@ def get_trip_bill(
     if not bill_details:
         raise HTTPException(404, "Bill not found")
 
+    bill_details["trip_id"] = trip.reference_id
     return bill_details
 
 
@@ -2402,6 +2208,8 @@ def get_trip_settlement(
     billing_service = BillingService()
     settlement_details = billing_service.get_settlement_details(session, settlement.id)
 
+    if settlement_details:
+        settlement_details["trip_id"] = trip.reference_id
     return settlement_details
 
 
@@ -2461,11 +2269,20 @@ def list_trip_bills(
 
     stmt = select(TripBill).where(
         TripBill.trip_id == trip_id,
-        TripBill.bill_type == "daily_bill",
+        TripBill.bill_type.in_(("daily_bill", "advance_recovery")),
     )
     if only_unpaid:
         stmt = stmt.where(TripBill.amount_due > 0)
-    return session.exec(stmt.order_by(TripBill.bill_date)).all()
+    rows = session.exec(stmt.order_by(TripBill.bill_date)).all()
+    return [
+        TripBillRead(
+            **{
+                **row.model_dump(exclude={"trip_id"}),
+                "trip_id": trip.reference_id,
+            }
+        )
+        for row in rows
+    ]
 
 
 @router.post("/bill/{bill_id}/pay")
@@ -2493,12 +2310,10 @@ def user_pay_bill(
         raise HTTPException(403, "Not authorized for this bill")
 
     trip = session.get(Trip, bill.trip_id)
-    # F6: cancellation_balance bills are payable on any payment method —
-    # they only exist after a mid-trip cancel that left a shortfall.
     if (
         trip
         and trip.payment_method != "trip_day"
-        and bill.bill_type != "cancellation_balance"
+        and bill.bill_type not in ("cancellation_balance", "advance_recovery")
     ):
         raise HTTPException(
             400,
@@ -2520,8 +2335,6 @@ def user_pay_bill(
         raise HTTPException(400, err)
 
     if client_secret:
-        # Platform: the bill clears (and any cancellation_pending → settled
-        # transition) on the gateway webhook via the orchestrator hook.
         _maybe_schedule_platform_settlement(background_tasks, payment)
         response = {
             "message": "Bill payment initiated. Confirm with the client secret; "
@@ -2537,8 +2350,6 @@ def user_pay_bill(
         idem.store(response)
         return response
 
-    # Wallet: settled synchronously; the orchestrator already settled the bill
-    # and ran any cancellation_pending → settled transition.
     try:
         send_push_notification(
             session=session,
@@ -2607,7 +2418,11 @@ def driver_mark_bill_paid(
         raise HTTPException(403, "Not authorized for this bill")
 
     trip = session.get(Trip, bill.trip_id)
-    if trip and trip.payment_method != "trip_day":
+    if (
+        trip
+        and trip.payment_method != "trip_day"
+        and bill.bill_type != "advance_recovery"
+    ):
         raise HTTPException(
             400,
             f"Daily bills cannot be paid individually for the '{trip.payment_method}' payment method.",
@@ -2679,21 +2494,7 @@ def pay_trip_settlement(
     ),
     idem: IdempotencyGuard = Depends(idempotent("settlement.pay", ["settlement_id"])),
 ):
-    """User pays the final trip settlement for advance_20 or full_payment methods.
-
-    ``channel`` is "wallet" (settles instantly) or "platform" (gateway card;
-    returns a client_secret and clears on the webhook). On success the
-    centralized orchestrator marks the settlement paid, clears any remaining
-    unpaid bills, lifts pauses, and closes a force-billed trip.
-
-    Outstation only: the user may add an ``extra_amount`` on top of
-    ``remaining_due`` for incidentals (toll, parking, food, other). When
-    ``extra_amount > 0`` the caller MUST supply ``extra_amount_breakdown`` —
-    a dict whose keys are a subset of ``{"toll", "parking", "food", "other"}``
-    and whose values sum to ``extra_amount``. The breakdown is stored on the
-    settlement row so finance / support can answer "what was the ₹300 for?"
-    without digging through chat history (F7).
-    """
+    """User pays the final trip settlement for advance_20 or full_payment methods."""
     if idem.cached_response is not None:
         return idem.cached_response
     _validate_online_channel(channel)
@@ -2728,9 +2529,6 @@ def pay_trip_settlement(
             "extra_amount is only allowed for outstation trip settlements",
         )
 
-    # F7: when paying any extra, the caller must itemise it. The sum must
-    # match `extra_amount` within ₹1 to allow for rounding. Empty breakdown
-    # with extra=0 is fine.
     validated_breakdown: Optional[dict] = None
     if extra > 0:
         if not extra_amount_breakdown or not isinstance(extra_amount_breakdown, dict):
@@ -2774,8 +2572,6 @@ def pay_trip_settlement(
     if not trip:
         raise HTTPException(404, "Trip not found for settlement")
 
-    # Carry the note + validated outstation extras on the Payment so the
-    # orchestrator persists them on the settlement when the charge succeeds.
     extra_meta: dict = {"settlement_id": settlement.id}
     if note:
         extra_meta["note"] = note
@@ -2797,8 +2593,6 @@ def pay_trip_settlement(
     )
 
     if client_secret:
-        # Platform: the settlement is marked paid, bills cleared, and the trip
-        # closed on the gateway webhook via the orchestrator hook.
         _maybe_schedule_platform_settlement(background_tasks, payment)
         response = {
             "message": "Settlement payment initiated. Confirm with the client "
@@ -2815,8 +2609,6 @@ def pay_trip_settlement(
         idem.store(response)
         return response
 
-    # Wallet: settled synchronously; the orchestrator marked the settlement
-    # paid, cleared remaining bills, unpaused, and closed a billed trip.
     session.refresh(settlement)
 
     try:

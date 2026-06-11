@@ -19,9 +19,10 @@ from app.core.models import (
     BookingAddressUpdate,
     User,
 )
-from app.modules.trips import booking_otp_service
-from app.modules.trips.arrival_service import mark_tow_arrived
-from app.modules.trips.booking_summary import build_tow_summary, address_edit_window
+from app.modules.bookings import otp_service as booking_otp_service
+from app.modules.bookings.summary_helpers import address_edit_window
+from app.modules.towing.arrival_service import mark_tow_arrived
+from app.modules.towing.booking_summary import build_tow_summary
 from app.modules.pricing.pricing_algo import (
     get_road_distance_duration,
     calculate_tow_cost,

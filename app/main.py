@@ -137,24 +137,27 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(purge_otps_scheduler, "interval", minutes=5)
     scheduler.add_job(auto_end_trip_scheduler, "interval", minutes=2)
     scheduler.add_job(driver_payment_timeout_scheduler, "interval", minutes=1)
-    scheduler.add_job(daily_settlement_scheduler, "cron", hour=23, minute=59)
+    # Daily jobs run as gated interval jobs: the job body checks a persisted
+    # due-time marker (SystemConfig row), so a run missed during downtime is
+    # caught up on the first tick after restart instead of waiting a full day.
+    scheduler.add_job(daily_settlement_scheduler, "interval", minutes=10)
     # Resolve trips stuck in `paused`: advance/full upfront unpaid > 1h
     # (auto-convert to trip_day) and trip_day daily bill unpaid > 48h
     # (force-close the booking with a final settlement).
     scheduler.add_job(auto_resolve_paused_trips_scheduler, "interval", minutes=5)
     # Self-heal trips stuck in active_pending_otp with no attendance rows (D3).
     scheduler.add_job(repair_orphan_active_trips_scheduler, "interval", minutes=10)
-    # F8: daily 09:00 IST — advance overdue settlements down the dunning
+    # F8: due 09:00 IST — advance overdue settlements down the dunning
     # ladder, push reminders, and hand off to collections at day 30.
-    scheduler.add_job(dunning_scheduler, "cron", hour=9, minute=0)
+    scheduler.add_job(dunning_scheduler, "interval", minutes=10)
     # Expire gateway/direct payment intents that never settle (no webhook /
     # never confirmed) → cancelled; also expire pending wallet top-ups.
     scheduler.add_job(expire_stale_payment_intents_scheduler, "interval", minutes=15)
     # Auto-cancel no-show service-center slot bookings (advance forfeited).
     scheduler.add_job(auto_cancel_no_show_service_bookings, "interval", minutes=15)
     # Daily provider payout sweep: move each provider's positive wallet balance
-    # to their bank via the payout partner (22:30 IST, after settlements).
-    scheduler.add_job(auto_payout_sweep_scheduler, "cron", hour=22, minute=30)
+    # to their bank via the payout partner (due 22:30 IST, after settlements).
+    scheduler.add_job(auto_payout_sweep_scheduler, "interval", minutes=10)
     # Auto-close service-linked support tickets after 2hrs of inactivity
     scheduler.add_job(auto_close_inactive_support_tickets, "interval", minutes=10)
     # Clean up attachments uploaded but never linked to a message
