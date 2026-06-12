@@ -28,6 +28,7 @@ from app.core import cache
 from app.utils.booking_states import SERVICE_CENTER_ENGAGED_STATES
 from app.core.security import get_current_active_service_center
 from app.modules.payments.service import refund_booking_payments
+from app.modules.service.booking_summary import build_service_summary
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
 from app.utils.id_generator import get_by_reference
 from sqlalchemy.orm import selectinload
@@ -579,6 +580,21 @@ def get_center_active_bookings(
     ]
     cache.cache_set_json(key, result, cache.ACTIVE_CACHE_TTL)
     return result
+
+
+@router.get("/me/bookings/{booking_id}/summary")
+def get_center_booking_summary(
+    booking_id: str,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """Rich status summary for the center app's booking screen. Visible only to
+    the center serving the booking. Returns a sanitized customer block (name +
+    avatar, no phone), an actions block, and the amount to collect."""
+    booking = get_by_reference(session, ServiceRequest, booking_id)
+    if not booking or booking.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return build_service_summary(session, booking, viewer="center")
 
 
 @router.patch("/me/bookings/{booking_id}/status")

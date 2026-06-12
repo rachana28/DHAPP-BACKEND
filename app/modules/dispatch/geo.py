@@ -109,11 +109,18 @@ def _nearest(
     limit: Optional[int],
     type_col: Optional[str] = None,
     type_val: Optional[str] = None,
+    extra_filters: Optional[List[tuple]] = None,
 ) -> Optional[List]:
     if lat is None or lng is None:
         return None
-    # Strict provider-type filter (e.g. tow_vehicle_type) when requested.
-    type_filter = (type_col, type_val) if type_col and type_val else None
+
+    type_filters: List[tuple] = []
+    if type_col and type_val:
+        type_filters.append((type_col, type_val))
+    for col, val in extra_filters or []:
+        if col and val:
+            type_filters.append((col, val))
+    type_filter = type_filters or None
 
     if limit is None:
         limit = get_config_int(session, KNN_LIMIT_KEY, DEFAULT_KNN_LIMIT)
@@ -174,7 +181,7 @@ def _knn_postgres(
     radius_m: float,
     fresh_cutoff,
     limit: int,
-    type_filter: Optional[tuple] = None,
+    type_filter: Optional[List[tuple]] = None,
 ) -> List[int]:
     params = {
         "lat": lat,
@@ -183,13 +190,12 @@ def _knn_postgres(
         "fresh_cutoff": fresh_cutoff,
         "limit": limit,
     }
-    # Optional strict provider-type clause; column name is a module-supplied
-    # constant (never user input), the value is bound as a parameter.
+
     type_clause = ""
-    if type_filter:
-        type_col, type_val = type_filter
-        type_clause = f"AND {type_col} = :type_val"
-        params["type_val"] = type_val
+    for i, (type_col, type_val) in enumerate(type_filter or []):
+        pname = f"type_val_{i}"
+        type_clause += f"\n          AND {type_col} = :{pname}"
+        params[pname] = type_val
 
     sql = text(
         f"""
@@ -229,7 +235,7 @@ def _nearest_haversine(
     lng: float,
     fresh_cutoff,
     limit: int,
-    type_filter: Optional[tuple] = None,
+    type_filter: Optional[List[tuple]] = None,
 ) -> List:
     conditions = [
         model.status == "available",
@@ -239,8 +245,7 @@ def _nearest_haversine(
         model.location_updated_at.is_not(None),
         model.location_updated_at >= fresh_cutoff,
     ]
-    if type_filter:
-        type_col, type_val = type_filter
+    for type_col, type_val in type_filter or []:
         conditions.append(getattr(model, type_col) == type_val)
     candidates = session.exec(select(model).where(*conditions)).all()
 
@@ -269,12 +274,21 @@ def nearest_available_tow_drivers(
     lng: Optional[float],
     limit: Optional[int] = None,
     tow_vehicle_type: Optional[str] = None,
+    service_type: str = "tow",
+    vehicle_class: Optional[str] = None,
 ) -> Optional[List[TowTruckDriver]]:
-    """Closest available tow drivers to (lat, lng); None if no coords given.
+    """Closest available tow/transport providers to (lat, lng); None if no coords.
 
-    When ``tow_vehicle_type`` is given, only drivers of that exact tow-truck
-    class are returned (strict matching).
+    Providers live in one table (``towtruckdriver``); ``service_type``
+    ("tow" | "transport") selects the kind and which class column to match. The
+    requested class is ``vehicle_class`` (falls back to the legacy
+    ``tow_vehicle_type`` arg). When a class is given only providers registered for
+    that exact class are returned (strict matching); ``service_type`` is always
+    enforced so tow and transport pools never mix.
     """
+    svc = service_type or "tow"
+    class_col = "transport_vehicle_type" if svc == "transport" else "tow_vehicle_type"
+    requested_class = vehicle_class if vehicle_class is not None else tow_vehicle_type
     return _nearest(
         session,
         model=TowTruckDriver,
@@ -286,8 +300,9 @@ def nearest_available_tow_drivers(
         lat=lat,
         lng=lng,
         limit=limit,
-        type_col="tow_vehicle_type" if tow_vehicle_type else None,
-        type_val=tow_vehicle_type,
+        type_col=class_col if requested_class else None,
+        type_val=requested_class,
+        extra_filters=[("service_type", svc)],
     )
 
 
@@ -334,7 +349,13 @@ def nearby_provider_locations(
     if lat is None or lng is None:
         return []
     if kind == "tow":
-        providers = nearest_available_tow_drivers(session, lat, lng, limit=limit)
+        providers = nearest_available_tow_drivers(
+            session, lat, lng, limit=limit, service_type="tow"
+        )
+    elif kind == "transport":
+        providers = nearest_available_tow_drivers(
+            session, lat, lng, limit=limit, service_type="transport"
+        )
     elif kind == "mechanic":
         providers = nearest_available_mechanics(session, lat, lng, limit=limit)
     else:

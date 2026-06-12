@@ -22,6 +22,23 @@ DEFAULT_TOW_PRICING = {
     "integrated": {"base_fare": 1200.0, "per_km": 60.0, "min_charge": 2000.0},
 }
 
+TRANSPORT_VEHICLE_TYPES = ("mini_truck", "tempo", "pickup", "container", "trailer")
+DEFAULT_TRANSPORT_VEHICLE_TYPE = "pickup"
+
+DEFAULT_TRANSPORT_PRICING = {
+    "pickup": {"base_fare": 400.0, "per_km": 25.0, "min_charge": 500.0},
+    "mini_truck": {"base_fare": 600.0, "per_km": 35.0, "min_charge": 800.0},
+    "tempo": {"base_fare": 800.0, "per_km": 45.0, "min_charge": 1200.0},
+    "container": {"base_fare": 1500.0, "per_km": 70.0, "min_charge": 2500.0},
+    "trailer": {"base_fare": 2000.0, "per_km": 90.0, "min_charge": 3500.0},
+}
+
+# Per-service registry: maps service_type -> (default-pricing table, default type).
+_SERVICE_PRICING = {
+    "tow": (DEFAULT_TOW_PRICING, DEFAULT_TOW_VEHICLE_TYPE),
+    "transport": (DEFAULT_TRANSPORT_PRICING, DEFAULT_TRANSPORT_VEHICLE_TYPE),
+}
+
 
 def get_road_distance_duration(
     start_lat: float, start_lng: float, dest_lat: float, dest_lng: float
@@ -57,10 +74,24 @@ def get_road_distance_duration(
     return dist_km, dist_km * 3
 
 
+def normalize_vehicle_class(service_type: str, vehicle_class: Optional[str]) -> str:
+    """Coerce to a supported class for the given service, defaulting unknown/empty
+    values. ``service_type`` is "tow" | "transport"."""
+    pricing, default_type = _SERVICE_PRICING.get(
+        (service_type or "tow"), _SERVICE_PRICING["tow"]
+    )
+    t = (vehicle_class or "").strip().lower()
+    return t if t in pricing else default_type
+
+
 def normalize_tow_vehicle_type(tow_vehicle_type: Optional[str]) -> str:
     """Coerce to a supported tow-truck class, defaulting unknown/empty values."""
-    t = (tow_vehicle_type or "").strip().lower()
-    return t if t in DEFAULT_TOW_PRICING else DEFAULT_TOW_VEHICLE_TYPE
+    return normalize_vehicle_class("tow", tow_vehicle_type)
+
+
+def normalize_transport_vehicle_type(transport_vehicle_type: Optional[str]) -> str:
+    """Coerce to a supported transport class, defaulting unknown/empty values."""
+    return normalize_vehicle_class("transport", transport_vehicle_type)
 
 
 def _tow_cfg(
@@ -72,43 +103,48 @@ def _tow_cfg(
     return get_config_value(session, redis_client, key, default)
 
 
-def calculate_tow_cost(
+def _calculate_service_cost(
+    service_type: str,
     distance_km: float,
-    tow_vehicle_type: str,
+    vehicle_class: str,
     session: Optional[Session] = None,
     redis_client: Optional[object] = None,
 ) -> dict:
-    """Per-tow-type tow fare. Rates come from SystemConfig (Redis → DB → default).
+    """Per-class distance fare shared by tow and transport. Rates come from
+    SystemConfig (Redis → DB → default) under keys
+    ``pricing_<service>_<class>_base_fare|_per_km|_min_charge`` plus
+    ``pricing_<service>_night_multiplier|_evening_multiplier``. Unknown/empty
+    classes fall back to that service's default class.
 
-    ``tow_vehicle_type`` is the tow-TRUCK class (flatbed / wheel_lift / hook_chain
-    / integrated) — NOT the customer's vehicle. Keys:
-    ``pricing_tow_<type>_base_fare`` / ``_per_km`` / ``_min_charge`` plus the
-    evening/night multipliers. Unknown/empty types fall back to a default class.
+    The breakdown's class key is named ``<service>_vehicle_type`` so the tow path
+    keeps emitting ``tow_vehicle_type`` exactly as before.
     """
-    tow_type = normalize_tow_vehicle_type(tow_vehicle_type)
-    defaults = DEFAULT_TOW_PRICING[tow_type]
+    svc = service_type if service_type in _SERVICE_PRICING else "tow"
+    pricing, _ = _SERVICE_PRICING[svc]
+    vclass = normalize_vehicle_class(svc, vehicle_class)
+    defaults = pricing[vclass]
 
     base_fare = _tow_cfg(
         session,
         redis_client,
-        f"pricing_tow_{tow_type}_base_fare",
+        f"pricing_{svc}_{vclass}_base_fare",
         defaults["base_fare"],
     )
     rate_per_km = _tow_cfg(
-        session, redis_client, f"pricing_tow_{tow_type}_per_km", defaults["per_km"]
+        session, redis_client, f"pricing_{svc}_{vclass}_per_km", defaults["per_km"]
     )
     min_charge = _tow_cfg(
         session,
         redis_client,
-        f"pricing_tow_{tow_type}_min_charge",
+        f"pricing_{svc}_{vclass}_min_charge",
         defaults["min_charge"],
     )
 
     # Time multiplier (admin-tunable surcharge for evening / night).
     current_hour = datetime.now().hour
-    night_mult = _tow_cfg(session, redis_client, "pricing_tow_night_multiplier", 1.5)
+    night_mult = _tow_cfg(session, redis_client, f"pricing_{svc}_night_multiplier", 1.5)
     evening_mult = _tow_cfg(
-        session, redis_client, "pricing_tow_evening_multiplier", 1.25
+        session, redis_client, f"pricing_{svc}_evening_multiplier", 1.25
     )
     if 22 <= current_hour or current_hour < 5:
         time_multiplier, time_label = night_mult, "Night"
@@ -137,7 +173,7 @@ def calculate_tow_cost(
     return {
         "final_price": final_price,
         "breakdown": {
-            "tow_vehicle_type": tow_type,
+            f"{svc}_vehicle_type": vclass,
             "base_fare": base_fare,
             "distance_km": round(distance_km, 2),
             "distance_cost": round(distance_cost, 2),
@@ -147,6 +183,39 @@ def calculate_tow_cost(
             "min_charge": min_charge,
         },
     }
+
+
+def calculate_tow_cost(
+    distance_km: float,
+    tow_vehicle_type: str,
+    session: Optional[Session] = None,
+    redis_client: Optional[object] = None,
+) -> dict:
+    """Per-tow-type tow fare (thin wrapper over :func:`_calculate_service_cost`).
+
+    ``tow_vehicle_type`` is the tow-TRUCK class (flatbed / wheel_lift / hook_chain
+    / integrated) — NOT the customer's vehicle. Behavior and ``pricing_tow_*``
+    keys are unchanged.
+    """
+    return _calculate_service_cost(
+        "tow", distance_km, tow_vehicle_type, session, redis_client
+    )
+
+
+def calculate_transport_cost(
+    distance_km: float,
+    transport_vehicle_type: str,
+    session: Optional[Session] = None,
+    redis_client: Optional[object] = None,
+) -> dict:
+    """Per-transport-class fare (thin wrapper over :func:`_calculate_service_cost`).
+
+    ``transport_vehicle_type`` is the cargo-vehicle class (mini_truck / tempo /
+    pickup / container / trailer). Keys: ``pricing_transport_<class>_*``.
+    """
+    return _calculate_service_cost(
+        "transport", distance_km, transport_vehicle_type, session, redis_client
+    )
 
 
 def estimate_tow_for_all_types(
@@ -162,6 +231,22 @@ def estimate_tow_for_all_types(
             **calculate_tow_cost(distance_km, t, session, redis_client),
         }
         for t in TOW_VEHICLE_TYPES
+    ]
+
+
+def estimate_transport_for_all_types(
+    distance_km: float,
+    session: Optional[Session] = None,
+    redis_client: Optional[object] = None,
+) -> List[dict]:
+    """Price every supported transport class for a given distance, so the user
+    app can present the options side-by-side after picking the Transport service."""
+    return [
+        {
+            "transport_vehicle_type": t,
+            **calculate_transport_cost(distance_km, t, session, redis_client),
+        }
+        for t in TRANSPORT_VEHICLE_TYPES
     ]
 
 

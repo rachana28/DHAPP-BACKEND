@@ -544,11 +544,14 @@ class TripService:
     def count_driver_skips_for_trip_in_window(
         self, session: Session, trip_id: int, ref_date: date
     ) -> int:
+        # Explicit driver skips AND driver-fault no-shows (skipped_by_system:
+        # missed shift / OTP-window expiry) share one budget, so a driver can't
+        # dodge the cap by simply not showing up instead of pressing "skip".
         window_start = ref_date - timedelta(days=self.DRIVER_SKIP_WINDOW_DAYS - 1)
         rows = session.exec(
             select(TripAttendance.id).where(
                 TripAttendance.trip_id == trip_id,
-                TripAttendance.status == "skipped_by_driver",
+                TripAttendance.status.in_(("skipped_by_driver", "skipped_by_system")),
                 TripAttendance.trip_date >= window_start,
                 TripAttendance.trip_date <= ref_date,
             )
@@ -629,6 +632,15 @@ class TripService:
                     ).first()
                     target = "completed" if has_any_present else "skipped"
                     self.transition_trip_state(session, trip_id, target, validate=False)
+                    # Stamp the end time so the daily settlement scheduler can
+                    # pick this trip up to retry settlement if the inline pass
+                    # (e.g. a settlement refund) fails. Mirrors the auto-close
+                    # scheduler and the end-trip / cancel paths.
+                    closed = session.get(Trip, trip_id)
+                    if closed and closed.actual_end_time is None:
+                        closed.actual_end_time = now_ist()
+                        session.add(closed)
+                        session.commit()
 
             return True, None
 

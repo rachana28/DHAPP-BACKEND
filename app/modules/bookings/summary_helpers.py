@@ -14,7 +14,7 @@ from typing import Any, Dict, Tuple
 
 from sqlmodel import Session, select
 
-from app.core.models import Payment
+from app.core.models import Payment, User
 from app.modules.bookings import otp_service as booking_otp_service
 from app.modules.dispatch import geo
 from app.utils.time_utils import now_ist
@@ -22,6 +22,18 @@ from app.utils.time_utils import now_ist
 PAID_STATES = ["succeeded", "partially_refunded", "refunded"]
 
 CANCELLABLE_STATES = ("searching", "accepted", "arrived")
+
+_NEXT_ACTION = {
+    "searching": "Waiting for a provider to accept",
+    "accepted": "Head to the customer and mark arrived",
+    "arrived": "Collect the start OTP from the customer and verify it",
+    "in_progress": "Service in progress — complete when done",
+    "near_destination": "Approaching destination — complete when done",
+    "completed": "Completed",
+    "cancelled": "Cancelled",
+    "no_drivers_found": "No provider was found",
+    "no_mechanics_found": "No mechanic was found",
+}
 
 
 def address_edit_window(session: Session, trip) -> Tuple[bool, datetime]:
@@ -62,11 +74,57 @@ def payment_view(session: Session, service_type: str, trip) -> Dict[str, Any]:
     return out
 
 
-def otp_view(session: Session, booking_type: str, trip) -> Dict[str, Any]:
+def otp_view(
+    session: Session, booking_type: str, trip, include_code: bool = True
+) -> Dict[str, Any]:
+    """OTP block for a booking summary.
+
+    ``include_code=True`` (user view) returns the plaintext OTP for the customer
+    to read out. ``include_code=False`` (provider view) returns only
+    ``{"otp_pending": True}`` so the provider knows to collect the code from the
+    customer without ever seeing it.
+    """
     if trip.status != "arrived":
         return {}
+    if not include_code:
+        pending = booking_otp_service.has_active_otp(session, booking_type, trip.id)
+        return {"otp_pending": bool(pending)}
     active = booking_otp_service.active_otp_view(session, booking_type, trip.id)
     if not active:
         return {}
     code, expires_at = active
     return {"otp": code, "otp_expires_at": expires_at}
+
+
+def provider_user_block(session: Session, user_id) -> Dict[str, Any]:
+    """Sanitized customer block for provider-facing summaries: name + avatar only,
+    NEVER phone, email, or the user UUID."""
+    user = session.get(User, user_id)
+    if not user:
+        return {}
+    return {"full_name": user.full_name, "avatar_url": user.avatar_url}
+
+
+def amount_to_collect(session: Session, service_type: str, trip) -> float:
+    """What the provider should collect from the customer at completion — the
+    payment_view's outstanding ``amount_due`` (0 once paid or cancelled)."""
+    return float(payment_view(session, service_type, trip).get("amount_due", 0.0))
+
+
+def provider_actions(trip, service_type: str) -> Dict[str, Any]:
+    """Derived (read-only) lifecycle action booleans + a next-step hint for the
+    provider app. Tells the app which buttons to enable for the current status;
+    performs no writes and mirrors the existing endpoint guards."""
+    status = trip.status or ""
+    live_complete_states = (
+        ("in_progress", "near_destination")
+        if service_type == "tow"
+        else ("in_progress",)
+    )
+    return {
+        "can_mark_arrived": status == "accepted",
+        "can_verify_otp": status == "arrived",
+        "can_complete": status in live_complete_states,
+        "can_cancel": status in CANCELLABLE_STATES,
+        "next_action": _NEXT_ACTION.get(status, status),
+    }

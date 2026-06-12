@@ -25,7 +25,8 @@ from app.modules.towing.arrival_service import mark_tow_arrived
 from app.modules.towing.booking_summary import build_tow_summary
 from app.modules.pricing.pricing_algo import (
     get_road_distance_duration,
-    calculate_tow_cost,
+    _calculate_service_cost,
+    TRANSPORT_VEHICLE_TYPES,
 )
 from app.workers.topics import telemetry_topic
 from app.utils.time_utils import now_ist
@@ -59,8 +60,14 @@ def _price_tow_trip(session, redis_client, trip: TowTrip) -> None:
         )
         if dist:
             trip.distance_km = round(dist, 2)
-    price = calculate_tow_cost(
-        trip.distance_km or 0.0, trip.tow_vehicle_type, session, redis_client
+    # Service-aware pricing: tow → pricing_tow_*, transport → pricing_transport_*.
+    # For tow trips (service_type defaults to "tow") this is identical to before.
+    price = _calculate_service_cost(
+        trip.service_type or "tow",
+        trip.distance_km or 0.0,
+        trip.requested_vehicle_class,
+        session,
+        redis_client,
     )
     trip.fare = price["final_price"]
     trip.fare_breakdown = price["breakdown"]
@@ -81,18 +88,36 @@ def create_tow_booking_request(
     trip_data["status"] = "searching"
     trip_data.pop("hiring_type", None)  # discriminator no longer stored
 
+    service_type = (trip_data.get("service_type") or "tow").strip().lower()
+    trip_data["service_type"] = service_type
+    # Transport is a new service: require a valid transport class up front. The tow
+    # path keeps its existing lenient behaviour (normalized at pricing time).
+    if service_type == "transport":
+        chosen = (trip_data.get("transport_vehicle_type") or "").strip().lower()
+        if chosen not in TRANSPORT_VEHICLE_TYPES:
+            raise HTTPException(
+                400,
+                "transport_vehicle_type must be one of: "
+                + ", ".join(TRANSPORT_VEHICLE_TYPES),
+            )
+        trip_data["transport_vehicle_type"] = chosen
+
     db_trip = TowTrip.model_validate(trip_data)
     db_trip.reference_id = generate_reference_id(session, TOW_TRIP)
-    # Server-authoritative pricing keyed on the requested tow-truck class.
+    # Server-authoritative pricing keyed on the requested provider class.
     _price_tow_trip(session, redis_client, db_trip)
 
     session.add(db_trip)
     session.commit()
     session.refresh(db_trip)
 
-    # Strict dispatch: only drivers registered for the requested tow-truck class.
+    # Strict dispatch: only providers of this service + requested class.
     ranked_drivers = rank_tow_drivers(
-        session, db_trip.start_lat, db_trip.start_lng, db_trip.tow_vehicle_type
+        session,
+        db_trip.start_lat,
+        db_trip.start_lng,
+        service_type=db_trip.service_type or "tow",
+        vehicle_class=db_trip.requested_vehicle_class,
     )
 
     if not ranked_drivers:
@@ -497,16 +522,19 @@ def get_tow_trip_summary(
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    authorized = trip.user_id == current_user.id
-    if not authorized and current_user.role == "tow_truck_driver":
+    is_owner = trip.user_id == current_user.id
+    is_provider = False
+    if not is_owner and current_user.role == "tow_truck_driver":
         driver = session.exec(
             select(TowTruckDriver).where(TowTruckDriver.user_id == current_user.id)
         ).first()
-        authorized = bool(driver and trip.tow_truck_driver_id == driver.id)
-    if not authorized:
+        is_provider = bool(driver and trip.tow_truck_driver_id == driver.id)
+    if not (is_owner or is_provider):
         raise HTTPException(403, "Not authorized to view this trip")
 
-    return build_tow_summary(session, trip)
+    return build_tow_summary(
+        session, trip, viewer="provider" if is_provider else "user"
+    )
 
 
 @router.patch("/{trip_id}/address")
@@ -553,7 +581,11 @@ def update_tow_trip_address(
             session.delete(offer)
         session.commit()
         ranked = rank_tow_drivers(
-            session, trip.start_lat, trip.start_lng, trip.tow_vehicle_type
+            session,
+            trip.start_lat,
+            trip.start_lng,
+            service_type=trip.service_type or "tow",
+            vehicle_class=trip.requested_vehicle_class,
         )
         if ranked:
             tier_size = geo.get_config_int(

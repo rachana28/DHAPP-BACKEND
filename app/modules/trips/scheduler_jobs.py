@@ -43,7 +43,10 @@ from app.core.models import (
 from app.modules.trips.otp_service import OTPService
 from app.modules.trips.trip_service import TripService
 from app.modules.trips.billing_service import BillingService
-from app.modules.trips.payment_service import PaymentService
+from app.modules.trips.payment_service import (
+    PaymentService,
+    get_driver_abandon_suspension_hours,
+)
 from app.utils.system_config import daily_job_due, mark_job_run
 from app.utils.time_utils import now_ist, today_ist
 from app.utils.notifications import send_push_notification
@@ -467,6 +470,56 @@ async def auto_mark_missed_shifts_scheduler():
                     f"(not started by scheduled end {att.scheduled_end})"
                 )
 
+                if trip.driver_id:
+                    used = trip_service.count_driver_skips_for_trip_in_window(
+                        session, trip.id, att.trip_date
+                    )
+                    if used >= trip_service.DRIVER_SKIP_LIMIT_PER_TRIP_WINDOW:
+                        driver = session.exec(
+                            select(Driver)
+                            .where(Driver.id == trip.driver_id)
+                            .with_for_update()
+                        ).first()
+                        now_suspend = now_ist()
+                        if driver and (
+                            driver.suspended_until is None
+                            or driver.suspended_until < now_suspend
+                        ):
+                            hours = get_driver_abandon_suspension_hours(
+                                session, get_redis()
+                            )
+                            driver.suspended_until = now_suspend + timedelta(
+                                hours=hours
+                            )
+                            session.add(driver)
+                            session.commit()
+                            logger.info(
+                                "Driver %s suspended %sh after exceeding the "
+                                "no-show/skip cap on trip %s",
+                                driver.id,
+                                hours,
+                                trip.id,
+                            )
+                            try:
+                                driver_user = session.get(User, driver.user_id)
+                                if driver_user:
+                                    send_push_notification(
+                                        session=session,
+                                        user_ids=[driver_user.id],
+                                        title="Account temporarily suspended",
+                                        body=(
+                                            "You've exceeded the allowed number of "
+                                            "missed/skipped shifts. New bookings "
+                                            f"are paused for {int(hours)}h."
+                                        ),
+                                        data={
+                                            "type": "driver_suspended",
+                                            "trip_id": trip.reference_id,
+                                        },
+                                    )
+                            except Exception:
+                                pass
+
                 try:
                     billing_service.check_advance_recovery(session, trip.id)
                 except Exception as rec_err:
@@ -633,7 +686,10 @@ async def daily_settlement_scheduler():
                 select(Trip)
                 .outerjoin(TripSettlement, TripSettlement.trip_id == Trip.id)
                 .where(
-                    Trip.status.in_(["completed", "auto_completed"]),
+                    # "skipped" included so an all-skipped trip whose settlement
+                    # refund failed (and therefore has no settlement row yet) is
+                    # retried here until the refund succeeds.
+                    Trip.status.in_(["completed", "auto_completed", "skipped"]),
                     Trip.actual_end_time.isnot(None),
                     TripSettlement.id.is_(None),
                 )
