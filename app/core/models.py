@@ -84,7 +84,9 @@ class TowTruckDriverBase(SQLModel):
     name: str
     phone_number: str
     vehicle_number: Optional[str] = None
+    service_type: str = "tow"
     tow_vehicle_type: Optional[str] = None
+    transport_vehicle_type: Optional[str] = None
     address: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: str = "pending_approval"
@@ -671,7 +673,9 @@ class TowTripBase(SQLModel):
         default=None, foreign_key="towtruckdriver.id"
     )
     vehicle_type: str  # the customer's vehicle (BIKE/CAR/...)
+    service_type: str = "tow"
     tow_vehicle_type: Optional[str] = None
+    transport_vehicle_type: Optional[str] = None
     start_location: Optional[str] = None
     end_location: Optional[str] = None
     start_lat: Optional[float] = None
@@ -701,6 +705,15 @@ class TowTrip(TowTripBase, table=True):
     )
     user: "User" = Relationship(back_populates="tow_trips")
     offers: List["TowTripOffer"] = Relationship(back_populates="trip")
+
+    @property
+    def requested_vehicle_class(self) -> Optional[str]:
+        """The provider class requested for this booking, picked by service_type:
+        ``transport_vehicle_type`` for transport bookings, else
+        ``tow_vehicle_type``. Centralizes "which class did the user ask for"."""
+        if (self.service_type or "tow") == "transport":
+            return self.transport_vehicle_type
+        return self.tow_vehicle_type
 
 
 # --- SAFETY LAYER: RESPONSE MODELS ---
@@ -765,6 +778,15 @@ class TowTruckDriver(TowTruckDriverBase, table=True):
     reviews: List["TowTruckDriverReview"] = Relationship(back_populates="driver")
     offers: List[TowTripOffer] = Relationship(back_populates="driver")
 
+    @property
+    def vehicle_class(self) -> Optional[str]:
+        """The class this provider is registered for, picked by service_type:
+        ``transport_vehicle_type`` for transport providers, else
+        ``tow_vehicle_type``."""
+        if (self.service_type or "tow") == "transport":
+            return self.transport_vehicle_type
+        return self.tow_vehicle_type
+
 
 class BookingOTP(SQLModel, table=True):
     """Geofenced start/end OTP for tow & mechanic bookings.
@@ -810,7 +832,9 @@ class TowTruckDriverPublic(SQLModel):
     rating: float
     profile_picture_url: Optional[str] = None
     vehicle_number: Optional[str] = None
+    service_type: str = "tow"
     tow_vehicle_type: Optional[str] = None
+    transport_vehicle_type: Optional[str] = None
     status: str
     total_trips: int = 0
 
@@ -822,9 +846,6 @@ class TripReadUser(TripSafe):
 
 
 # --- MechanicTrip / TowTrip response models ---
-# Mirrors TripSafe / TripReadUser field shape so the user / mechanic / tow-driver
-# apps can keep consuming the same JSON keys (including a constant `hiring_type`
-# discriminator) without any client-side change after the table split.
 class MechanicTripSafe(SQLModel):
     id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
     payment_status: Optional[str] = None
@@ -866,7 +887,9 @@ class TowTripSafe(SQLModel):
     payment_status: Optional[str] = None
     hiring_type: str = "Tow Service"
     vehicle_type: str
+    service_type: str = "tow"
     tow_vehicle_type: Optional[str] = None
+    transport_vehicle_type: Optional[str] = None
     shift_details: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -933,7 +956,9 @@ class TowTruckDriverUpdate(SQLModel):
     address: Optional[str] = None
     phone_number: Optional[str] = None
     vehicle_number: Optional[str] = None
+    service_type: Optional[str] = None
     tow_vehicle_type: Optional[str] = None
+    transport_vehicle_type: Optional[str] = None
     profile_picture_url: Optional[str] = None
     status: Optional[str] = None
 
@@ -1031,7 +1056,7 @@ class IdSequence(SQLModel, table=True):
     last_value: int = 0
 
 
-# --- NEW: SUPPORT TICKET SYSTEM ---
+# --- SUPPORT TICKET SYSTEM ---
 
 # Allowed values (kept as plain strings in DB to match existing style)
 SUPPORT_SERVICE_TYPES = {"trip", "tow", "mechanic", "service_center"}
@@ -1765,7 +1790,9 @@ class PayoutRecord(SQLModel, table=True):
     provider_user_id: uuid.UUID = Field(index=True)
     provider_type: str
     amount: float
-    status: str = Field(default="initiated", index=True)  # initiated|success|bounced|failed
+    status: str = Field(
+        default="initiated", index=True
+    )  # initiated|success|bounced|failed
 
     bank_name: Optional[str] = None
     account_number_masked: Optional[str] = None
@@ -1812,9 +1839,6 @@ class TripCreate(TripBase):
     driver_id: Optional[int] = None
 
 
-# Permissive request models for the mechanic / tow booking endpoints.
-# Clients today POST the full TripCreate shape (with `hiring_type` etc.);
-# unknown fields are ignored so existing apps need zero changes.
 class MechanicTripCreate(SQLModel):
     vehicle_type: str  # required, matches existing TripCreate contract
     user_id: Optional[uuid.UUID] = None
@@ -1831,7 +1855,9 @@ class MechanicTripCreate(SQLModel):
 
 class TowTripCreate(SQLModel):
     vehicle_type: str  # required, matches existing TripCreate contract
+    service_type: str = "tow"  # "tow" | "transport"; user picks the service first
     tow_vehicle_type: Optional[str] = None  # requested tow-truck class
+    transport_vehicle_type: Optional[str] = None  # requested transport class
     user_id: Optional[uuid.UUID] = None
     tow_truck_driver_id: Optional[int] = None
     hiring_type: Optional[str] = None  # accepted for back-compat; ignored
@@ -1890,7 +1916,9 @@ class VerifyOTPRequest(SQLModel):
     vehicle_type: Optional[str] = None
     # Tow Truck Specific Fields
     vehicle_number: Optional[str] = None
+    service_type: Optional[str] = None  # "tow" | "transport" (tow providers)
     tow_vehicle_type: Optional[str] = None  # flatbed/wheel_lift/hook_chain/integrated
+    transport_vehicle_type: Optional[str] = None  # mini_truck/tempo/pickup/...
     specialization: Optional[str] = None
     # Service Center Specific Fields
     address: Optional[str] = None

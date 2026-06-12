@@ -489,16 +489,19 @@ def get_mechanic_trip_summary(
     if not trip:
         raise HTTPException(404, "Trip not found")
 
-    authorized = trip.user_id == current_user.id
-    if not authorized and current_user.role == "mechanic":
+    is_owner = trip.user_id == current_user.id
+    is_provider = False
+    if not is_owner and current_user.role == "mechanic":
         mechanic = session.exec(
             select(Mechanic).where(Mechanic.user_id == current_user.id)
         ).first()
-        authorized = bool(mechanic and trip.mechanic_id == mechanic.id)
-    if not authorized:
+        is_provider = bool(mechanic and trip.mechanic_id == mechanic.id)
+    if not (is_owner or is_provider):
         raise HTTPException(403, "Not authorized to view this trip")
 
-    return build_mechanic_summary(session, trip)
+    return build_mechanic_summary(
+        session, trip, viewer="provider" if is_provider else "user"
+    )
 
 
 @router.patch("/{trip_id}/address")

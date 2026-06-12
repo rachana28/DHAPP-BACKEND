@@ -16,8 +16,11 @@ from app.core.models import Mechanic, MechanicTrip
 from app.modules.bookings.summary_helpers import (
     CANCELLABLE_STATES,
     address_edit_window,
+    amount_to_collect,
     otp_view,
     payment_view,
+    provider_actions,
+    provider_user_block,
 )
 from app.modules.dispatch import geo
 from app.workers.topics import telemetry_topic
@@ -40,7 +43,17 @@ def _mechanic_block(session: Session, mech: Mechanic) -> Dict[str, Any]:
     }
 
 
-def build_mechanic_summary(session: Session, trip: MechanicTrip) -> Dict[str, Any]:
+def build_mechanic_summary(
+    session: Session, trip: MechanicTrip, viewer: str = "user"
+) -> Dict[str, Any]:
+    """Mechanic booking summary.
+
+    ``viewer="user"`` (default) returns the rich customer-facing payload — kept
+    as before. ``viewer="provider"`` returns the mechanic-app shape: a sanitized
+    customer block (name + avatar, no phone), an ``actions`` block,
+    ``amount_to_collect`` and ``otp_pending`` (no OTP code), and no
+    ``nearby_providers``.
+    """
     editable, deadline = address_edit_window(session, trip)
     result: Dict[str, Any] = {
         "trip_id": trip.reference_id,
@@ -57,10 +70,23 @@ def build_mechanic_summary(session: Session, trip: MechanicTrip) -> Dict[str, An
         "actual_start_time": trip.actual_start_time,
         "actual_end_time": trip.actual_end_time,
         "payment_due_at": trip.payment_due_at,
-        "address_editable": editable,
-        "address_edit_deadline": deadline,
-        "cancellable": trip.status in CANCELLABLE_STATES,
     }
+
+    if viewer == "provider":
+        result["otp_pending"] = otp_view(
+            session, "mechanic", trip, include_code=False
+        ).get("otp_pending", False)
+        result["amount_to_collect"] = amount_to_collect(session, "mechanic", trip)
+        result["actions"] = provider_actions(trip, "mechanic")
+        result["customer"] = provider_user_block(session, trip.user_id)
+        if trip.status in _MECHANIC_LIVE_STATES:
+            result["telemetry_topic"] = telemetry_topic(trip.reference_id)
+        return result
+
+    # --- user view (unchanged) ---
+    result["address_editable"] = editable
+    result["address_edit_deadline"] = deadline
+    result["cancellable"] = trip.status in CANCELLABLE_STATES
     result.update(payment_view(session, "mechanic", trip))
     result.update(otp_view(session, "mechanic", trip))
 

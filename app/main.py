@@ -25,6 +25,7 @@ from app.modules.towing import (
     driver_router as tow_drivers_router,
     trip_router as tow_trips_router,
 )
+from app.modules.transport import router as transport_router
 from app.modules.pricing import router as pricing_router
 from app.modules.tracking import router as tracking_router
 from app.modules.admin import (
@@ -199,6 +200,9 @@ app.include_router(trips_router.router)
 app.include_router(users_router.router)
 app.include_router(tow_drivers_router.router)
 app.include_router(tow_trips_router.router)
+# Transport runs on the same stack as tow; alias routes under /transport-*.
+app.include_router(transport_router.transport_trips_router)
+app.include_router(transport_router.transport_drivers_router)
 app.include_router(tracking_router.router)
 app.include_router(pricing_router.router)
 app.include_router(support_router.router)

@@ -29,6 +29,7 @@ from app.core.models import (
 )
 from app.services.audit_log import emit_event as audit_emit
 from app.modules.payments import service as central
+from app.modules.trips.billing_service import USER_SKIP_FEE
 
 _PAID_IN_STATES = ["succeeded", "partially_refunded"]
 
@@ -262,17 +263,13 @@ class PaymentService:
         ).all()
         total_days = len(attendances) or 1
         served_days = sum(1 for a in attendances if a.status == "present")
-        skipped_user_days = sum(
-            1
-            for a in attendances
-            if a.status in ("skipped_by_user", "skipped_by_system")
-        )
+        skipped_user_days = sum(1 for a in attendances if a.status == "skipped_by_user")
 
         upfront_paid = self._user_paid_total(session, trip_id)
 
         per_day_rate = float(trip.fare or 0.0) / total_days
         served_charge = round(per_day_rate * served_days, 2)
-        anti_fraud = round(50.0 * skipped_user_days, 2)
+        anti_fraud = round(USER_SKIP_FEE * skipped_user_days, 2)
         net = round(upfront_paid - served_charge - anti_fraud, 2)
 
         return {
@@ -305,47 +302,6 @@ class PaymentService:
 
         total_paid = self._user_paid_total(session, trip_id)
         return round(min(gross_refund, total_paid), 2)
-
-    def calculate_refund_amount(
-        self, session: Session, trip_id: int
-    ) -> Tuple[float, Optional[str]]:
-        try:
-            trip = session.get(Trip, trip_id)
-            if not trip:
-                return 0.0, "Trip not found"
-
-            total_paid = self._user_paid_total(session, trip_id)
-
-            if trip.payment_method == "trip_day":
-                return (total_paid if trip.actual_start_time is None else 0.0), None
-
-            if trip.payment_method == "advance_20":
-                any_present = session.exec(
-                    select(TripAttendance.id).where(
-                        TripAttendance.trip_id == trip_id,
-                        TripAttendance.status == "present",
-                    )
-                ).first()
-                return (total_paid if any_present is None else 0.0), None
-
-            if trip.payment_method == "full_payment":
-                if not (trip.fare and trip.start_date and trip.end_date):
-                    return 0.0, None
-                daily_rate = trip.fare / ((trip.end_date - trip.start_date).days + 1)
-                days_used = len(
-                    session.exec(
-                        select(TripAttendance.id).where(
-                            TripAttendance.trip_id == trip_id,
-                            TripAttendance.status == "present",
-                        )
-                    ).all()
-                )
-                return max(0.0, total_paid - daily_rate * days_used), None
-
-            return total_paid, None
-
-        except Exception as e:
-            return 0.0, f"Refund calculation failed: {str(e)}"
 
     def refund_driver_acceptance_fee(
         self,

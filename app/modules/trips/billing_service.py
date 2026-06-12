@@ -7,6 +7,7 @@ discount is baked into the daily bill total so the user-visible amount is
 the actual amount due, not gross.
 """
 
+import logging
 import math
 from datetime import date
 
@@ -24,8 +25,15 @@ from app.core.models import (
     TripSettlement,
     PricingComponentBreakdown,
 )
+from app.services.audit_log import emit_event as audit_emit
+
+logger = logging.getLogger(__name__)
 
 _PAID_IN_STATES = ["succeeded", "partially_refunded"]
+
+# Flat fee a user forfeits for each day THEY voluntarily skip on a prepaid trip
+# (mirrors the cancellation anti-fraud fee). Driver-fault skips never incur it.
+USER_SKIP_FEE = 50.0
 
 
 def payment_method_discount_pct(
@@ -413,6 +421,40 @@ class BillingService:
 
             final_earned = round(total_earned, 2)
 
+            # Prepaid methods (advance_20 / full_payment) have no daily bills, so
+            # settle against an attribution-based "basis" instead: present days are
+            # retained at the NET (discounted) rate, user-skipped days forfeit only
+            # the flat USER_SKIP_FEE, and driver-fault days (skipped_by_driver /
+            # skipped_by_system) are credited the discount back so the user is made
+            # whole at the GROSS rate on a day the driver failed to serve. Clamped
+            # at >= 0 so a heavily driver-skipped trip refunds at most what was paid.
+            if (
+                trip.payment_method in ("advance_20", "full_payment")
+                and trip.fare
+                and total_trips > 0
+            ):
+                per_day_gross = trip.fare / total_trips
+                discount_pct = payment_method_discount_pct(
+                    trip.hiring_type, trip.payment_method
+                )
+                per_day_net = per_day_gross * (1 - discount_pct / 100.0)
+                driver_fault_days = len(
+                    [
+                        a
+                        for a in attendances
+                        if a.status in ("skipped_by_driver", "skipped_by_system")
+                    ]
+                )
+                user_skip_days = len(
+                    [a for a in attendances if a.status == "skipped_by_user"]
+                )
+                basis = (
+                    present_count * per_day_net
+                    + user_skip_days * USER_SKIP_FEE
+                    - driver_fault_days * (per_day_gross - per_day_net)
+                )
+                final_earned = round(max(0.0, basis), 2)
+
             remaining_due = max(0, final_earned - total_user_paid)
 
             net_user_paid = round(
@@ -422,16 +464,21 @@ class BillingService:
             if remaining_due <= 0 and net_user_paid > final_earned:
                 from app.modules.trips import payment_orchestrator
 
+                intended_refund = round(net_user_paid - final_earned, 2)
                 try:
                     refund_amount = payment_orchestrator.refund_trip_amount(
                         session,
                         trip_id,
-                        round(net_user_paid - final_earned, 2),
+                        intended_refund,
                         "Trip settlement refund (paid more than earned)",
                     )
-                except Exception:
+                except Exception as refund_err:
+                    # A refund failure must NOT be swallowed into a settlement
+                    # marked paid — that silently loses the user's money. Roll the
+                    # partial refund back (refund_payment never self-commits) and
+                    # abort WITHOUT creating the settlement, so the daily settlement
+                    # scheduler retries idempotently once the refund path recovers.
                     session.rollback()
-                    refund_amount = 0.0
                     session.exec(
                         select(Trip).where(Trip.id == trip_id).with_for_update()
                     ).first()
@@ -444,6 +491,26 @@ class BillingService:
                             raced.id,
                             "Settlement already exists for this trip",
                         )
+                    logger.error(
+                        "Settlement refund failed for trip %s (intended ₹%.2f): %s",
+                        trip_id,
+                        intended_refund,
+                        refund_err,
+                    )
+                    audit_emit(
+                        "settlement.refund_failed",
+                        trip_id=trip_id,
+                        actor="system",
+                        payload={
+                            "intended_refund": intended_refund,
+                            "error": str(refund_err),
+                        },
+                    )
+                    return (
+                        False,
+                        None,
+                        f"Settlement refund failed; will retry: {refund_err}",
+                    )
 
             settlement = TripSettlement(
                 trip_id=trip_id,

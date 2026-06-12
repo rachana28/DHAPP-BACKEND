@@ -21,6 +21,7 @@ from app.core.models import (
     SystemConfig,
 )
 from app.modules.payments.service import refund_booking_payments
+from app.modules.service.booking_summary import build_service_summary
 from app.services.dues import raise_if_unpaid_past_due
 from app.core.security import get_current_user
 from app.utils.notifications import send_push_notification
@@ -546,6 +547,20 @@ def get_my_service_bookings(
     bookings = session.exec(query.offset(offset).limit(limit)).all()
 
     return [ServiceRequestPublic(**b.model_dump()) for b in bookings]
+
+
+@router.get("/my-bookings/{booking_id}/summary")
+def get_my_service_booking_summary(
+    booking_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rich status summary for the user app's service-booking screen. Visible to
+    the booking's owner only. No phone numbers / sensitive data are returned."""
+    booking = get_by_reference(session, ServiceRequest, booking_id)
+    if not booking or booking.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return build_service_summary(session, booking, viewer="user")
 
 
 @router.patch("/my-bookings/{booking_id}/cancel")

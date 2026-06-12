@@ -30,33 +30,49 @@ def rank_tow_drivers(
     pickup_lat: Optional[float] = None,
     pickup_lng: Optional[float] = None,
     tow_vehicle_type: Optional[str] = None,
+    service_type: str = "tow",
+    vehicle_class: Optional[str] = None,
 ) -> List[TowTruckDriver]:
-    """Available tow drivers, closest-first.
+    """Available tow/transport providers, closest-first.
 
     When pickup coordinates are supplied, ordering is by spatial distance
     (PostGIS KNN, Haversine fallback on SQLite). If no coordinates are given —
     or the booking predates location capture — falls back to the legacy
     score-based ranking so existing behaviour is preserved.
 
-    When ``tow_vehicle_type`` is supplied, ranking is strictly limited to drivers
-    registered for that exact tow-truck class (both the spatial and legacy
-    paths); legacy bookings without a requested type are unfiltered.
+    ``service_type`` ("tow" | "transport") is always enforced so the two pools
+    never mix. The requested class is ``vehicle_class`` (falls back to the legacy
+    ``tow_vehicle_type`` arg) and, when supplied, strictly limits ranking to
+    providers registered for that exact class column (tow → ``tow_vehicle_type``,
+    transport → ``transport_vehicle_type``). Legacy bookings without a requested
+    type are unfiltered on class (but still filtered by service_type).
     """
+    svc = service_type or "tow"
+    requested_class = vehicle_class if vehicle_class is not None else tow_vehicle_type
+    class_attr = (
+        TowTruckDriver.transport_vehicle_type
+        if svc == "transport"
+        else TowTruckDriver.tow_vehicle_type
+    )
     if pickup_lat is not None and pickup_lng is not None:
         nearby = geo.nearest_available_tow_drivers(
             session,
             pickup_lat,
             pickup_lng,
             limit=geo.DISPATCH_POOL_LIMIT,
-            tow_vehicle_type=tow_vehicle_type,
+            service_type=svc,
+            vehicle_class=requested_class,
         )
 
         if nearby:
             return nearby
 
-    query = select(TowTruckDriver).where(TowTruckDriver.status == "available")
-    if tow_vehicle_type:
-        query = query.where(TowTruckDriver.tow_vehicle_type == tow_vehicle_type)
+    query = select(TowTruckDriver).where(
+        TowTruckDriver.status == "available",
+        TowTruckDriver.service_type == svc,
+    )
+    if requested_class:
+        query = query.where(class_attr == requested_class)
     drivers = session.exec(query).all()
 
     driver_scores = []
@@ -153,7 +169,11 @@ def attempt_tow_trip_escalation(session: Session, trip: TowTrip) -> bool:
 
         next_tier = current_tier + 1
         all_ranked_drivers = rank_tow_drivers(
-            session, trip.start_lat, trip.start_lng, trip.tow_vehicle_type
+            session,
+            trip.start_lat,
+            trip.start_lng,
+            service_type=trip.service_type or "tow",
+            vehicle_class=trip.requested_vehicle_class,
         )
 
         start = current_tier * TIER_SIZE

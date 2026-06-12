@@ -251,7 +251,9 @@ def verify_otp(
                 phone_number=phone,
                 user_id=user.id,
                 vehicle_number=request.vehicle_number,
+                service_type=(request.service_type or "tow"),
                 tow_vehicle_type=request.tow_vehicle_type,
+                transport_vehicle_type=request.transport_vehicle_type,
                 reference_id=generate_reference_id(session, TOW_DRIVER),
             )
             session.add(db_tow_driver)
