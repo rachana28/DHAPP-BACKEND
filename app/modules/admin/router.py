@@ -67,7 +67,7 @@ from app.core.models import PROVIDER_DOCUMENT_TYPES  # noqa: E402
 def assert_provider_profile_complete(profile, provider_type: str) -> None:
     """Block approval (status -> "available") unless the mandatory profile
     fields, all six labelled documents, and bank details are present. Applies to
-    drivers & tow-drivers (the providers that carry bank/document KYC)."""
+    drivers & tow-transport-drivers (the providers that carry bank/document KYC)."""
     missing = []
 
     if not getattr(profile, "vehicle_number", None):
@@ -255,7 +255,7 @@ def update_driver_status(
 
 
 # --- 3. TOW DRIVER MANAGEMENT ---
-@router.get("/tow-drivers", response_model=List[TowTruckDriverPrivate])
+@router.get("/tow-transport-drivers", response_model=List[TowTruckDriverPrivate])
 def get_tow_drivers_admin(
     status: Optional[str] = None, session: Session = Depends(get_session)
 ):
@@ -265,7 +265,7 @@ def get_tow_drivers_admin(
     return session.exec(query).all()
 
 
-@router.patch("/tow-drivers/{driver_id}/status")
+@router.patch("/tow-transport-drivers/{driver_id}/status")
 def update_tow_driver_status(
     driver_id: str,
     status: str = Query(..., regex="^(available|banned|pending_approval|rejected)$"),
