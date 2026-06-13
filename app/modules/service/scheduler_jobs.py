@@ -71,3 +71,48 @@ async def auto_cancel_no_show_service_bookings() -> None:
                 logger.info(f"Auto-cancelled {count} no-show service booking(s).")
     except Exception as e:
         logger.error(f"Service no-show auto-cancel scheduler failed: {e}")
+
+
+# Active states where a member should be doing the work — the same moments the
+# event hooks (check-in / status→active) try to auto-assign.
+_ASSIGNABLE_ACTIVE_STATES = (
+    "accepted",
+    "checked_in",
+    "service_ongoing",
+    "service_accepted",
+)
+
+
+async def sweep_unassigned_service_bookings() -> None:
+    """Safety-net for the event-driven member auto-assignment: pick up any active
+    booking that is still unassigned and try to auto-assign an expert member.
+    Each booking is committed independently by ``auto_assign_member``."""
+    try:
+        from app.modules.service.assignment import auto_assign_member
+
+        with Session(engine) as session:
+            rows = session.exec(
+                select(ServiceRequest).where(
+                    ServiceRequest.assigned_member_id.is_(None),
+                    ServiceRequest.status.in_(_ASSIGNABLE_ACTIVE_STATES),
+                )
+            ).all()
+            assigned = 0
+            for booking in rows:
+                try:
+                    # Sweep stays silent on "no expert" — the event hooks already
+                    # notified the center; re-pinging every 2 min would spam.
+                    if auto_assign_member(
+                        session, booking, notify_center_on_no_match=False
+                    ):
+                        assigned += 1
+                except Exception as e:
+                    logger.error(
+                        f"Auto-assign failed for {booking.reference_id}: {e}"
+                    )
+            if assigned:
+                logger.info(
+                    f"Auto-assigned {assigned} unassigned service booking(s)."
+                )
+    except Exception as e:
+        logger.error(f"Service auto-assign sweep failed: {e}")

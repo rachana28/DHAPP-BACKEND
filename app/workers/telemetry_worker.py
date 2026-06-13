@@ -39,7 +39,7 @@ from app.core.database import engine
 from app.core.models import MechanicTrip, TowTrip, TowTruckDriver, Mechanic
 from app.modules.dispatch import geo
 from app.modules.mechanic.arrival_service import mark_mechanic_arrived
-from app.modules.towing.arrival_service import mark_tow_arrived
+from app.modules.tow_transport.arrival_service import mark_tow_arrived
 from app.utils.id_generator import get_by_reference
 from app.utils.notifications import send_push_notification
 from app.utils.time_utils import now_ist

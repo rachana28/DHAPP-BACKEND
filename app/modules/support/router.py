@@ -26,7 +26,7 @@ from app.core.models import (
     SupportFAQ,
     SupportFAQResponse,
 )
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_no_member
 from app.modules.support import service as support_service
 from app.modules.support.attachments import upload_support_attachment
 from app.modules.support.ws_manager import manager
@@ -58,7 +58,7 @@ def list_faqs(
     service_type: Optional[str] = None,
     category: Optional[str] = None,
     session: Session = Depends(get_session),
-    _: User = Depends(get_current_user),
+    _: User = Depends(get_current_user_no_member),
 ):
     q = select(SupportFAQ).where(SupportFAQ.is_active == True)  # noqa: E712
     if service_type:
@@ -78,7 +78,7 @@ def list_faqs(
 def create_ticket(
     payload: SupportTicketCreate,
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_no_member),
 ):
     """Create a new support ticket, optionally linked to a service."""
     ticket = support_service.create_ticket(session, current_user, payload)
@@ -92,7 +92,7 @@ def get_my_tickets(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_no_member),
 ):
     q = (
         select(SupportTicket)
@@ -110,7 +110,7 @@ def get_my_tickets(
 def get_ticket_detail(
     ticket_db_id: int,
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_no_member),
 ):
     ticket = session.get(SupportTicket, ticket_db_id)
     if not ticket:
@@ -137,7 +137,7 @@ async def post_message(
     ticket_db_id: int,
     payload: SupportMessageCreate,
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_no_member),
 ):
     """HTTP fallback for sending a message (WebSocket is the primary path)."""
     ticket = session.get(SupportTicket, ticket_db_id)
@@ -177,7 +177,7 @@ async def upload_attachments(
     ticket_db_id: int,
     files: List[UploadFile] = File(...),
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_no_member),
 ):
     """
     Upload one or more files (image/document, <= 10MB each) for a ticket.
@@ -218,7 +218,7 @@ async def upload_attachments(
 async def user_close_ticket(
     ticket_db_id: int,
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_no_member),
 ):
     ticket = session.get(SupportTicket, ticket_db_id)
     if not ticket:

@@ -7,9 +7,9 @@ the public driver directory (list, detail, reviews) consumed by the user app.
 """
 
 import json
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
 from fastapi.encoders import jsonable_encoder
-from sqlmodel import Session, select, func, desc
+from sqlmodel import Session, select, func
 from typing import List
 import redis
 
@@ -20,7 +20,6 @@ from app.core.models import (
     DriverUpdate,
     DriverPublic,
     DriverPrivate,
-    DriverReview,
     Trip,
     ProviderBankDetailsUpdate,
     PROVIDER_DOCUMENT_TYPES,
@@ -159,29 +158,6 @@ def read_driver(
         )
 
     return public_driver
-
-
-@router.get("/{driver_id}/reviews", response_model=List[DriverReview])
-def get_driver_reviews(
-    driver_id: str,
-    session: Session = Depends(get_session),
-    page: int = Query(1, gt=0),
-    limit: int = Query(5, gt=0, le=50),
-):
-    """Get reviews for a specific driver with pagination."""
-    driver = get_by_reference(session, Driver, driver_id)
-    if not driver:
-        raise HTTPException(status_code=404, detail="Driver not found")
-
-    offset = (page - 1) * limit
-    reviews = session.exec(
-        select(DriverReview)
-        .where(DriverReview.driver_id == driver.id)
-        .order_by(desc(DriverReview.created_at))
-        .offset(offset)
-        .limit(limit)
-    ).all()
-    return reviews
 
 
 @router.post("/me/documents")

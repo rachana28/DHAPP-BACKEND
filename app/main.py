@@ -21,11 +21,10 @@ from app.modules.config import router as config_router
 from app.modules.auth import router as auth_router, users as users_router
 from app.modules.drivers import router as drivers_router
 from app.modules.trips import router as trips_router
-from app.modules.towing import (
+from app.modules.tow_transport import (
     driver_router as tow_drivers_router,
     trip_router as tow_trips_router,
 )
-from app.modules.transport import router as transport_router
 from app.modules.pricing import router as pricing_router
 from app.modules.tracking import router as tracking_router
 from app.modules.admin import (
@@ -49,6 +48,7 @@ from app.modules.mechanic import (
 from app.modules.service import (
     center_router as service_center_router,
     user_router as service_user_router,
+    member_router as service_member_router,
 )
 from app.modules.payments import router as payments_router
 from app.modules.addresses import router as addresses_router
@@ -60,7 +60,7 @@ from app.modules.bookings import active_router as bookings_active_router
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
-from app.modules.towing.tow_allocation import process_tow_tier_escalation
+from app.modules.tow_transport.tow_allocation import process_tow_tier_escalation
 from app.modules.trips.scheduler_jobs import (
     generate_otp_for_trip_scheduler,
     expire_otp_for_trip_scheduler,
@@ -78,6 +78,7 @@ from app.modules.payments.scheduler_jobs import (
 from app.modules.payout.scheduler_jobs import auto_payout_sweep_scheduler
 from app.modules.service.scheduler_jobs import (
     auto_cancel_no_show_service_bookings,
+    sweep_unassigned_service_bookings,
 )
 
 
@@ -156,6 +157,9 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(expire_stale_payment_intents_scheduler, "interval", minutes=15)
     # Auto-cancel no-show service-center slot bookings (advance forfeited).
     scheduler.add_job(auto_cancel_no_show_service_bookings, "interval", minutes=15)
+    # Safety-net for member auto-assignment: assign any active service booking
+    # still left without a center-member (complements the event-driven hooks).
+    scheduler.add_job(sweep_unassigned_service_bookings, "interval", minutes=2)
     # Daily provider payout sweep: move each provider's positive wallet balance
     # to their bank via the payout partner (due 22:30 IST, after settlements).
     scheduler.add_job(auto_payout_sweep_scheduler, "interval", minutes=10)
@@ -198,11 +202,10 @@ app.include_router(auth_router.router)
 app.include_router(drivers_router.router)
 app.include_router(trips_router.router)
 app.include_router(users_router.router)
+# Tow & Transport share one stack/table (TowTrip, discriminated by
+# service_type); a single unified router serves both under /tow-transport-*.
 app.include_router(tow_drivers_router.router)
 app.include_router(tow_trips_router.router)
-# Transport runs on the same stack as tow; alias routes under /transport-*.
-app.include_router(transport_router.transport_trips_router)
-app.include_router(transport_router.transport_drivers_router)
 app.include_router(tracking_router.router)
 app.include_router(pricing_router.router)
 app.include_router(support_router.router)
@@ -215,6 +218,7 @@ app.include_router(mechanic_router.router)
 app.include_router(mechanic_profile_router.router)
 app.include_router(service_center_router.router)
 app.include_router(service_user_router.router)
+app.include_router(service_member_router.router)
 app.include_router(payments_router.router)
 app.include_router(addresses_router.router)
 app.include_router(cards_router.router)

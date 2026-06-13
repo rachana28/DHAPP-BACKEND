@@ -3,7 +3,7 @@
 Flips an ``accepted`` tow trip to ``arrived``, issues the start OTP (persisted +
 plaintext cached for the summary API), and pushes it to the customer. Used by
 BOTH triggers so they never diverge: the telemetry worker's geofence check
-(auto) and the manual ``POST /tow-trips/{ref}/mark-arrived`` endpoint (fallback
+(auto) and the manual ``POST /tow-transport-trips/{ref}/mark-arrived`` endpoint (fallback
 when telemetry is unavailable or GPS drift keeps the geofence from firing).
 Returns the fresh OTP code, or ``None`` if the booking wasn't in a state to
 arrive (idempotent: re-calling on an already-``arrived`` booking is a no-op).

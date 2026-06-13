@@ -17,6 +17,8 @@ that entity within the year.
 
 from __future__ import annotations
 
+import secrets
+import string
 from typing import Optional, Type
 
 from sqlmodel import Session, select
@@ -33,6 +35,7 @@ DRIVER = "driver"
 TOW_DRIVER = "tow_driver"
 MECHANIC = "mechanic"
 SERVICE_CENTER = "service_center"
+CENTER_MEMBER = "center_member"
 PAYMENT = "payment"
 ADDRESS = "address"
 CARD = "card"
@@ -52,6 +55,7 @@ _SCHEME = {
     TOW_DRIVER: ("TD", 4),
     MECHANIC: ("MN", 4),
     SERVICE_CENTER: ("SC", 4),
+    CENTER_MEMBER: ("CM", 4),
     PAYMENT: ("PAY", 6),
     ADDRESS: ("ADR", 4),
     CARD: ("CRD", 4),
@@ -130,3 +134,30 @@ def get_by_reference(session: Session, model: Type, reference_id: str):
     return session.exec(
         select(model).where(model.reference_id == reference_id)
     ).first()
+
+
+# Code alphabet for service-center codes: uppercase letters + digits. Ambiguous
+# characters are kept (full A-Z0-9) so the space is large; collisions are
+# handled by the DB-uniqueness retry loop below.
+_CENTER_CODE_ALPHABET = string.ascii_uppercase + string.digits
+_CENTER_CODE_LEN = 6
+
+
+def generate_center_code(session: Session, *, max_attempts: int = 25) -> str:
+    """Return a unique 6-char uppercase-alphanumeric ``ServiceCenter.center_code``.
+
+    Generated randomly and checked against the DB; retries on the (rare)
+    collision. Raises after ``max_attempts`` exhausted (effectively never with a
+    36**6 ≈ 2.1B space)."""
+    from app.core.models import ServiceCenter
+
+    for _ in range(max_attempts):
+        code = "".join(
+            secrets.choice(_CENTER_CODE_ALPHABET) for _ in range(_CENTER_CODE_LEN)
+        )
+        exists = session.exec(
+            select(ServiceCenter).where(ServiceCenter.center_code == code)
+        ).first()
+        if not exists:
+            return code
+    raise RuntimeError("Could not generate a unique center_code; try again.")

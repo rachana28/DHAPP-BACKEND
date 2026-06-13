@@ -24,12 +24,17 @@ from app.core.models import (
     SavedCardUpdate,
     SavedCardPublic,
 )
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_no_member
 from app.modules.cards import service as card_service
 from app.utils.id_generator import get_by_reference
 from app.utils.time_utils import now_ist
 
-router = APIRouter(prefix="/cards", tags=["Cards"])
+# Center-members have no saved cards — blocked at the router level.
+router = APIRouter(
+    prefix="/cards",
+    tags=["Cards"],
+    dependencies=[Depends(get_current_user_no_member)],
+)
 
 
 def _owned_active(session: Session, reference_id: str, user_id) -> SavedCard:

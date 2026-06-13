@@ -7,7 +7,14 @@ from sqlmodel import Session, select
 import uuid
 
 from app.core.database import get_session
-from app.core.models import User, Driver, TowTruckDriver, Mechanic, ServiceCenter
+from app.core.models import (
+    User,
+    Driver,
+    TowTruckDriver,
+    Mechanic,
+    ServiceCenter,
+    CenterMember,
+)
 
 SECRET_KEY = "supersecretkey_change_this_in_production"
 REFRESH_SECRET_KEY = "refresh_supersecretkey_change_this_too"
@@ -221,6 +228,48 @@ def get_current_active_service_center(
         pass
 
     return service_center
+
+
+def get_current_active_center_member(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> CenterMember:
+    """Authorize a center-member (a worker under a service center). Banned
+    accounts are rejected; pending/rejected members can still authenticate to
+    view their own status (assignment-gated endpoints simply return empty until
+    approved). Center-members have NO wallet/help and are deliberately excluded
+    from the provider-role map and get_current_active_user."""
+    if current_user.role != "center_member":
+        raise HTTPException(status_code=403, detail="Not a center member")
+
+    member = session.exec(
+        select(CenterMember).where(CenterMember.user_id == current_user.id)
+    ).first()
+
+    if not member:
+        raise HTTPException(status_code=404, detail="Center member profile not found")
+
+    if member.status == "banned":
+        raise HTTPException(
+            status_code=403,
+            detail="ACCOUNT_BANNED: Your account has been permanently suspended.",
+        )
+
+    return member
+
+
+def get_current_user_no_member(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Like get_current_user, but rejects center-members. Used to keep
+    center-members out of end-user account features (wallet / cards / addresses)
+    and help/support — features they must not have."""
+    if current_user.role == "center_member":
+        raise HTTPException(
+            status_code=403,
+            detail="This feature is not available for center members.",
+        )
+    return current_user
 
 
 def get_current_active_user(
