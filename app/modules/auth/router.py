@@ -14,6 +14,7 @@ from app.core.models import (
     TowTruckDriver,
     Mechanic,
     ServiceCenter,
+    CenterMember,
     VerifyOTPRequest,
     SendOTPRequest,
     UserDevice,
@@ -28,12 +29,15 @@ from app.core.security import (
 )
 from app.utils.id_generator import (
     generate_reference_id,
+    generate_center_code,
     get_by_reference,
     DRIVER,
     TOW_DRIVER,
     MECHANIC,
     SERVICE_CENTER,
+    CENTER_MEMBER,
 )
+from app.utils.notifications import notify_safe
 import requests
 import re
 from dns import resolver
@@ -278,9 +282,73 @@ def verify_otp(
                 latitude=request.latitude,
                 longitude=request.longitude,
                 reference_id=generate_reference_id(session, SERVICE_CENTER),
+                center_code=generate_center_code(session),
             )
             session.add(new_service_center)
             session.commit()
+        elif role == "center_member":
+            # A worker joining an existing center by its 6-char center_code.
+            # Approval is the center's job (no admin), so we register as
+            # pending_approval and notify the center.
+            if not request.center_code:
+                raise HTTPException(
+                    status_code=400, detail="center_code is required"
+                )
+            if not request.expert_in:
+                raise HTTPException(
+                    status_code=400,
+                    detail="expert_in is required (at least one service)",
+                )
+            center = session.exec(
+                select(ServiceCenter).where(
+                    ServiceCenter.center_code == request.center_code.strip().upper()
+                )
+            ).first()
+            if not center:
+                # Roll back the just-created User so the phone can retry cleanly.
+                session.delete(user)
+                session.commit()
+                raise HTTPException(status_code=404, detail="Invalid center code")
+
+            valid_services = {s.service_name for s in center.services}
+            invalid = [e for e in request.expert_in if e not in valid_services]
+            if invalid:
+                session.delete(user)
+                session.commit()
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "expert_in must be services offered by this center",
+                        "invalid": invalid,
+                        "valid_options": sorted(valid_services),
+                    },
+                )
+
+            new_member = CenterMember(
+                user_id=user.id,
+                service_center_id=center.id,
+                name=request.full_name,
+                phone_number=phone,
+                date_of_birth=request.date_of_birth,
+                gender=request.gender,
+                expert_in=request.expert_in,
+                status="pending_approval",
+                is_online=True,
+                reference_id=generate_reference_id(session, CENTER_MEMBER),
+            )
+            session.add(new_member)
+            session.commit()
+            session.refresh(new_member)
+            notify_safe(
+                session=session,
+                user_ids=[center.user_id],
+                title="New member request",
+                body=f"{new_member.name} requested to join your center.",
+                data={
+                    "type": "center_member_request",
+                    "member_id": new_member.reference_id,
+                },
+            )
 
     # 4. Generate Session Tokens
     access_token = create_access_token(

@@ -23,14 +23,21 @@ from app.core.models import (
     ServiceRequestForCenter,
     BookingType,
     ServiceStatus,
+    CenterMember,
+    CenterMemberForCenter,
+    CenterMemberAssignCandidate,
+    MemberAssignmentRequest,
+    MemberApprovalRequest,
 )
 from app.core import cache
 from app.utils.booking_states import SERVICE_CENTER_ENGAGED_STATES
 from app.core.security import get_current_active_service_center
 from app.modules.payments.service import refund_booking_payments
 from app.modules.service.booking_summary import build_service_summary
+from app.modules.service import assignment as member_assignment
 from app.utils.storage import upload_document_to_r2, upload_profile_picture_to_r2
 from app.utils.id_generator import get_by_reference
+from app.utils.notifications import notify_safe
 from sqlalchemy.orm import selectinload
 
 router = APIRouter(prefix="/service-centers", tags=["Service Centers"])
@@ -651,6 +658,7 @@ def update_booking_status(
 
     session.add(booking)
     session.commit()
+    session.refresh(booking)
 
     if center_cancelled:
         refund_booking_payments(
@@ -661,6 +669,17 @@ def update_booking_status(
             actor="service_center",
             actor_id=str(current_center.id),
         )
+
+    # Keep the assigned member's active-assignment cache fresh on any transition,
+    # and auto-assign when the booking becomes active and is still unassigned.
+    if booking.assigned_member_id:
+        member_assignment.invalidate_member_active_cache(booking.assigned_member_id)
+    elif new_status in (
+        ServiceStatus.ACCEPTED.value,
+        ServiceStatus.CHECKED_IN.value,
+        ServiceStatus.SERVICE_ONGOING.value,
+    ):
+        member_assignment.auto_assign_member(session, booking)
 
     return {
         "message": f"Booking status updated to {new_status}",
@@ -701,6 +720,12 @@ def checkin_vehicle(
 
     session.add(booking)
     session.commit()
+    session.refresh(booking)
+
+    # Walk-in vehicle has arrived: if the center hasn't assigned a member yet,
+    # auto-assign an available expert now.
+    if not booking.assigned_member_id:
+        member_assignment.auto_assign_member(session, booking)
 
     return {"message": "Vehicle checked in successfully"}
 
@@ -895,3 +920,274 @@ def accept_walkin_service(
         "price_locked": booking.price_locked,
         "service_accepted_time": booking.service_accepted_time,
     }
+
+
+# --- CENTER MEMBER MANAGEMENT ---
+
+
+def _member_for_center(
+    session: Session, m: CenterMember, *, detail: bool = False
+) -> CenterMemberForCenter:
+    """Build the center's sanitized view of a member. `detail=True` adds the
+    completed/pending/hours stats (omitted from list rows for cost)."""
+    data: Dict[str, Any] = {
+        "id": m.reference_id,
+        "name": m.name,
+        "gender": m.gender,
+        "profile_picture_url": m.profile_picture_url,
+        "expert_in": m.expert_in,
+        "is_online": m.is_online,
+        "status": m.status,
+        "rating": m.rating,
+        "total_reviews": m.total_reviews,
+        "current_assignments": member_assignment.member_current_assignment_blocks(
+            session, m.id
+        ),
+    }
+    if detail:
+        data.update(member_assignment.member_stats(session, m.id))
+    return CenterMemberForCenter(**data)
+
+
+@router.get("/me/members", response_model=List[CenterMemberForCenter])
+def list_center_members(
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+    status: str = Query(None, description="pending_approval|approved|rejected|suspended|banned"),
+    expert: str = Query(None, description="filter to members with this service in expert_in"),
+    page: int = Query(1, gt=0),
+    limit: int = Query(50, gt=0, le=100),
+):
+    """List this center's members (sanitized — no internal id / center_code /
+    phone). Filter by status (e.g. pending_approval to triage requests) or by an
+    expertise/service name."""
+    offset = (page - 1) * limit
+    query = select(CenterMember).where(
+        CenterMember.service_center_id == current_center.id
+    )
+    if status:
+        query = query.where(CenterMember.status == status)
+    query = query.order_by(desc(CenterMember.created_at))
+    if expert:
+        # expert_in is a JSON list (DB-agnostic) — filter then page in Python so
+        # the page isn't silently short. Member counts per center are small.
+        matched = [
+            m for m in session.exec(query).all() if expert in (m.expert_in or [])
+        ]
+        members = matched[offset : offset + limit]
+    else:
+        members = session.exec(query.offset(offset).limit(limit)).all()
+    return [_member_for_center(session, m) for m in members]
+
+
+@router.get("/me/members/available", response_model=List[CenterMemberAssignCandidate])
+def list_available_members(
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+    booking_id: str = Query(None, description="rank/filter candidates for this booking's service"),
+    include_non_experts: bool = Query(True, description="soft expertise: include non-matches"),
+):
+    """Members eligible for assignment (approved + online). When `booking_id` is
+    given, expertise matches are flagged and listed first; non-experts are
+    included by default (manual assignment is soft — center may override)."""
+    members = member_assignment.approved_online_members(session, current_center.id)
+
+    service_name = None
+    if booking_id:
+        booking = get_by_reference(session, ServiceRequest, booking_id)
+        if booking and booking.service_center_id == current_center.id:
+            service_name = booking.service_name
+
+    rows: List[CenterMemberAssignCandidate] = []
+    for m in members:
+        match = (
+            member_assignment.expertise_matches(m, service_name)
+            if service_name
+            else True
+        )
+        if service_name and not match and not include_non_experts:
+            continue
+        # Fetch the member's active assignments once; derive count + soonest-free.
+        active = member_assignment.member_active_assignments(session, m.id)
+        ests = [member_assignment.completion_estimate(session, b) for b in active]
+        ests = [e for e in ests if e]
+        rows.append(
+            CenterMemberAssignCandidate(
+                id=m.reference_id,
+                name=m.name,
+                expert_in=m.expert_in,
+                is_online=m.is_online,
+                active_task_count=len(active),
+                soonest_free_at=(min(ests) if ests else None),
+                expertise_match=match,
+            )
+        )
+    # experts first, then least-loaded.
+    rows.sort(key=lambda r: (not r.expertise_match, r.active_task_count))
+    return rows
+
+
+@router.get("/me/members/{member_ref}", response_model=CenterMemberForCenter)
+def get_center_member_detail(
+    member_ref: str,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """Full (sanitized) member detail + work stats (completed / pending / total
+    hours worked). No internal id / center_code."""
+    member = get_by_reference(session, CenterMember, member_ref)
+    if not member or member.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return _member_for_center(session, member, detail=True)
+
+
+_APPROVAL_ACTIONS = {
+    "approve": "approved",
+    "reject": "rejected",
+    "suspend": "suspended",
+    "reactivate": "approved",
+}
+
+
+@router.patch("/me/members/{member_ref}/approval")
+def update_member_approval(
+    member_ref: str,
+    body: MemberApprovalRequest,
+    *,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """Approve / reject / suspend / reactivate a member (the center owns this —
+    no admin approval). Notifies the member."""
+    member = get_by_reference(session, CenterMember, member_ref)
+    if not member or member.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    action = (body.action or "").strip().lower()
+    if action not in _APPROVAL_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="action must be one of: approve, reject, suspend, reactivate",
+        )
+
+    member.status = _APPROVAL_ACTIONS[action]
+    session.add(member)
+    session.commit()
+    session.refresh(member)
+
+    cache.cache_delete(cache.me_key("center_member", member.id))
+    member_assignment.invalidate_member_active_cache(member.id)
+
+    notify_safe(
+        session=session,
+        user_ids=[member.user_id],
+        title="Membership update",
+        body=f"Your membership status is now '{member.status}'."
+        + (f" Note: {body.note}" if body.note else ""),
+        data={"type": "center_member_status", "status": member.status},
+    )
+    return {
+        "message": f"Member {action} done",
+        "member_id": member.reference_id,
+        "status": member.status,
+    }
+
+
+# --- BOOKING ⇄ MEMBER ASSIGNMENT ---
+
+
+@router.patch("/me/bookings/{booking_id}/assign")
+def assign_member_to_booking(
+    booking_id: str,
+    body: MemberAssignmentRequest,
+    *,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """Manually assign (or reassign) a member to a slot or walk-in booking.
+    Approved + online members only; walk-in requires the vehicle to have checked
+    in. Expertise is soft here (center may override)."""
+    booking = get_by_reference(session, ServiceRequest, booking_id)
+    if not booking or booking.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.status in (
+        ServiceStatus.COMPLETED.value,
+        ServiceStatus.CANCELLED.value,
+    ):
+        raise HTTPException(
+            status_code=400, detail="Cannot assign on a completed/cancelled booking"
+        )
+
+    member = get_by_reference(session, CenterMember, body.member_id)
+    if not member or member.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.status != "approved":
+        raise HTTPException(status_code=400, detail="Member is not approved")
+    if not member.is_online:
+        raise HTTPException(status_code=400, detail="Member is offline / unavailable")
+
+    service = session.get(CenterService, booking.center_service_id)
+    if service and service.booking_type == BookingType.WALK_IN and booking.status in (
+        ServiceStatus.BOOKED.value,
+        ServiceStatus.ACCEPTED.value,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Assign a member only after the vehicle has checked in",
+        )
+
+    previous = booking.assigned_member_id
+    booking.assigned_member_id = member.id
+    booking.assigned_at = datetime.utcnow()
+    booking.auto_assigned = False
+    session.add(booking)
+    session.commit()
+    session.refresh(booking)
+
+    member_assignment.invalidate_member_active_cache(member.id)
+    if previous and previous != member.id:
+        member_assignment.invalidate_member_active_cache(previous)
+    member_assignment.invalidate_center_active_cache(current_center.id)
+
+    notify_safe(
+        session=session,
+        user_ids=[member.user_id],
+        title="New assignment",
+        body=f"You have been assigned to {booking.service_name} "
+        f"(booking {booking.reference_id}).",
+        data={
+            "type": "service_assignment",
+            "booking_id": booking.reference_id,
+            "auto": False,
+        },
+    )
+    return {
+        "message": "Member assigned",
+        "booking_id": booking.reference_id,
+        "member_id": member.reference_id,
+    }
+
+
+@router.delete("/me/bookings/{booking_id}/assign")
+def unassign_member_from_booking(
+    booking_id: str,
+    *,
+    session: Session = Depends(get_session),
+    current_center: ServiceCenter = Depends(get_current_active_service_center),
+):
+    """Clear the member assignment on a booking."""
+    booking = get_by_reference(session, ServiceRequest, booking_id)
+    if not booking or booking.service_center_id != current_center.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    previous = booking.assigned_member_id
+    booking.assigned_member_id = None
+    booking.assigned_at = None
+    booking.auto_assigned = False
+    session.add(booking)
+    session.commit()
+
+    if previous:
+        member_assignment.invalidate_member_active_cache(previous)
+    member_assignment.invalidate_center_active_cache(current_center.id)
+    return {"message": "Member unassigned", "booking_id": booking_id}

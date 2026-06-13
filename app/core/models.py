@@ -191,6 +191,11 @@ class MechanicReview(MechanicReviewBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     mechanic_id: int = Field(foreign_key="mechanic.id")
     user_id: uuid.UUID = Field(foreign_key="user.id")
+    # Booking this review is for — lets a customer rate the same mechanic on
+    # different jobs (per-booking dedup), parity with ServiceCenterReview.
+    mechanic_trip_id: Optional[int] = Field(
+        default=None, foreign_key="mechanictrip.id"
+    )
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -244,6 +249,9 @@ class ServiceCenter(ServiceCenterBase, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    # Short, human-shareable 6-char code (A-Z+0-9) members type at signup to
+    # register under this center. Distinct from the sequential reference_id.
+    center_code: Optional[str] = Field(default=None, unique=True, index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -252,6 +260,7 @@ class ServiceCenter(ServiceCenterBase, table=True):
     slots: List["ServiceSlot"] = Relationship(back_populates="service_center")
     bookings: List["ServiceRequest"] = Relationship(back_populates="service_center")
     reviews: List["ServiceCenterReview"] = Relationship(back_populates="service_center")
+    center_members: List["CenterMember"] = Relationship(back_populates="service_center")
 
 
 class CenterService(SQLModel, table=True):
@@ -361,10 +370,21 @@ class ServiceRequest(SQLModel, table=True):
     )
     cancellation_reason: Optional[str] = None
 
+    # Center-member assignment (manual by center or system auto-assign). The
+    # assigned member is NEVER exposed to the end user.
+    assigned_member_id: Optional[int] = Field(
+        default=None, foreign_key="centermember.id"
+    )
+    assigned_at: Optional[datetime] = None
+    auto_assigned: bool = Field(default=False)
+
     user: "User" = Relationship(back_populates="service_bookings")
     service_center: ServiceCenter = Relationship(back_populates="bookings")
     center_service: CenterService = Relationship(back_populates="bookings")
     slot: Optional[ServiceSlot] = Relationship(back_populates="bookings")
+    assigned_member: Optional["CenterMember"] = Relationship(
+        back_populates="assignments"
+    )
 
 
 class ServiceCenterReviewBase(SQLModel):
@@ -384,6 +404,92 @@ class ServiceCenterReview(ServiceCenterReviewBase, table=True):
     service_center: ServiceCenter = Relationship(back_populates="reviews")
 
 
+# --- CENTER MEMBER MODELS ---
+
+
+class CenterMember(SQLModel, table=True):
+    """A worker/technician who belongs to a service center and is assigned to its
+    bookings. Signs up in the driver app with a center_code and is approved by
+    the center (no admin approval). Has no wallet/help and is read-only on
+    bookings. The center drives all booking status changes."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reference_id: Optional[str] = Field(default=None, unique=True, index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    service_center_id: int = Field(foreign_key="servicecenter.id")
+
+    name: str
+    phone_number: str
+    profile_picture_url: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    # Skills the member can handle. Each value MUST be one of the parent
+    # center's CenterService.service_name (validated at signup / profile-update).
+    expert_in: List[str] = Field(default_factory=list, sa_column=Column(JSON))
+
+    # pending_approval | approved | rejected | suspended | banned
+    status: str = "pending_approval"
+    is_online: bool = Field(default=True)  # member's own availability toggle
+    rating: float = Field(default=0.0)
+    total_reviews: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    user: "User" = Relationship(back_populates="center_member_profile")
+    service_center: "ServiceCenter" = Relationship(back_populates="center_members")
+    reviews: List["CenterMemberReview"] = Relationship(back_populates="member")
+    assignments: List["ServiceRequest"] = Relationship(back_populates="assigned_member")
+
+    _validate_gender = field_validator("gender", mode="before")(
+        lambda cls, v: _normalize_gender(v)
+    )
+    _coerce_expert_in = field_validator("expert_in", mode="before")(
+        lambda cls, v: _coerce_none_to_empty_list(v)
+    )
+
+
+class CenterMemberReviewBase(SQLModel):
+    rating: int = Field(ge=1, le=5)
+    comment: Optional[str] = None
+
+
+class CenterMemberReview(CenterMemberReviewBase, table=True):
+    """Customer's review of the member who handled their booking. The member is
+    derived from ServiceRequest.assigned_member_id and stays anonymous to the
+    user — only the aggregate (rating / total_reviews) is ever exposed."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    center_member_id: int = Field(foreign_key="centermember.id")
+    user_id: uuid.UUID = Field(foreign_key="user.id")
+    service_request_id: Optional[int] = Field(
+        default=None, foreign_key="servicerequest.id"
+    )
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    member: "CenterMember" = Relationship(back_populates="reviews")
+
+
+# --- UNIFIED APP/SERVICE RATING (all 4 services) ---
+class ServiceRatingBase(SQLModel):
+    rating: int = Field(ge=1, le=5)
+    comment: Optional[str] = None
+
+
+class ServiceRating(ServiceRatingBase, table=True):
+    """App/service-level rating, unified across all 4 services (trip, tow,
+    transport, mechanic, service-center). One row per (service_type, booking)
+    per user. Provider ratings live in their own per-provider review tables and
+    aggregate into the provider profile ``.rating`` columns; THIS table is the
+    app's own service score, so admin can see service satisfaction next to
+    provider performance from a single place."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service_type: str = Field(index=True)  # trip | tow | transport | mechanic | service_center
+    booking_id: int = Field(index=True)  # internal PK of the booking row
+    booking_reference_id: str = Field(index=True)  # TP.. / TW.. / MC.. / SB..
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 # --- API Response Models for Service Center ---
 class ServiceCenterPublic(SQLModel):
     id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
@@ -400,6 +506,7 @@ class ServiceCenterPublic(SQLModel):
 
 class ServiceCenterPrivate(ServiceCenterBase):
     id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    center_code: Optional[str] = None
     created_at: datetime
 
 
@@ -548,6 +655,99 @@ class ServiceSlotUpdate(SQLModel):
     end_time: Optional[datetime] = None
     max_capacity: Optional[int] = None
     is_available: Optional[bool] = None
+
+
+# --- API Models for Center Members ---
+class CenterMemberPublic(SQLModel):
+    """Member's own /me view (driver app). No center_code / internal id."""
+
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    name: str
+    phone_number: str
+    profile_picture_url: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    expert_in: List[str] = Field(default_factory=list)
+    status: str
+    is_online: bool = True
+    rating: float = 0.0
+    total_reviews: int = 0
+    center_name: Optional[str] = None
+
+
+class CenterMemberProfileUpdate(SQLModel):
+    """Member self-service profile edit — ONLY these fields are editable.
+    (Profile photo is handled by the dedicated upload endpoint.)"""
+
+    name: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    expert_in: Optional[List[str]] = None
+
+
+class CenterMemberForCenter(SQLModel):
+    """Center's view of a member (list + detail). No internal id / center_code /
+    phone — `current_assignments` carries sanitized booking blocks only."""
+
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    name: str
+    gender: Optional[str] = None
+    profile_picture_url: Optional[str] = None
+    expert_in: List[str] = Field(default_factory=list)
+    is_online: bool = True
+    status: str
+    rating: float = 0.0
+    total_reviews: int = 0
+    current_assignments: List[Dict[str, Any]] = Field(default_factory=list)
+    # Detail-only stats (None in list view).
+    total_completed: Optional[int] = None
+    total_pending: Optional[int] = None
+    total_hours_worked: Optional[float] = None
+
+
+class CenterMemberAssignCandidate(SQLModel):
+    """Row in the center's "assign a member" picker."""
+
+    id: str = Field(validation_alias=AliasChoices("reference_id", "id"))
+    name: str
+    expert_in: List[str] = Field(default_factory=list)
+    is_online: bool = True
+    active_task_count: int = 0
+    soonest_free_at: Optional[datetime] = None
+    expertise_match: bool = True
+
+
+class MemberAssignmentSummary(SQLModel):
+    """Member's sanitized view of an assigned booking — NO price / payment /
+    customer data."""
+
+    booking_id: str
+    service_name: str
+    booking_type: BookingType
+    status: ServiceStatus
+    vehicle_type: str
+    vehicle_number: Optional[str] = None
+    vehicle_model: Optional[str] = None
+    requested_date: Optional[date] = None
+    requested_time: Optional[str] = None
+    expected_return_date: Optional[date] = None
+    expected_return_time: Optional[str] = None
+    actual_return_date: Optional[date] = None
+    actual_return_time: Optional[str] = None
+    booking_time: datetime
+    assigned_at: Optional[datetime] = None
+
+
+class MemberAssignmentRequest(SQLModel):
+    """Body for the center assigning a member to a booking."""
+
+    member_id: str  # CenterMember.reference_id
+
+
+class MemberApprovalRequest(SQLModel):
+    """Body for the center approving / rejecting / (de)activating a member."""
+
+    action: str  # approve | reject | suspend | reactivate
+    note: Optional[str] = None
 
 
 # --- Trip Models ---
@@ -982,6 +1182,9 @@ class DriverReviewBase(SQLModel):
 class DriverReview(DriverReviewBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     driver_id: int = Field(foreign_key="driver.id")
+    # Booking this review is for — enables per-booking dedup (a customer may
+    # rehire and re-rate the same driver on a later trip).
+    trip_id: Optional[int] = Field(default=None, foreign_key="trip.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     driver: "Driver" = Relationship(back_populates="reviews")
 
@@ -989,6 +1192,8 @@ class DriverReview(DriverReviewBase, table=True):
 class TowTruckDriverReview(DriverReviewBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     driver_id: int = Field(foreign_key="towtruckdriver.id")
+    # Booking this review is for — enables per-booking dedup.
+    trip_id: Optional[int] = Field(default=None, foreign_key="towtrip.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     driver: "TowTruckDriver" = Relationship(back_populates="reviews")
 
@@ -1326,6 +1531,9 @@ class User(UserBase, table=True):
     tickets: List["SupportTicket"] = Relationship(back_populates="user")
     mechanic_profile: Optional[Mechanic] = Relationship(back_populates="user")
     service_center_profile: Optional["ServiceCenter"] = Relationship(
+        back_populates="user"
+    )
+    center_member_profile: Optional["CenterMember"] = Relationship(
         back_populates="user"
     )
     service_bookings: List["ServiceRequest"] = Relationship(back_populates="user")
@@ -1924,6 +2132,11 @@ class VerifyOTPRequest(SQLModel):
     address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Center Member Specific Fields
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    center_code: Optional[str] = None  # 6-char code of the center they join
+    expert_in: Optional[List[str]] = None  # subset of the center's service names
 
 
 # --- UI CONFIGURATION MODELS ---

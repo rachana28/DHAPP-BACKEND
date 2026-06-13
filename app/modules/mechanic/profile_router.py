@@ -1,6 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
-from sqlmodel import Session, select, func, desc
-from typing import List
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
+from sqlmodel import Session, select, func
 import redis
 
 from app.core import cache
@@ -11,7 +10,6 @@ from app.core.models import (
     MechanicUpdate,
     MechanicPublic,
     MechanicPrivate,
-    MechanicReview,
     MechanicTrip,
 )
 from app.core.security import get_current_active_mechanic
@@ -120,28 +118,6 @@ def read_mechanic(
     ).one()
 
     return MechanicPublic(**mechanic.model_dump(), total_trips=trip_count)
-
-
-@router.get("/{mechanic_id}/reviews", response_model=List[MechanicReview])
-def get_mechanic_reviews(
-    mechanic_id: str,
-    session: Session = Depends(get_session),
-    page: int = Query(1, gt=0),
-    limit: int = Query(5, gt=0, le=50),
-):
-    mechanic = get_by_reference(session, Mechanic, mechanic_id)
-    if not mechanic:
-        raise HTTPException(status_code=404, detail="Mechanic not found")
-
-    offset = (page - 1) * limit
-    reviews = session.exec(
-        select(MechanicReview)
-        .where(MechanicReview.mechanic_id == mechanic.id)
-        .order_by(desc(MechanicReview.created_at))
-        .offset(offset)
-        .limit(limit)
-    ).all()
-    return reviews
 
 
 @router.post("/me/documents")

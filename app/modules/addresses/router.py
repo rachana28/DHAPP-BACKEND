@@ -26,11 +26,16 @@ from app.core.models import (
     UserAddressUpdate,
     UserAddressPublic,
 )
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_no_member
 from app.utils.id_generator import generate_reference_id, get_by_reference, ADDRESS
 from app.utils.time_utils import now_ist
 
-router = APIRouter(prefix="/addresses", tags=["Addresses"])
+# Center-members have no address book — blocked at the router level.
+router = APIRouter(
+    prefix="/addresses",
+    tags=["Addresses"],
+    dependencies=[Depends(get_current_user_no_member)],
+)
 
 
 def _active_addresses(session: Session, user_id):

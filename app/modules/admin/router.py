@@ -36,8 +36,11 @@ from app.core.models import (
     ServiceRequest,
     ServiceSlot,
     ServiceCenterReview,
+    CenterMember,
 )
 from fastapi import Body
+from app.core import cache
+from app.modules.service import assignment as member_assignment
 from app.services.audit_log import emit_event as audit_emit
 from app.modules.trips.trip_service import TripService
 from app.modules.trips.payment_service import PaymentService
@@ -503,6 +506,104 @@ def update_service_center_status(
         redis_client.delete(f"service_center_{center.id}")
 
     return {"message": f"Service center status updated to {status}"}
+
+
+# --- CENTER MEMBER OVERSIGHT (read-only + ban; approval stays with the center) ---
+def _admin_member_view(session: Session, m: CenterMember, *, detail: bool = False):
+    center = session.get(ServiceCenter, m.service_center_id)
+    data = {
+        "id": m.reference_id,
+        "name": m.name,
+        "phone_number": m.phone_number,
+        "gender": m.gender,
+        "date_of_birth": m.date_of_birth,
+        "profile_picture_url": m.profile_picture_url,
+        "expert_in": m.expert_in,
+        "status": m.status,
+        "is_online": m.is_online,
+        "rating": m.rating,
+        "total_reviews": m.total_reviews,
+        "created_at": m.created_at,
+        "center": {
+            "id": center.reference_id if center else None,
+            "name": center.name if center else None,
+            "center_code": center.center_code if center else None,
+        },
+    }
+    if detail:
+        data.update(member_assignment.member_stats(session, m.id))
+    return data
+
+
+@router.get("/center-members")
+def get_center_members_admin(
+    center: Optional[str] = Query(None, description="ServiceCenter.reference_id"),
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    session: Session = Depends(get_session),
+):
+    """Read-only list of center-members across all centers (filter by center /
+    status / name)."""
+    query = select(CenterMember)
+    if center:
+        sc = get_by_reference(session, ServiceCenter, center)
+        if not sc:
+            return []
+        query = query.where(CenterMember.service_center_id == sc.id)
+    if status:
+        query = query.where(CenterMember.status == status)
+    if search:
+        query = query.where(CenterMember.name.contains(search))
+    members = session.exec(
+        query.order_by(desc(CenterMember.created_at)).offset(skip).limit(limit)
+    ).all()
+    return [_admin_member_view(session, m) for m in members]
+
+
+@router.get("/center-members/{member_ref}")
+def get_center_member_admin(
+    member_ref: str, session: Session = Depends(get_session)
+):
+    """Read-only member detail + work stats (completed / pending / hours)."""
+    member = get_by_reference(session, CenterMember, member_ref)
+    if not member:
+        raise HTTPException(404, "Center member not found")
+    return _admin_member_view(session, member, detail=True)
+
+
+@router.patch("/center-members/{member_ref}/status")
+def update_center_member_status_admin(
+    member_ref: str,
+    status: str = Query(
+        ..., regex="^(approved|banned|suspended|rejected|pending_approval)$"
+    ),
+    session: Session = Depends(get_session),
+):
+    """Admin override — primarily to ban/suspend an abusive member. Approval of
+    new members remains the center's responsibility."""
+    member = get_by_reference(session, CenterMember, member_ref)
+    if not member:
+        raise HTTPException(404, "Center member not found")
+
+    member.status = status
+    session.add(member)
+    session.commit()
+    session.refresh(member)
+
+    cache.cache_delete(cache.me_key("center_member", member.id))
+    member_assignment.invalidate_member_active_cache(member.id)
+
+    if status in ("banned", "suspended", "rejected"):
+        send_push_notification(
+            session,
+            [member.user_id],
+            "Account Status Update",
+            f"Your membership has been {status} by the administrator.",
+            {"type": "account_restricted"},
+        )
+    return {"message": f"Center member status updated to {status}"}
 
 
 # --- VERIFICATION DETAILS ---

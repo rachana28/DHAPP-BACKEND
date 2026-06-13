@@ -53,6 +53,13 @@ from app.core.models import (
     TripSettlement,
     TripDaySkipRequest,
     Payment,
+    DriverReview,
+)
+from app.modules.bookings.ratings import (
+    RatingIn,
+    record_service_rating,
+    recompute_provider_average,
+    ensure_rateable,
 )
 from app.modules.payments import service as central_payments
 from app.core.security import get_current_user
@@ -206,7 +213,7 @@ def create_booking_request(
 
     if (trip_in.hiring_type or "").strip() in ("Tow Service", "Mechanic Service"):
         target = (
-            "/tow-trips/book-request"
+            "/tow-transport-trips/book-request"
             if trip_in.hiring_type.strip() == "Tow Service"
             else "/mechanic-trips/book-request"
         )
@@ -2243,6 +2250,74 @@ def get_trip_summary(
         raise HTTPException(500, "Could not generate trip summary")
 
     return summary
+
+
+# --- REVIEWS (booking-scoped; only after the hire is finished) ---
+
+
+@router.post("/{trip_id}/service-review")
+def submit_trip_service_review(
+    trip_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate DriveHub's service for a completed trip (the app rating, not the
+    driver). Stored in the unified ``ServiceRating`` table."""
+    trip = get_by_reference(session, Trip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    ensure_rateable("trip", trip.status)
+    return record_service_rating(
+        session,
+        service_type="trip",
+        booking_id=trip.id,
+        booking_reference_id=trip.reference_id,
+        user_id=current_user.id,
+        payload=payload,
+    )
+
+
+@router.post("/{trip_id}/provider-review")
+def submit_trip_provider_review(
+    trip_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate the driver who handled a completed trip."""
+    trip = get_by_reference(session, Trip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    ensure_rateable("trip", trip.status)
+    if not trip.driver_id:
+        raise HTTPException(status_code=400, detail="No driver handled this trip")
+
+    existing = session.exec(
+        select(DriverReview).where(
+            DriverReview.user_id == current_user.id,
+            DriverReview.trip_id == trip.id,
+        )
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You have already reviewed this trip")
+
+    session.add(
+        DriverReview(
+            driver_id=trip.driver_id,
+            trip_id=trip.id,
+            user_id=current_user.id,
+            rating=payload.rating,
+            comment=payload.comment,
+        )
+    )
+    driver = session.get(Driver, trip.driver_id)
+    recompute_provider_average(session, DriverReview, "driver_id", driver.id, driver)
+    session.commit()
+    cache.cache_delete(cache.me_key("driver", driver.user_id))
+    return {"message": "Review submitted successfully", "rating": payload.rating}
 
 
 @router.get("/{trip_id}/bills", response_model=List[TripBillRead])

@@ -14,6 +14,7 @@ from app.core.models import (
     TowTripSafe,
     TowTripReadUser,
     TowTruckDriver,
+    TowTruckDriverReview,
     TowTripOffer,
     TowTripOfferPublic,
     BookingAddressUpdate,
@@ -21,8 +22,14 @@ from app.core.models import (
 )
 from app.modules.bookings import otp_service as booking_otp_service
 from app.modules.bookings.summary_helpers import address_edit_window
-from app.modules.towing.arrival_service import mark_tow_arrived
-from app.modules.towing.booking_summary import build_tow_summary
+from app.modules.bookings.ratings import (
+    RatingIn,
+    record_service_rating,
+    recompute_provider_average,
+    ensure_rateable,
+)
+from app.modules.tow_transport.arrival_service import mark_tow_arrived
+from app.modules.tow_transport.booking_summary import build_tow_summary
 from app.modules.pricing.pricing_algo import (
     get_road_distance_duration,
     _calculate_service_cost,
@@ -33,7 +40,7 @@ from app.utils.time_utils import now_ist
 from app.modules.payments.service import refund_booking_payments
 from app.services.dues import raise_if_unpaid_past_due
 from app.core.security import get_current_user, get_current_active_tow_truck_driver
-from app.modules.towing.tow_allocation import (
+from app.modules.tow_transport.tow_allocation import (
     rank_tow_drivers,
     create_tow_offers_for_tier,
     attempt_tow_trip_escalation,
@@ -42,7 +49,7 @@ from app.modules.dispatch import geo
 from app.utils.notifications import send_push_notification
 from app.utils.id_generator import generate_reference_id, get_by_reference, TOW_TRIP
 
-router = APIRouter(prefix="/tow-trips", tags=["Tow Trips"])
+router = APIRouter(prefix="/tow-transport-trips", tags=["Tow & Transport Trips"])
 
 
 def _price_tow_trip(session, redis_client, trip: TowTrip) -> None:
@@ -535,6 +542,78 @@ def get_tow_trip_summary(
     return build_tow_summary(
         session, trip, viewer="provider" if is_provider else "user"
     )
+
+
+# --- REVIEWS (booking-scoped; only after the tow/transport job is completed) ---
+
+
+@router.post("/{trip_id}/service-review")
+def submit_tow_service_review(
+    trip_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate DriveHub's service for a completed tow/transport booking (the app
+    rating, not the driver). Recorded under the booking's own ``service_type``
+    so admin can tell tow apart from transport."""
+    trip = get_by_reference(session, TowTrip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    service_type = trip.service_type or "tow"
+    ensure_rateable(service_type, trip.status)
+    return record_service_rating(
+        session,
+        service_type=service_type,
+        booking_id=trip.id,
+        booking_reference_id=trip.reference_id,
+        user_id=current_user.id,
+        payload=payload,
+    )
+
+
+@router.post("/{trip_id}/provider-review")
+def submit_tow_provider_review(
+    trip_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate the tow/transport driver who handled a completed booking."""
+    trip = get_by_reference(session, TowTrip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    ensure_rateable(trip.service_type or "tow", trip.status)
+    if not trip.tow_truck_driver_id:
+        raise HTTPException(status_code=400, detail="No driver handled this trip")
+
+    existing = session.exec(
+        select(TowTruckDriverReview).where(
+            TowTruckDriverReview.user_id == current_user.id,
+            TowTruckDriverReview.trip_id == trip.id,
+        )
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You have already reviewed this trip")
+
+    session.add(
+        TowTruckDriverReview(
+            driver_id=trip.tow_truck_driver_id,
+            trip_id=trip.id,
+            user_id=current_user.id,
+            rating=payload.rating,
+            comment=payload.comment,
+        )
+    )
+    driver = session.get(TowTruckDriver, trip.tow_truck_driver_id)
+    recompute_provider_average(
+        session, TowTruckDriverReview, "driver_id", driver.id, driver
+    )
+    session.commit()
+    cache.cache_delete(cache.me_key("tow_driver", driver.user_id))
+    return {"message": "Review submitted successfully", "rating": payload.rating}
 
 
 @router.patch("/{trip_id}/address")

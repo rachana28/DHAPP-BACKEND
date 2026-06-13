@@ -15,7 +15,12 @@ from typing import Any, Dict
 
 from sqlmodel import Session
 
-from app.core.models import ServiceCenter, ServiceRequest, ServiceStatus
+from app.core.models import (
+    CenterMember,
+    ServiceCenter,
+    ServiceRequest,
+    ServiceStatus,
+)
 from app.modules.bookings.summary_helpers import provider_user_block
 
 # Booking is no longer changeable once it reaches a terminal state.
@@ -54,6 +59,24 @@ def _amount_due(booking: ServiceRequest) -> float:
         else (booking.price_at_booking or 0.0)
     )
     return round(max(0.0, float(total or 0.0) - float(booking.amount_paid or 0.0)), 2)
+
+
+def _assigned_member_block(session: Session, booking: ServiceRequest):
+    """Center-only block describing who is handling the booking. Returns None
+    when unassigned. NEVER included in the user view."""
+    if not booking.assigned_member_id:
+        return None
+    member = session.get(CenterMember, booking.assigned_member_id)
+    if not member:
+        return None
+    return {
+        "id": member.reference_id,
+        "name": member.name,
+        "expert_in": member.expert_in,
+        "is_online": member.is_online,
+        "assigned_at": booking.assigned_at,
+        "auto_assigned": booking.auto_assigned,
+    }
 
 
 def _center_block(center: ServiceCenter) -> Dict[str, Any]:
@@ -125,6 +148,7 @@ def build_service_summary(
         result["amount_to_collect"] = _amount_due(booking)
         result["actions"] = _service_actions(booking)
         result["customer"] = provider_user_block(session, booking.user_id)
+        result["assigned_member"] = _assigned_member_block(session, booking)
         return result
 
     # --- user view ---
@@ -132,4 +156,39 @@ def build_service_summary(
     center = session.get(ServiceCenter, booking.service_center_id)
     if center:
         result["service_center"] = _center_block(center)
+    # Surface ONLY the assigned member's NAME (no id/phone/skills) so the user
+    # app can render the post-completion member-rating card. This is the single
+    # place a member's name is exposed to the customer; null when unassigned.
+    member_name = None
+    if booking.assigned_member_id:
+        member = session.get(CenterMember, booking.assigned_member_id)
+        member_name = member.name if member else None
+    result["service_member"] = member_name
     return result
+
+
+def build_member_assignment_summary(
+    session: Session, booking: ServiceRequest
+) -> Dict[str, Any]:
+    """Center-member's sanitized view of a booking they are assigned to.
+
+    Deliberately strips ALL price/payment fields, the customer block, and the
+    service-center block — a member sees only what they need to do the job
+    (vehicle + schedule + status)."""
+    return {
+        "booking_id": booking.reference_id,
+        "service_name": booking.service_name,
+        "booking_type": _booking_type_value(booking.booking_type),
+        "status": _status_value(booking.status),
+        "vehicle_type": booking.vehicle_type,
+        "vehicle_number": booking.vehicle_number,
+        "vehicle_model": booking.vehicle_model,
+        "requested_date": booking.requested_date,
+        "requested_time": booking.requested_time,
+        "expected_return_date": booking.expected_return_date,
+        "expected_return_time": booking.expected_return_time,
+        "actual_return_date": booking.actual_return_date,
+        "actual_return_time": booking.actual_return_time,
+        "booking_time": booking.booking_time,
+        "assigned_at": booking.assigned_at,
+    }

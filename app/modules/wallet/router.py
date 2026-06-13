@@ -28,10 +28,19 @@ from app.core.models import (
     WalletTopupRequest,
     WalletAdminCreditRequest,
 )
-from app.core.security import get_current_user, get_current_admin
+from app.core.security import (
+    get_current_user,
+    get_current_admin,
+    get_current_user_no_member,
+)
 from app.modules.wallet import service as wallet_service
 
-router = APIRouter(prefix="/wallet", tags=["Wallet"])
+# Center-members have no wallet — blocked at the router level.
+router = APIRouter(
+    prefix="/wallet",
+    tags=["Wallet"],
+    dependencies=[Depends(get_current_user_no_member)],
+)
 
 
 @router.get("", response_model=WalletPublic)

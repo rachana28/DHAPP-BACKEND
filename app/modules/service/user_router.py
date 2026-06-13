@@ -15,11 +15,15 @@ from app.core.models import (
     ServiceRequestCreate,
     ServiceRequestPublic,
     ServiceCenterReview,
+    CenterMember,
+    CenterMemberReview,
     User,
     BookingType,
     ServiceStatus,
     SystemConfig,
 )
+from app.core import cache
+from app.modules.bookings.ratings import RatingIn, record_service_rating
 from app.modules.payments.service import refund_booking_payments
 from app.modules.service.booking_summary import build_service_summary
 from app.services.dues import raise_if_unpaid_past_due
@@ -65,6 +69,27 @@ def _service_center_late_cancel_hours(session: Session) -> float:
 
 
 # --- SERVICE CENTER DISCOVERY ---
+
+
+@router.get("/center-lookup")
+def lookup_center_by_code(
+    code: str = Query(..., min_length=6, max_length=6),
+    session: Session = Depends(get_session),
+):
+    """Public helper for the driver-app center-member signup screen: resolve a
+    6-char center_code to the center's name and the list of service names that
+    populate the mandatory `expert_in` dropdown. No auth (pre-registration)."""
+    center = session.exec(
+        select(ServiceCenter).where(ServiceCenter.center_code == code.strip().upper())
+    ).first()
+    if not center:
+        raise HTTPException(status_code=404, detail="Invalid center code")
+    return {
+        "center_id": center.reference_id,
+        "center_name": center.name,
+        "status": center.status,
+        "service_names": sorted({s.service_name for s in center.services}),
+    }
 
 
 @router.get("/centers", response_model=List[ServiceCenterPublic])
@@ -691,17 +716,44 @@ def update_service_booking(
 # --- REVIEWS ---
 
 
+@router.post("/my-bookings/{booking_id}/service-review")
+def submit_app_service_review(
+    booking_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate DriveHub's service for a completed service-center booking (the app
+    rating — distinct from the center and the technician). Stored in the unified
+    ``ServiceRating`` table."""
+    booking = get_by_reference(session, ServiceRequest, booking_id)
+    if not booking or booking.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.status != ServiceStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=400, detail="Can only review completed bookings"
+        )
+    return record_service_rating(
+        session,
+        service_type="service_center",
+        booking_id=booking.id,
+        booking_reference_id=booking.reference_id,
+        user_id=current_user.id,
+        payload=payload,
+    )
+
+
 @router.post("/my-bookings/{booking_id}/review")
 def submit_service_review(
     booking_id: str,
-    rating: int = Query(..., ge=1, le=5),
-    comment: str = Query(None),
+    payload: RatingIn,
     *,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Submit a review for a completed service.
+    Submit a review of the service center for a completed booking.
     """
     booking = get_by_reference(session, ServiceRequest, booking_id)
     if not booking or booking.user_id != current_user.id:
@@ -730,8 +782,8 @@ def submit_service_review(
         service_center_id=booking.service_center_id,
         user_id=current_user.id,
         service_request_id=booking.id,
-        rating=rating,
-        comment=comment,
+        rating=payload.rating,
+        comment=payload.comment,
     )
 
     session.add(review)
@@ -753,40 +805,67 @@ def submit_service_review(
 
     return {
         "message": "Review submitted successfully",
-        "rating": rating,
+        "rating": payload.rating,
         "center_new_rating": center.rating,
     }
 
 
-@router.get("/centers/{center_id}/reviews")
-def get_service_center_reviews(
-    center_id: str,
+@router.post("/my-bookings/{booking_id}/member-review")
+def submit_member_review(
+    booking_id: str,
+    payload: RatingIn,
+    *,
     session: Session = Depends(get_session),
-    page: int = Query(1, gt=0),
-    limit: int = Query(10, gt=0, le=50),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Get all reviews for a service center.
-    """
-    center = get_by_reference(session, ServiceCenter, center_id)
-    if not center:
-        raise HTTPException(status_code=404, detail="Service center not found")
+    """Rate the technician/member who handled this booking. The member stays
+    ANONYMOUS to the customer — they are derived from the booking's assignment.
+    Called alongside the service-center review from the post-completion screen;
+    no-ops gracefully if the booking was never assigned to a member."""
+    booking = get_by_reference(session, ServiceRequest, booking_id)
+    if not booking or booking.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.status != ServiceStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=400, detail="Can only review completed bookings"
+        )
+    if not booking.assigned_member_id:
+        raise HTTPException(
+            status_code=400, detail="No technician handled this booking"
+        )
 
-    offset = (page - 1) * limit
-    reviews = session.exec(
-        select(ServiceCenterReview)
-        .where(ServiceCenterReview.service_center_id == center.id)
-        .order_by(desc(ServiceCenterReview.created_at))
-        .offset(offset)
-        .limit(limit)
+    existing_review = session.exec(
+        select(CenterMemberReview).where(
+            CenterMemberReview.user_id == current_user.id,
+            CenterMemberReview.service_request_id == booking.id,
+        )
+    ).first()
+    if existing_review:
+        raise HTTPException(
+            status_code=400, detail="You have already reviewed this booking's service"
+        )
+
+    review = CenterMemberReview(
+        center_member_id=booking.assigned_member_id,
+        user_id=current_user.id,
+        service_request_id=booking.id,
+        rating=payload.rating,
+        comment=payload.comment,
+    )
+    session.add(review)
+
+    # Recompute the member's aggregate (autoflush includes the new review).
+    member = session.get(CenterMember, booking.assigned_member_id)
+    all_reviews = session.exec(
+        select(CenterMemberReview).where(
+            CenterMemberReview.center_member_id == member.id
+        )
     ).all()
+    if all_reviews:
+        member.rating = round(sum(r.rating for r in all_reviews) / len(all_reviews), 1)
+        member.total_reviews = len(all_reviews)
+        session.add(member)
 
-    return [
-        {
-            "id": r.id,
-            "rating": r.rating,
-            "comment": r.comment,
-            "created_at": r.created_at,
-        }
-        for r in reviews
-    ]
+    session.commit()
+    cache.cache_delete(cache.me_key("center_member", member.id))
+    return {"message": "Review submitted successfully", "rating": payload.rating}

@@ -13,10 +13,17 @@ from app.core.models import (
     MechanicTripSafe,
     MechanicTripReadUser,
     Mechanic,
+    MechanicReview,
     MechanicOffer,
     MechanicOfferPublic,
     BookingAddressUpdate,
     User,
+)
+from app.modules.bookings.ratings import (
+    RatingIn,
+    record_service_rating,
+    recompute_provider_average,
+    ensure_rateable,
 )
 from app.core.security import get_current_user, get_current_active_mechanic
 from app.modules.mechanic.mechanic_allocation import (
@@ -502,6 +509,76 @@ def get_mechanic_trip_summary(
     return build_mechanic_summary(
         session, trip, viewer="provider" if is_provider else "user"
     )
+
+
+# --- REVIEWS (booking-scoped; only after the mechanic job is completed) ---
+
+
+@router.post("/{trip_id}/service-review")
+def submit_mechanic_service_review(
+    trip_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate DriveHub's service for a completed mechanic booking (the app rating,
+    not the mechanic). Stored in the unified ``ServiceRating`` table."""
+    trip = get_by_reference(session, MechanicTrip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    ensure_rateable("mechanic", trip.status)
+    return record_service_rating(
+        session,
+        service_type="mechanic",
+        booking_id=trip.id,
+        booking_reference_id=trip.reference_id,
+        user_id=current_user.id,
+        payload=payload,
+    )
+
+
+@router.post("/{trip_id}/provider-review")
+def submit_mechanic_provider_review(
+    trip_id: str,
+    payload: RatingIn,
+    *,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Rate the mechanic who handled a completed booking."""
+    trip = get_by_reference(session, MechanicTrip, trip_id)
+    if not trip or trip.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    ensure_rateable("mechanic", trip.status)
+    if not trip.mechanic_id:
+        raise HTTPException(status_code=400, detail="No mechanic handled this trip")
+
+    existing = session.exec(
+        select(MechanicReview).where(
+            MechanicReview.user_id == current_user.id,
+            MechanicReview.mechanic_trip_id == trip.id,
+        )
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You have already reviewed this trip")
+
+    session.add(
+        MechanicReview(
+            mechanic_id=trip.mechanic_id,
+            mechanic_trip_id=trip.id,
+            user_id=current_user.id,
+            rating=payload.rating,
+            comment=payload.comment,
+        )
+    )
+    mechanic = session.get(Mechanic, trip.mechanic_id)
+    recompute_provider_average(
+        session, MechanicReview, "mechanic_id", mechanic.id, mechanic
+    )
+    session.commit()
+    cache.cache_delete(cache.me_key("mechanic", mechanic.user_id))
+    return {"message": "Review submitted successfully", "rating": payload.rating}
 
 
 @router.patch("/{trip_id}/address")
