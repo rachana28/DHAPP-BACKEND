@@ -23,7 +23,7 @@ from fastapi import (
     HTTPException,
     Query,
 )
-from fastapi_limiter.depends import RateLimiter
+from app.core.rate_limit import RateLimiter
 
 from app.core.models import User
 from app.core.security import get_current_active_user

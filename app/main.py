@@ -5,7 +5,7 @@ from apscheduler.schedulers.asyncio import (
     AsyncIOScheduler,
 )  # You need to install: pip install apscheduler
 from sqlmodel import Session
-from fastapi_limiter import FastAPILimiter
+from app.core.rate_limit import RateLimiterRegistry
 import redis.asyncio as redis_async
 import asyncio
 import os
@@ -133,7 +133,7 @@ async def lifespan(app: FastAPI):
         decode_responses=True,
     )
 
-    await FastAPILimiter.init(redis_connection)
+    await RateLimiterRegistry.init(redis_connection)
     # ----------------------------------------------------------
 
     scheduler = AsyncIOScheduler()
@@ -195,6 +195,7 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
     print("🛑 Scheduler shut down.")
     await ai_diagnostic_client.aclose()
+    await RateLimiterRegistry.close()
     await redis_connection.close()
 
 
