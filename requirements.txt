@@ -17,3 +17,4 @@ apscheduler
 fastapi-limiter==0.1.5
 boto3
 aiomqtt
+httpx
