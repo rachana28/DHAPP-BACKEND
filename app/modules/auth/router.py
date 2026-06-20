@@ -1,10 +1,10 @@
 import random
 import redis
 import os
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session, select, delete
 from datetime import datetime
-from fastapi_limiter.depends import RateLimiter
+from app.core.rate_limit import RateLimiter
 from app.core.database import get_session, get_redis
 from app.core.models import (
     User,
@@ -143,7 +143,30 @@ def login(user_data: UserLogin, session: Session = Depends(get_session)):
     }
 
 
-@router.post("/send-otp", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
+async def _otp_phone_identifier(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+    phone = body.get("phone_number") if isinstance(body, dict) else None
+    return f"phone:{phone}" if phone else None
+
+
+@router.post(
+    "/send-otp",
+    dependencies=[
+        Depends(RateLimiter(times=3, seconds=60)),
+        Depends(
+            RateLimiter(
+                times=5,
+                minutes=10,
+                scope="send-otp-phone",
+                identifier=_otp_phone_identifier,
+                fail_open=False,
+            )
+        ),
+    ],
+)
 def send_otp(request: SendOTPRequest, redis_client: redis.Redis = Depends(get_redis)):
     if not redis_client:
         raise HTTPException(status_code=500, detail="Redis connection failed")
