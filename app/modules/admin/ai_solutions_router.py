@@ -58,8 +58,20 @@ async def list_common_solutions(
 async def reindex_common_solutions(
     x_request_id: Optional[str] = Header(default=None),
 ):
-    """Backfill embeddings for rows inserted without one (e.g. raw SQL load)."""
+    """Start the background backfill of missing embeddings; returns immediately.
+
+    Poll GET /reindex/status for progress. Safe to call repeatedly — it resumes
+    where it left off and reports 'already_running' if a job is in flight.
+    """
     return await ai_client.admin_reindex_common_solutions(request_id=x_request_id)
+
+
+@router.get("/reindex/status")
+async def reindex_status_common_solutions(
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Progress of the background reindex job (running, pending, processed, failed)."""
+    return await ai_client.admin_reindex_status_common_solutions(request_id=x_request_id)
 
 
 @router.get("/{solution_id}")
