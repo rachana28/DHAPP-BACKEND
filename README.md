@@ -4,19 +4,24 @@ This is a FastAPI backend for a driver hiring application using SQLModel and Pos
 
 ## Setup
 
+> **Requires Python 3.12** (matches the production image `python:3.12-slim`).
+> On Windows, do **not** use a bare `python -m venv` if another Python (e.g. Anaconda)
+> comes first on your PATH — it would build the venv from the wrong version. Use the
+> `py -3.12` launcher to pin the version explicitly.
+
 1. Clone the repository and navigate to the project directory.
 
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   ```
+2. Create a virtual environment with Python 3.12:
+   - On Windows: `py -3.12 -m venv .venv`
+   - On macOS/Linux: `python3.12 -m venv .venv`
 
 3. Activate the virtual environment:
-   - On Windows: `.\venv\Scripts\Activate.ps1`
-   - On macOS/Linux: `source venv/bin/activate`
+   - On Windows (PowerShell): `.\.venv\Scripts\Activate.ps1`
+   - On macOS/Linux: `source .venv/bin/activate`
 
-4. Install dependencies:
+4. Upgrade pip and install dependencies:
    ```
+   python -m pip install --upgrade pip
    pip install -r requirements.txt
    ```
 

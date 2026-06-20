@@ -32,6 +32,7 @@ from app.modules.admin import (
     support_router as admin_support_router,
     merchant_bank_router as admin_merchant_bank_router,
     payout_router as admin_payout_router,
+    ai_solutions_router as admin_ai_solutions_router,
 )
 from app.modules.support import (
     router as support_router,
@@ -57,6 +58,11 @@ from app.modules.wallet import router as wallet_router
 from app.modules.provider_wallet import router as provider_wallet_router
 from app.modules.payout import router as payout_router
 from app.modules.bookings import active_router as bookings_active_router
+from app.modules.ai_diagnostic import (
+    router as ai_diagnostic_router,
+    scheduler_jobs as ai_diagnostic_jobs,
+    ai_client as ai_diagnostic_client,
+)
 
 # Import Services for Scheduled Tasks
 from app.modules.trips.allocation import process_tier_escalation
@@ -167,6 +173,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(auto_close_inactive_support_tickets, "interval", minutes=10)
     # Clean up attachments uploaded but never linked to a message
     scheduler.add_job(cleanup_orphan_support_attachments, "interval", minutes=30)
+    # AI Diagnostic cleanup: Core sweeps orphaned media bytes; the row sweep is a
+    # safety-net that pokes the AI service's own primary sweep (both daily).
+    scheduler.add_job(ai_diagnostic_jobs.ai_media_sweep_job, "interval", hours=24)
+    scheduler.add_job(ai_diagnostic_jobs.ai_orphan_row_sweep_job, "interval", hours=24)
     scheduler.start()
     print("🚀 Scheduler started.")
 
@@ -184,6 +194,7 @@ async def lifespan(app: FastAPI):
         pass
     scheduler.shutdown()
     print("🛑 Scheduler shut down.")
+    await ai_diagnostic_client.aclose()
     await redis_connection.close()
 
 
@@ -228,6 +239,8 @@ app.include_router(payout_router.router)
 app.include_router(admin_merchant_bank_router.router)
 app.include_router(admin_payout_router.router)
 app.include_router(bookings_active_router.router)
+app.include_router(ai_diagnostic_router.router)
+app.include_router(admin_ai_solutions_router.router)
 
 
 @app.get("/")
