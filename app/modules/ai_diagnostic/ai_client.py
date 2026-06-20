@@ -179,6 +179,12 @@ async def admin_reindex_common_solutions(request_id: Optional[str] = None) -> An
     )
 
 
+async def admin_reindex_status_common_solutions(request_id: Optional[str] = None) -> Any:
+    return await _request(
+        "GET", f"{_ADMIN_BASE}/reindex/status", request_id, admin=True
+    )
+
+
 async def forward_diagnose(payload: dict, request_id: Optional[str] = None) -> Any:
     """Phase B — AI chat: POST /api/v1/diagnose."""
     return await _post("/api/v1/diagnose", payload, request_id)
