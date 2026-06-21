@@ -38,5 +38,12 @@ AI_MEDIA_PREFIX = "ai-diagnostic/sessions/"
 # Hard cap on a single uploaded object (enforced in the presigned POST policy).
 AI_MEDIA_MAX_BYTES = int(os.getenv("AI_MEDIA_MAX_BYTES", str(50 * 1024 * 1024)))
 
-# Max number of media items accepted in one /query request.
-AI_MEDIA_MAX_ITEMS = int(os.getenv("AI_MEDIA_MAX_ITEMS", "10"))
+# Max images allowed across a whole chat session (cost/quota guard, mirrors the
+# AI service's MAX_IMAGES_PER_SESSION for a fast client-facing reject).
+AI_MAX_IMAGES_PER_SESSION = int(os.getenv("AI_MAX_IMAGES_PER_SESSION", "3"))
+
+# Chat images are uploaded via a separate JWT-protected multipart endpoint (kept
+# off the WebSocket to bound memory); the backend streams them to R2 and the chat
+# references the returned key. Per-image byte cap and per-message key count.
+AI_IMAGE_MAX_BYTES = int(os.getenv("AI_IMAGE_MAX_BYTES", str(4 * 1024 * 1024)))
+AI_WS_MAX_IMAGES_PER_MESSAGE = int(os.getenv("AI_WS_MAX_IMAGES_PER_MESSAGE", "2"))

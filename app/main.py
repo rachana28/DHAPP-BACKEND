@@ -60,6 +60,7 @@ from app.modules.payout import router as payout_router
 from app.modules.bookings import active_router as bookings_active_router
 from app.modules.ai_diagnostic import (
     router as ai_diagnostic_router,
+    ws as ai_diagnostic_ws,
     scheduler_jobs as ai_diagnostic_jobs,
     ai_client as ai_diagnostic_client,
 )
@@ -241,7 +242,9 @@ app.include_router(admin_merchant_bank_router.router)
 app.include_router(admin_payout_router.router)
 app.include_router(bookings_active_router.router)
 app.include_router(ai_diagnostic_router.router)
+app.include_router(ai_diagnostic_ws.router)
 app.include_router(admin_ai_solutions_router.router)
+app.include_router(admin_ai_solutions_router.unresolved_router)
 
 
 @app.get("/")
