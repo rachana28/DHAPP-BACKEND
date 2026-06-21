@@ -9,6 +9,7 @@ Errors are mapped to consistent HTTP statuses so callers/clients see predictable
 failures. `aclose()` is called from the app lifespan shutdown.
 """
 
+import logging
 import uuid
 from typing import Any, Optional
 from urllib.parse import quote
@@ -21,6 +22,8 @@ from app.modules.ai_diagnostic.config import (
     AI_DIAGNOSTIC_BASE_URL,
     INTERNAL_SECRET,
 )
+
+logger = logging.getLogger("ai_diagnostic.client")
 
 _client = httpx.AsyncClient(
     base_url=AI_DIAGNOSTIC_BASE_URL or "",
@@ -77,18 +80,42 @@ async def _request(
             status_code=502, detail="Could not reach AI diagnostic service."
         )
 
-    if resp.is_success:
-        return resp.json()
+    content_type = resp.headers.get("content-type", "")
+    is_json = "application/json" in content_type.lower()
 
-    # Surface the upstream status and detail where present.
+    if resp.is_success:
+        if not is_json:
+            logger.error(
+                "AI service returned non-JSON success [%s %s] status=%s ct=%s body=%.200s",
+                method, path, resp.status_code, content_type, resp.text,
+            )
+            raise HTTPException(
+                status_code=502, detail="AI diagnostic service returned an invalid response."
+            )
+        try:
+            return resp.json()
+        except ValueError:
+            logger.error(
+                "AI service JSON parse failed [%s %s] body=%.200s", method, path, resp.text
+            )
+            raise HTTPException(
+                status_code=502, detail="AI diagnostic service returned an invalid response."
+            )
+
+    # Non-2xx: only surface a clean JSON `detail`; never forward an HTML/error page.
     detail: Any = f"AI diagnostic service error ({resp.status_code})."
-    try:
-        body = resp.json()
-        if isinstance(body, dict) and body.get("detail") is not None:
-            detail = body["detail"]
-    except ValueError:
-        if resp.text:
-            detail = resp.text
+    if is_json:
+        try:
+            body = resp.json()
+            if isinstance(body, dict) and isinstance(body.get("detail"), (str, list, dict)):
+                detail = body["detail"]
+        except ValueError:
+            pass
+    else:
+        logger.error(
+            "AI service non-2xx non-JSON [%s %s] status=%s ct=%s body=%.300s",
+            method, path, resp.status_code, content_type, resp.text,
+        )
     raise HTTPException(status_code=resp.status_code, detail=detail)
 
 
