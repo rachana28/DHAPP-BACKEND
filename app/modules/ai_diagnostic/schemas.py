@@ -6,15 +6,15 @@ forwards to the AI service — including the admin common-solution write models 
 the admin router imports. Responses are returned verbatim from the AI service, so
 no response models are declared here.
 
-The common-solution tier (current product) is scoped by `vehicle_type` only:
-`CommonSolutionsSearchRequest` for vector search and `CommonSolution{Create,Update}`
-for admin CRUD. `query` is sanitized (trimmed, control-chars stripped, length-capped)
-before it leaves Core, on top of the AI service's guardrail firewall. Media file
-names are restricted to bare names with allowed extensions so a stored name can
-never inject a path segment or absolute URL when the R2 link is composed.
-`QueryRequest`/`MediaItemIn` remain for the dormant AI chat: `session_id` is
-validated as a UUID (it flows into R2 keys and the AI URL path) and the media list
-is length-capped.
+Curated solutions are scoped by `vehicle_type` (which now selects one storage
+table per type): `CommonSolution{Create,Update}` for admin CRUD. `query` is
+sanitized (trimmed, control-chars stripped, length-capped) before it leaves Core,
+on top of the AI service's guardrail firewall. Media file names are restricted to
+bare names with allowed extensions so a stored name can never inject a path
+segment or absolute URL when the R2 link is composed. The real-time chat uses
+`ChatStart` (opens a session for a vehicle type) and `ChatMessageIn` (one user
+turn): `session_id` is validated as a UUID (it flows into R2 keys and the AI URL
+path), the chat is image-only, and the media list is length-capped.
 """
 
 import re
@@ -23,22 +23,13 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.modules.ai_diagnostic.config import AI_MEDIA_MAX_ITEMS
+from app.modules.ai_diagnostic.config import AI_WS_MAX_IMAGES_PER_MESSAGE
 
 VehicleType = Literal["car", "bike", "light_vehicle", "heavy_vehicle"]
 
 _MEDIA_NAME_RE = re.compile(
     r"^[A-Za-z0-9._-]+\.(jpg|jpeg|png|webp|gif|mp4|mov|webm|m4v)$", re.IGNORECASE
 )
-
-
-def _validate_year(value: Optional[str]) -> Optional[str]:
-    if value is None or value == "":
-        return None
-    v = str(value).strip()
-    if not (len(v) == 4 and v.isdigit()):
-        raise ValueError("vehicle_year must be 4 digits")
-    return v
 
 
 def _validate_uuid(value: str) -> str:
@@ -103,9 +94,12 @@ class CommonSolutionCreate(BaseModel):
 
 
 class CommonSolutionUpdate(BaseModel):
-    """Admin partial update — only provided fields are changed."""
+    """Admin partial update — only provided fields are changed.
 
-    vehicle_type: Optional[VehicleType] = None
+    `vehicle_type` is not updatable in place (it selects the storage table); the
+    admin passes it as a separate query param to locate the row.
+    """
+
     problem_title: Optional[str] = Field(default=None, min_length=1, max_length=255)
     problem_summary: Optional[str] = Field(default=None, min_length=1, max_length=4000)
     solution_steps: Optional[str] = Field(default=None, min_length=1, max_length=20000)
@@ -115,29 +109,32 @@ class CommonSolutionUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class MediaItemIn(BaseModel):
-    """One uploaded media object referenced by its R2 key."""
+class ChatStart(BaseModel):
+    """WS `start` frame — opens a chat scoped to a vehicle type."""
 
-    key: str
-    type: Literal["image", "video"]
+    vehicle_type: VehicleType
 
 
-class QueryRequest(BaseModel):
-    """Phase B — AI chat request. The app sends R2 keys, not URLs."""
+class ChatMessageIn(BaseModel):
+    """WS `message` frame — one user turn referencing already-uploaded image keys.
+
+    Images are uploaded out-of-band via the JWT-protected multipart endpoint, which
+    returns each `key`; the chat turn only carries those keys (small strings), never
+    the bytes.
+    """
 
     session_id: str
-    vehicle_make: str
-    vehicle_model: str
-    vehicle_year: Optional[str] = None
     query: str
-    media: List[MediaItemIn] = []
+    image_keys: List[str] = []
 
-    _validate_vehicle_year = field_validator("vehicle_year")(_validate_year)
     _validate_session_id = field_validator("session_id")(_validate_uuid)
+    _sanitize_query = field_validator("query")(_sanitize_query)
 
-    @field_validator("media")
+    @field_validator("image_keys")
     @classmethod
-    def _cap_media(cls, v: List[MediaItemIn]) -> List[MediaItemIn]:
-        if len(v) > AI_MEDIA_MAX_ITEMS:
-            raise ValueError(f"media may contain at most {AI_MEDIA_MAX_ITEMS} items")
+    def _cap_keys(cls, v: List[str]) -> List[str]:
+        if len(v) > AI_WS_MAX_IMAGES_PER_MESSAGE:
+            raise ValueError(
+                f"at most {AI_WS_MAX_IMAGES_PER_MESSAGE} images per message"
+            )
         return v

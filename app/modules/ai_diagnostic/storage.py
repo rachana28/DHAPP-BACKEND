@@ -7,18 +7,18 @@ objects are unreachable from this feature.
 
 Security model: every object key is namespaced by the authenticated user id —
 `ai-diagnostic/sessions/{user_id}/{session_id}/{hex}{ext}`. The user_id always
-comes from the JWT (never the client), and `is_owned_key` lets the router reject
-any key that isn't under the caller's own prefix (prevents cross-user reads).
-Uploads use a presigned POST with a `content-length-range` policy so object size
-is capped server-side. boto3 is synchronous → calls are offloaded with
+comes from the JWT (never the client). Chat images are uploaded through the
+multipart endpoint and stored here server-side (`upload_ai_image`), so the app
+never gets write credentials and the key is always minted from the JWT user id. The
+bytes are sniffed by magic number so only real images are stored, regardless of the
+declared content type. boto3 is synchronous → calls are offloaded with
 `asyncio.to_thread`.
 """
 
-import os
 import asyncio
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Optional
 
 from botocore.exceptions import ClientError
 
@@ -26,30 +26,38 @@ from app.utils.storage import s3_client
 from app.modules.ai_diagnostic.config import (
     AI_BUCKET_NAME,
     AI_MEDIA_PREFIX,
-    AI_MEDIA_PUT_TTL,
     AI_MEDIA_GET_TTL,
-    AI_MEDIA_MAX_BYTES,
 )
 
-# Extensions we accept for diagnostic media; anything else falls back to no ext.
-_ALLOWED_MEDIA_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".gif",
-    ".heic",
-    ".mp4",
-    ".mov",
-    ".webm",
-    ".m4v",
+# Image content types accepted in the chat, mapped to a canonical extension.
+_IMAGE_CONTENT_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
 }
 
 
-def _safe_extension(filename: str) -> str:
-    """Return a safe lowercase extension (incl. dot) or '' if not recognised."""
-    ext = os.path.splitext(filename or "")[1].lower()
-    return ext if ext in _ALLOWED_MEDIA_EXTENSIONS else ""
+def _sniff_image_ext(data: bytes) -> Optional[str]:
+    """Return a canonical extension if `data`'s magic bytes are a known image."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:4] in (b"GIF8",):
+        return ".gif"
+    if data[4:8] == b"ftyp" and data[8:12] in (
+        b"heic",
+        b"heix",
+        b"hevc",
+        b"mif1",
+        b"msf1",
+    ):
+        return ".heic"
+    return None
 
 
 def session_prefix(user_id: str, session_id: str) -> str:
@@ -62,37 +70,31 @@ def is_owned_key(user_id: str, session_id: str, key: str) -> bool:
     return key.startswith(session_prefix(user_id, session_id))
 
 
-async def generate_ai_upload_url(
-    user_id: str, session_id: str, filename: str, file_type: str
-) -> dict:
-    """Mint a presigned POST the app uses to upload one media object.
+async def upload_ai_image(
+    user_id: str, session_id: str, data: bytes, content_type: str
+) -> str:
+    """Store one chat image in R2 under the caller's session prefix; return its key.
 
-    A presigned POST (not PUT) is used so the policy can enforce a
-    `content-length-range` (size cap) and an exact `Content-Type`. The random
-    object name prevents collisions/guessing; the key is namespaced by the
-    authenticated user id so it can never land in another user's prefix.
+    `content_type` must be an accepted image type, and the raw bytes are sniffed by
+    magic number — a mismatch (or non-image payload) raises ValueError so a
+    disguised file can never be stored. The object name is random and namespaced by
+    the JWT user id, so it can never land in another user's prefix.
     """
-    ext = _safe_extension(filename)
-    key = f"{session_prefix(user_id, session_id)}{secrets.token_hex(16)}{ext}"
+    if content_type not in _IMAGE_CONTENT_TYPES:
+        raise ValueError("unsupported_image_type")
+    sniffed = _sniff_image_ext(data)
+    if sniffed is None:
+        raise ValueError("not_an_image")
 
-    presigned = await asyncio.to_thread(
-        s3_client.generate_presigned_post,
+    key = f"{session_prefix(user_id, session_id)}{secrets.token_hex(16)}{sniffed}"
+    await asyncio.to_thread(
+        s3_client.put_object,
         Bucket=AI_BUCKET_NAME,
         Key=key,
-        Fields={"Content-Type": file_type},
-        Conditions=[
-            {"Content-Type": file_type},
-            ["content-length-range", 1, AI_MEDIA_MAX_BYTES],
-        ],
-        ExpiresIn=AI_MEDIA_PUT_TTL,
+        Body=data,
+        ContentType=content_type,
     )
-    return {
-        "upload_url": presigned["url"],
-        "fields": presigned["fields"],
-        "key": key,
-        "max_bytes": AI_MEDIA_MAX_BYTES,
-        "expires_in": AI_MEDIA_PUT_TTL,
-    }
+    return key
 
 
 async def generate_ai_get_url(key: str) -> str:
@@ -144,6 +146,12 @@ def _list_keys_sync(prefix: str, cutoff: datetime = None) -> List[str]:
             break
         continuation = resp.get("NextContinuationToken")
     return keys
+
+
+async def count_session_images(user_id: str, session_id: str) -> int:
+    """Number of media objects already stored for one user's session."""
+    keys = await asyncio.to_thread(_list_keys_sync, session_prefix(user_id, session_id))
+    return len(keys)
 
 
 async def delete_ai_session_media(user_id: str, session_id: str) -> int:

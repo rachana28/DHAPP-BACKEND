@@ -146,47 +146,97 @@ async def admin_list_common_solutions(
 
 
 async def admin_get_common_solution(
-    solution_id: str, request_id: Optional[str] = None
+    solution_id: str, vehicle_type: str, request_id: Optional[str] = None
 ) -> Any:
     return await _request(
-        "GET", f"{_ADMIN_BASE}/{quote(solution_id, safe='')}", request_id, admin=True
+        "GET",
+        f"{_ADMIN_BASE}/{quote(solution_id, safe='')}",
+        request_id,
+        params={"vehicle_type": vehicle_type},
+        admin=True,
     )
 
 
 async def admin_update_common_solution(
-    solution_id: str, payload: dict, request_id: Optional[str] = None
+    solution_id: str, vehicle_type: str, payload: dict, request_id: Optional[str] = None
 ) -> Any:
     return await _request(
         "PUT",
         f"{_ADMIN_BASE}/{quote(solution_id, safe='')}",
         request_id,
+        params={"vehicle_type": vehicle_type},
         json=payload,
         admin=True,
     )
 
 
 async def admin_delete_common_solution(
-    solution_id: str, request_id: Optional[str] = None
+    solution_id: str, vehicle_type: str, request_id: Optional[str] = None
 ) -> Any:
     return await _request(
-        "DELETE", f"{_ADMIN_BASE}/{quote(solution_id, safe='')}", request_id, admin=True
+        "DELETE",
+        f"{_ADMIN_BASE}/{quote(solution_id, safe='')}",
+        request_id,
+        params={"vehicle_type": vehicle_type},
+        admin=True,
     )
 
 
-async def admin_reindex_common_solutions(request_id: Optional[str] = None) -> Any:
+async def admin_reindex_common_solutions(
+    vehicle_type: str, request_id: Optional[str] = None
+) -> Any:
     return await _request(
-        "POST", f"{_ADMIN_BASE}/reindex", request_id, json=None, admin=True
+        "POST",
+        f"{_ADMIN_BASE}/reindex",
+        request_id,
+        json={"vehicle_type": vehicle_type},
+        admin=True,
     )
 
 
-async def admin_reindex_status_common_solutions(request_id: Optional[str] = None) -> Any:
+async def admin_reindex_status_common_solutions(
+    ref_id: str, request_id: Optional[str] = None
+) -> Any:
     return await _request(
-        "GET", f"{_ADMIN_BASE}/reindex/status", request_id, admin=True
+        "GET",
+        f"{_ADMIN_BASE}/reindex/status",
+        request_id,
+        params={"ref_id": ref_id},
+        admin=True,
+    )
+
+
+_UNRESOLVED_BASE = "/api/v1/admin/unresolved-queries"
+
+
+async def admin_list_unresolved(
+    status: Optional[str],
+    limit: int,
+    offset: int,
+    request_id: Optional[str] = None,
+) -> Any:
+    params: dict = {"limit": limit, "offset": offset}
+    if status:
+        params["status"] = status
+    return await _request(
+        "GET", _UNRESOLVED_BASE, request_id, params=params, admin=True
+    )
+
+
+async def admin_update_unresolved_status(
+    query_id: str, payload: dict, request_id: Optional[str] = None
+) -> Any:
+    return await _request(
+        "PATCH",
+        f"{_UNRESOLVED_BASE}/{quote(query_id, safe='')}",
+        request_id,
+        json=payload,
+        admin=True,
     )
 
 
 async def forward_diagnose(payload: dict, request_id: Optional[str] = None) -> Any:
-    """Phase B — AI chat: POST /api/v1/diagnose."""
+    """Real-time chat turn: POST /api/v1/diagnose."""
     return await _post("/api/v1/diagnose", payload, request_id)
 
 
