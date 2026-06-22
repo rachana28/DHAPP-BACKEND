@@ -109,6 +109,31 @@ class CommonSolutionUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
+class VehicleComponentCreate(BaseModel):
+    """Admin create for a component reference row — forwarded to the AI service,
+    which validates the image reference and generates the embedding."""
+
+    vehicle_type: VehicleType
+    component_name: str = Field(..., min_length=1, max_length=255)
+    description: str = Field(..., min_length=1, max_length=4000)
+    location_guide: str = Field(..., min_length=1, max_length=4000)
+    image_urls: List[str] = Field(default_factory=list, max_length=10)
+    keywords: List[str] = Field(default_factory=list, max_length=50)
+    is_active: bool = True
+
+
+class VehicleComponentUpdate(BaseModel):
+    """Admin partial update — only provided fields are changed. `vehicle_type` is a
+    separate query param (it selects the storage table) and is not updatable here."""
+
+    component_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    location_guide: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    image_urls: Optional[List[str]] = Field(default=None, max_length=10)
+    keywords: Optional[List[str]] = Field(default=None, max_length=50)
+    is_active: Optional[bool] = None
+
+
 class ChatStart(BaseModel):
     """WS `start` frame — opens a chat scoped to a vehicle type."""
 
@@ -126,6 +151,7 @@ class ChatMessageIn(BaseModel):
     session_id: str
     query: str
     image_keys: List[str] = []
+    stream: bool = False  # opt-in: stream the reply as `chunk` frames then the final `assistant` frame
 
     _validate_session_id = field_validator("session_id")(_validate_uuid)
     _sanitize_query = field_validator("query")(_sanitize_query)
