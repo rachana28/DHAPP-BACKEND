@@ -245,6 +245,7 @@ app.include_router(ai_diagnostic_router.router)
 app.include_router(ai_diagnostic_ws.router)
 app.include_router(admin_ai_solutions_router.router)
 app.include_router(admin_ai_solutions_router.component_router)
+app.include_router(admin_ai_solutions_router.media_router)
 app.include_router(admin_ai_solutions_router.unresolved_router)
 
 

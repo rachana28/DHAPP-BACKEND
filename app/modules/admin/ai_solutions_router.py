@@ -13,10 +13,11 @@ Additive only — no existing admin logic is touched.
 
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, Header, Query
+from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, UploadFile
 
 from app.core.security import get_current_admin
-from app.modules.ai_diagnostic import ai_client
+from app.modules.ai_diagnostic import ai_client, curated_media
+from app.modules.ai_diagnostic.config import CURATED_VIDEO_MAX_BYTES
 from app.modules.ai_diagnostic.schemas import (
     CommonSolutionCreate,
     CommonSolutionUpdate,
@@ -216,6 +217,44 @@ async def delete_component(
     return await ai_client.admin_delete_component(
         component_id, vehicle_type, request_id=x_request_id
     )
+
+
+media_router = APIRouter(
+    prefix="/admin/ai-diagnostic/media",
+    tags=["Admin AI Diagnostic"],
+    dependencies=[Depends(get_current_admin)],
+)
+
+
+@media_router.post("")
+async def upload_curated_media(
+    target: str = Form(...),
+    vehicle_type: VehicleType = Form(...),
+    name: str = Form(...),
+    file: UploadFile = File(...),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Upload one curated image/video to R2 under `<prefix>/<vehicle_type>/<name>`.
+
+    `target` is 'common_solutions' or 'vehicle_components'; `name` is the exact file
+    name that will be stored in the entry's media list. Format/size are validated
+    (incl. magic-byte sniffing) before the object is written.
+    """
+    data = await file.read(CURATED_VIDEO_MAX_BYTES + 1)
+    return await curated_media.upload_curated_media(
+        target, vehicle_type, name, data, file.content_type
+    )
+
+
+@media_router.delete("")
+async def delete_curated_media(
+    target: str = Query(...),
+    vehicle_type: VehicleType = Query(...),
+    name: str = Query(...),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Delete one curated media object (used when replacing/removing media)."""
+    return await curated_media.delete_curated_media(target, vehicle_type, name)
 
 
 unresolved_router = APIRouter(

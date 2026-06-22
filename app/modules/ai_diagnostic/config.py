@@ -47,3 +47,8 @@ AI_MAX_IMAGES_PER_SESSION = int(os.getenv("AI_MAX_IMAGES_PER_SESSION", "3"))
 # references the returned key. Per-image byte cap and per-message key count.
 AI_IMAGE_MAX_BYTES = int(os.getenv("AI_IMAGE_MAX_BYTES", str(4 * 1024 * 1024)))
 AI_WS_MAX_IMAGES_PER_MESSAGE = int(os.getenv("AI_WS_MAX_IMAGES_PER_MESSAGE", "2"))
+
+# Curated media (admin-uploaded images/videos for common-solutions & vehicle-components).
+CURATED_MEDIA_PUBLIC_URL = os.getenv("CURATED_MEDIA_PUBLIC_URL")  # optional, for preview URLs
+CURATED_IMAGE_MAX_BYTES = int(os.getenv("CURATED_IMAGE_MAX_BYTES", str(5 * 1024 * 1024)))
+CURATED_VIDEO_MAX_BYTES = int(os.getenv("CURATED_VIDEO_MAX_BYTES", str(25 * 1024 * 1024)))
