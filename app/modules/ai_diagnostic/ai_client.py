@@ -9,9 +9,10 @@ Errors are mapped to consistent HTTP statuses so callers/clients see predictable
 failures. `aclose()` is called from the app lifespan shutdown.
 """
 
+import json
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 from urllib.parse import quote
 
 import httpx
@@ -87,19 +88,28 @@ async def _request(
         if not is_json:
             logger.error(
                 "AI service returned non-JSON success [%s %s] status=%s ct=%s body=%.200s",
-                method, path, resp.status_code, content_type, resp.text,
+                method,
+                path,
+                resp.status_code,
+                content_type,
+                resp.text,
             )
             raise HTTPException(
-                status_code=502, detail="AI diagnostic service returned an invalid response."
+                status_code=502,
+                detail="AI diagnostic service returned an invalid response.",
             )
         try:
             return resp.json()
         except ValueError:
             logger.error(
-                "AI service JSON parse failed [%s %s] body=%.200s", method, path, resp.text
+                "AI service JSON parse failed [%s %s] body=%.200s",
+                method,
+                path,
+                resp.text,
             )
             raise HTTPException(
-                status_code=502, detail="AI diagnostic service returned an invalid response."
+                status_code=502,
+                detail="AI diagnostic service returned an invalid response.",
             )
 
     # Non-2xx: only surface a clean JSON `detail`; never forward an HTML/error page.
@@ -107,14 +117,20 @@ async def _request(
     if is_json:
         try:
             body = resp.json()
-            if isinstance(body, dict) and isinstance(body.get("detail"), (str, list, dict)):
+            if isinstance(body, dict) and isinstance(
+                body.get("detail"), (str, list, dict)
+            ):
                 detail = body["detail"]
         except ValueError:
             pass
     else:
         logger.error(
             "AI service non-2xx non-JSON [%s %s] status=%s ct=%s body=%.300s",
-            method, path, resp.status_code, content_type, resp.text,
+            method,
+            path,
+            resp.status_code,
+            content_type,
+            resp.text,
         )
     raise HTTPException(status_code=resp.status_code, detail=detail)
 
@@ -233,6 +249,97 @@ async def admin_reindex_status_common_solutions(
     )
 
 
+# --- Vehicle components: admin surface (attaches X-Admin-Secret) ---
+
+_COMPONENT_ADMIN_BASE = "/api/v1/admin/vehicle-components"
+
+
+async def admin_create_component(
+    payload: dict, request_id: Optional[str] = None
+) -> Any:
+    return await _request(
+        "POST", _COMPONENT_ADMIN_BASE, request_id, json=payload, admin=True
+    )
+
+
+async def admin_list_components(
+    vehicle_type: Optional[str],
+    limit: int,
+    offset: int,
+    request_id: Optional[str] = None,
+) -> Any:
+    params: dict = {"limit": limit, "offset": offset}
+    if vehicle_type:
+        params["vehicle_type"] = vehicle_type
+    return await _request(
+        "GET", _COMPONENT_ADMIN_BASE, request_id, params=params, admin=True
+    )
+
+
+async def admin_get_component(
+    component_id: str, vehicle_type: str, request_id: Optional[str] = None
+) -> Any:
+    return await _request(
+        "GET",
+        f"{_COMPONENT_ADMIN_BASE}/{quote(component_id, safe='')}",
+        request_id,
+        params={"vehicle_type": vehicle_type},
+        admin=True,
+    )
+
+
+async def admin_update_component(
+    component_id: str,
+    vehicle_type: str,
+    payload: dict,
+    request_id: Optional[str] = None,
+) -> Any:
+    return await _request(
+        "PUT",
+        f"{_COMPONENT_ADMIN_BASE}/{quote(component_id, safe='')}",
+        request_id,
+        params={"vehicle_type": vehicle_type},
+        json=payload,
+        admin=True,
+    )
+
+
+async def admin_delete_component(
+    component_id: str, vehicle_type: str, request_id: Optional[str] = None
+) -> Any:
+    return await _request(
+        "DELETE",
+        f"{_COMPONENT_ADMIN_BASE}/{quote(component_id, safe='')}",
+        request_id,
+        params={"vehicle_type": vehicle_type},
+        admin=True,
+    )
+
+
+async def admin_reindex_components(
+    vehicle_type: str, request_id: Optional[str] = None
+) -> Any:
+    return await _request(
+        "POST",
+        f"{_COMPONENT_ADMIN_BASE}/reindex",
+        request_id,
+        json={"vehicle_type": vehicle_type},
+        admin=True,
+    )
+
+
+async def admin_reindex_status_components(
+    ref_id: str, request_id: Optional[str] = None
+) -> Any:
+    return await _request(
+        "GET",
+        f"{_COMPONENT_ADMIN_BASE}/reindex/status",
+        request_id,
+        params={"ref_id": ref_id},
+        admin=True,
+    )
+
+
 _UNRESOLVED_BASE = "/api/v1/admin/unresolved-queries"
 
 
@@ -265,6 +372,53 @@ async def admin_update_unresolved_status(
 async def forward_diagnose(payload: dict, request_id: Optional[str] = None) -> Any:
     """Real-time chat turn: POST /api/v1/diagnose."""
     return await _post("/api/v1/diagnose", payload, request_id)
+
+
+async def forward_diagnose_stream(
+    payload: dict, request_id: Optional[str] = None
+) -> AsyncIterator[dict]:
+    """Stream a chat turn (SSE) from the AI service: POST /api/v1/diagnose/stream.
+
+    Yields each parsed event dict (`token` / `final` / `error` / `done`). Connection
+    and non-2xx errors are mapped to HTTPException and raised before the first event,
+    mirroring `_request`; the caller relays errors to the client as a WS frame.
+    """
+    headers = _headers(request_id)
+    headers["Accept"] = "text/event-stream"
+    try:
+        async with _client.stream(
+            "POST", "/api/v1/diagnose/stream", json=payload, headers=headers
+        ) as resp:
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                detail: Any = f"AI diagnostic service error ({resp.status_code})."
+                try:
+                    parsed = json.loads(body.decode("utf-8", "ignore"))
+                    if isinstance(parsed, dict) and parsed.get("detail"):
+                        detail = parsed["detail"]
+                except ValueError:
+                    pass
+                raise HTTPException(status_code=resp.status_code, detail=detail)
+
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                stripped = line.strip()
+                if not stripped.startswith("data:"):
+                    continue
+                data = stripped[len("data:") :].strip()
+                if not data:
+                    continue
+                try:
+                    yield json.loads(data)
+                except ValueError:
+                    continue
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="AI diagnostic service timed out.")
+    except httpx.TransportError:
+        raise HTTPException(
+            status_code=502, detail="Could not reach AI diagnostic service."
+        )
 
 
 async def close_session(session_id: str, request_id: Optional[str] = None) -> Any:

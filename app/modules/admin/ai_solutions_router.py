@@ -20,6 +20,8 @@ from app.modules.ai_diagnostic import ai_client
 from app.modules.ai_diagnostic.schemas import (
     CommonSolutionCreate,
     CommonSolutionUpdate,
+    VehicleComponentCreate,
+    VehicleComponentUpdate,
     VehicleType,
 )
 
@@ -120,6 +122,99 @@ async def delete_common_solution(
     """Delete a common solution (vehicle_type selects its table)."""
     return await ai_client.admin_delete_common_solution(
         solution_id, vehicle_type, request_id=x_request_id
+    )
+
+
+component_router = APIRouter(
+    prefix="/admin/ai-diagnostic/vehicle-components",
+    tags=["Admin AI Diagnostic"],
+    dependencies=[Depends(get_current_admin)],
+)
+
+
+@component_router.post("")
+async def create_component(
+    body: VehicleComponentCreate,
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Create a component reference row (the AI service generates its embedding)."""
+    return await ai_client.admin_create_component(
+        body.model_dump(), request_id=x_request_id
+    )
+
+
+@component_router.get("")
+async def list_components(
+    vehicle_type: Optional[VehicleType] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """List component references (all states), optionally filtered by vehicle_type."""
+    return await ai_client.admin_list_components(
+        vehicle_type, limit, offset, request_id=x_request_id
+    )
+
+
+@component_router.post("/reindex")
+async def reindex_components(
+    vehicle_type: VehicleType = Body(..., embed=True),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Start a background embedding backfill for one vehicle_type's component table."""
+    return await ai_client.admin_reindex_components(
+        vehicle_type, request_id=x_request_id
+    )
+
+
+@component_router.get("/reindex/status")
+async def reindex_status_components(
+    ref_id: str = Query(...),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Progress of a component reindex job by ref_id."""
+    return await ai_client.admin_reindex_status_components(
+        ref_id, request_id=x_request_id
+    )
+
+
+@component_router.get("/{component_id}")
+async def get_component(
+    component_id: str,
+    vehicle_type: VehicleType = Query(...),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Fetch one component reference by id (vehicle_type selects its table)."""
+    return await ai_client.admin_get_component(
+        component_id, vehicle_type, request_id=x_request_id
+    )
+
+
+@component_router.put("/{component_id}")
+async def update_component(
+    component_id: str,
+    body: VehicleComponentUpdate,
+    vehicle_type: VehicleType = Query(...),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Update a component reference (re-embeds if name/description/location changed)."""
+    return await ai_client.admin_update_component(
+        component_id,
+        vehicle_type,
+        body.model_dump(exclude_unset=True),
+        request_id=x_request_id,
+    )
+
+
+@component_router.delete("/{component_id}")
+async def delete_component(
+    component_id: str,
+    vehicle_type: VehicleType = Query(...),
+    x_request_id: Optional[str] = Header(default=None),
+):
+    """Delete a component reference (vehicle_type selects its table)."""
+    return await ai_client.admin_delete_component(
+        component_id, vehicle_type, request_id=x_request_id
     )
 
 
