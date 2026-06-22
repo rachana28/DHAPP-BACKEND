@@ -17,7 +17,7 @@ Protocol
     {"type":"session","session_id":..}
     {"type":"need_vehicle_type"}                      message before start
     {"type":"chunk","delta":..}                       streamed token (only if stream:true)
-    {"type":"assistant","kind":"answer|clarify|fallback","markdown":..,"safety_alert":..}
+    {"type":"assistant","kind":"answer|clarify|fallback","markdown":..,"safety_alert":..,"images":[{"component_name":..,"location_guide":..,"image_urls":[..]}]}
     {"type":"image_limit"}                            per-session image cap hit
     {"type":"error","detail":..}
 
@@ -112,6 +112,7 @@ async def _relay_diagnose_stream(ws: WebSocket, payload: dict) -> bool:
                         "kind": event.get("kind"),
                         "markdown": event.get("answer_markdown"),
                         "safety_alert": event.get("safety_alert"),
+                        "images": event.get("images") or [],
                     },
                 )
             elif etype == "error":
@@ -267,6 +268,7 @@ async def ai_diagnostic_ws(
                     "kind": result.get("kind"),
                     "markdown": result.get("answer_markdown"),
                     "safety_alert": result.get("safety_alert"),
+                    "images": result.get("images") or [],
                 },
             )
 
