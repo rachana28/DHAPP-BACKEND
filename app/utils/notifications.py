@@ -4,6 +4,7 @@ import requests
 from typing import List, Dict, Any
 from sqlmodel import Session, select
 from app.core.models import UserDevice
+from app.modules.notifications.service import persist_for_users
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,10 @@ def send_push_notification(
     Sends notifications to all devices belonging to the list of user_ids.
     Automatically removes invalid/dead tokens (Fix Flaw 4).
     """
-    # 1. Fetch all devices for these users
+    # 1. Persist durable history before dispatch (own session, never raises)
+    id_map = persist_for_users(user_ids, title, body, data)
+
+    # 2. Fetch all devices for these users
     statement = select(UserDevice).where(UserDevice.user_id.in_(user_ids))
     devices = session.exec(statement).all()
 
@@ -55,12 +59,16 @@ def send_push_notification(
             continue
 
         token_map[device.token] = device
+        msg_data = dict(data or {})
+        record_id = id_map.get(device.user_id)
+        if record_id is not None:
+            msg_data["id"] = str(record_id)
         messages.append(
             {
                 "to": device.token,
                 "title": title,
                 "body": body,
-                "data": data or {},
+                "data": msg_data,
                 "sound": "default",
             }
         )

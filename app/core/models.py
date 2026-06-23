@@ -5,7 +5,7 @@ from pydantic import EmailStr, field_validator, AliasChoices
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta, timezone
-from sqlalchemy import UniqueConstraint, JSON, Column
+from sqlalchemy import UniqueConstraint, JSON, Column, Index, text
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -193,9 +193,7 @@ class MechanicReview(MechanicReviewBase, table=True):
     user_id: uuid.UUID = Field(foreign_key="user.id")
     # Booking this review is for — lets a customer rate the same mechanic on
     # different jobs (per-booking dedup), parity with ServiceCenterReview.
-    mechanic_trip_id: Optional[int] = Field(
-        default=None, foreign_key="mechanictrip.id"
-    )
+    mechanic_trip_id: Optional[int] = Field(default=None, foreign_key="mechanictrip.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -483,7 +481,9 @@ class ServiceRating(ServiceRatingBase, table=True):
     provider performance from a single place."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    service_type: str = Field(index=True)  # trip | tow | transport | mechanic | service_center
+    service_type: str = Field(
+        index=True
+    )  # trip | tow | transport | mechanic | service_center
     booking_id: int = Field(index=True)  # internal PK of the booking row
     booking_reference_id: str = Field(index=True)  # TP.. / TW.. / MC.. / SB..
     user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
@@ -1242,6 +1242,44 @@ class UserDevice(SQLModel, table=True):
     user: "User" = Relationship(back_populates="devices")
 
 
+class Notification(SQLModel, table=True):
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+        Index(
+            "ix_notifications_user_unread",
+            "user_id",
+            postgresql_where=text("read_at IS NULL"),
+        ),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+    type: str
+    title: str
+    body: str = ""
+    detail: Optional[str] = None
+    data: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    important: bool = False
+    read_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_now_ist_naive, index=True)
+
+    user: "User" = Relationship(back_populates="notifications")
+
+
+class NotificationResponse(SQLModel):
+    id: uuid.UUID
+    type: str
+    title: str
+    body: str
+    detail: Optional[str] = None
+    data: Dict[str, Any] = {}
+    important: bool
+    read: bool
+    read_at: Optional[datetime] = None
+    created_at: datetime
+
+
 # --- NEW: SYSTEM CONFIGURATION ---
 class SystemConfig(SQLModel, table=True):
     key: str = Field(primary_key=True)  # e.g., "bike_base_fare", "car_per_km"
@@ -1521,6 +1559,7 @@ class User(UserBase, table=True):
     hashed_password: Optional[str] = None
     force_password_change: bool = Field(default=False)
     devices: List["UserDevice"] = Relationship(back_populates="user")
+    notifications: List["Notification"] = Relationship(back_populates="user")
     driver_profile: Optional[Driver] = Relationship(back_populates="user")
     tow_truck_driver_profile: Optional[TowTruckDriver] = Relationship(
         back_populates="user"

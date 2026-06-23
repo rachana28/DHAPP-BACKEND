@@ -57,6 +57,7 @@ from app.modules.cards import router as cards_router
 from app.modules.wallet import router as wallet_router
 from app.modules.provider_wallet import router as provider_wallet_router
 from app.modules.payout import router as payout_router
+from app.modules.notifications import router as notifications_router
 from app.modules.bookings import active_router as bookings_active_router
 from app.modules.ai_diagnostic import (
     router as ai_diagnostic_router,
@@ -238,6 +239,7 @@ app.include_router(cards_router.router)
 app.include_router(wallet_router.router)
 app.include_router(provider_wallet_router.router)
 app.include_router(payout_router.router)
+app.include_router(notifications_router.router)
 app.include_router(admin_merchant_bank_router.router)
 app.include_router(admin_payout_router.router)
 app.include_router(bookings_active_router.router)
