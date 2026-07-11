@@ -16,6 +16,7 @@ from app.core.database import (
     engine,
 )
 from app.modules.config import router as config_router
+from app.modules.legal import router as legal_router
 
 # Import Routers from Modules
 from app.modules.auth import router as auth_router, users as users_router
@@ -228,6 +229,7 @@ app.include_router(support_ws_router.router)
 app.include_router(admin_support_router.router)
 app.include_router(admin_support_router.faq_router)
 app.include_router(config_router.router)
+app.include_router(legal_router.router)
 app.include_router(mechanic_router.router)
 app.include_router(mechanic_profile_router.router)
 app.include_router(service_center_router.router)
