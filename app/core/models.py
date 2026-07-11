@@ -5,7 +5,7 @@ from pydantic import EmailStr, field_validator, AliasChoices
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta, timezone
-from sqlalchemy import UniqueConstraint, JSON, Column, Index, text
+from sqlalchemy import UniqueConstraint, CheckConstraint, JSON, Column, Index, text
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -2600,3 +2600,67 @@ class SettlementResponse(SQLModel):
     payment_note: Optional[str] = None
     extra_amount_paid: float = 0.0
     extra_amount_breakdown: Optional[Dict[str, float]] = None
+
+
+# --- Legal & company content (database-managed, served publicly to the apps) ---
+class LegalDocument(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("slug", "language", name="uq_legaldocument_slug_language"),
+        CheckConstraint(
+            "audience IN ('user', 'provider', 'all')",
+            name="ck_legaldocument_audience",
+        ),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+    slug: str = Field(max_length=80, index=True)
+    language: str = Field(default="en", max_length=10, index=True)
+    audience: str = Field(default="all", max_length=20, index=True)
+    title: str = Field(max_length=200)
+    version: str = Field(default="1.0", max_length=20)
+    effective_date: date
+    display_order: int = 0
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class LegalDocumentSection(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    document_id: int = Field(foreign_key="legaldocument.id", index=True)
+    heading: str = Field(max_length=200)
+    body: str = Field(max_length=20000)
+    display_order: int = 0
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class LegalPlaceholder(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("key", name="uq_legalplaceholder_key"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    key: str = Field(max_length=80)
+    value: str = Field(max_length=1000)
+    description: Optional[str] = Field(default=None, max_length=300)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class LegalSectionPublicResponse(SQLModel):
+    heading: str
+    body: str
+    display_order: int
+
+
+class LegalDocumentPublicResponse(SQLModel):
+    slug: str
+    language: str
+    audience: str
+    title: str
+    version: str
+    effective_date: date
+    display_order: int
+    updated_at: datetime
+
+
+class LegalDocumentPublicDetailResponse(LegalDocumentPublicResponse):
+    sections: List[LegalSectionPublicResponse] = []
